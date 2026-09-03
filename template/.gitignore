@@ -1,0 +1,13 @@
+# Worktree Ralph local state and diagnostics
+.codex/state.json
+.codex/tasks.json
+.codex/bugs.json
+.codex/*-summary.json
+.codex/logs/
+.codex/workflow.lock
+
+# Common local build output
+target/
+bin/
+obj/
+node_modules/

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["status", "summary", "commitSha", "changedFiles", "checks", "blocker"],
+  "properties": {
+    "status": { "enum": ["fixed", "not_reproducible", "blocked"] },
+    "summary": { "type": "string", "minLength": 1 },
+    "commitSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+    "changedFiles": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["command", "result", "evidence"],
+        "properties": {
+          "command": { "type": "string" },
+          "result": { "enum": ["passed", "failed", "skipped"] },
+          "evidence": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "blocker": { "type": ["string", "null"] }
+  },
+  "additionalProperties": false
+}

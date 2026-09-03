@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "1.0",
+  "provider": "github",
+  "remote": "origin",
+  "targetBranch": "main",
+  "integrationBranch": "ralph/integration",
+  "maximumConcurrentBuilders": 3,
+  "maximumConcurrentFixers": 3,
+  "maximumTaskAttempts": 3,
+  "maximumBugAttempts": 3,
+  "maximumPlanningQuestionRounds": 5,
+  "worktreeRoot": null,
+  "deleteMergedBranches": true,
+  "github": {
+    "repository": null
+  },
+  "azureDevOps": {
+    "organization": null,
+    "project": null,
+    "repository": null
+  }
+}

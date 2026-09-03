@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schemaVersion", "revision", "repositoryRoot", "provider", "repository", "remote", "targetBranch", "integrationBranch", "stage", "stageStatus", "requirementsHash", "planHash", "integrationSha", "finalMergeSha", "blocker", "createdAt", "updatedAt"],
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "revision": { "type": "integer", "minimum": 0 },
+    "repositoryRoot": { "type": "string", "minLength": 1 },
+    "provider": { "enum": ["github", "azure_devops"] },
+    "repository": { "type": "string", "minLength": 1 },
+    "remote": { "type": "string", "minLength": 1 },
+    "targetBranch": { "type": "string", "minLength": 1 },
+    "integrationBranch": { "type": "string", "minLength": 1 },
+    "stage": { "enum": ["requirements", "planning", "build", "audit", "complete", "blocked"] },
+    "stageStatus": { "enum": ["not_started", "running", "complete", "blocked"] },
+    "requirementsHash": { "type": ["string", "null"] },
+    "planHash": { "type": ["string", "null"] },
+    "integrationSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+    "finalMergeSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+    "blocker": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["scope", "identity", "message", "requiredDecision"],
+          "properties": {
+            "scope": { "type": "string" },
+            "identity": { "type": ["string", "null"] },
+            "message": { "type": "string", "minLength": 1 },
+            "requiredDecision": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": false
+}

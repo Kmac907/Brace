@@ -1,0 +1,4 @@
+# Codex-recognized project configuration only.
+# Workflow-specific configuration belongs in workflow.json.
+model_reasoning_effort = "high"
+sandbox_mode = "workspace-write"

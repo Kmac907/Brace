@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "pullRequest": {
+      "type": "object",
+      "required": ["id", "url", "state", "head", "base", "mergeSha"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "minLength": 1 },
+        "state": { "type": "string", "minLength": 1 },
+        "head": { "type": "string", "minLength": 1 },
+        "base": { "type": "string", "minLength": 1 },
+        "mergeSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" }
+      },
+      "additionalProperties": false
+    },
+    "bug": {
+      "type": "object",
+      "required": ["bugId", "title", "severity", "category", "status", "requirementIds", "description", "evidence", "actualBehavior", "requiredBehavior", "impact", "requiredCorrection", "acceptanceTest", "dependencies", "allowedPaths", "exclusiveResources", "attemptCount", "branch", "worktree", "baseSha", "resultSha", "pullRequest", "lastError"],
+      "properties": {
+        "bugId": { "type": "string", "pattern": "^BUG-[0-9]{4}$" },
+        "title": { "type": "string", "minLength": 1 },
+        "severity": { "enum": ["critical", "high", "medium", "low", "informational"] },
+        "category": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["open", "active", "fixed", "verified", "blocked"] },
+        "requirementIds": { "type": "array", "items": { "type": "string", "pattern": "^REQ-[A-Z0-9-]+" }, "uniqueItems": true },
+        "description": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "string", "minLength": 1 },
+        "actualBehavior": { "type": "string", "minLength": 1 },
+        "requiredBehavior": { "type": "string", "minLength": 1 },
+        "impact": { "type": "string", "minLength": 1 },
+        "requiredCorrection": { "type": "string", "minLength": 1 },
+        "acceptanceTest": { "type": "string", "minLength": 1 },
+        "dependencies": { "type": "array", "items": { "type": "string", "pattern": "^BUG-[0-9]{4}$" }, "uniqueItems": true },
+        "allowedPaths": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "exclusiveResources": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "attemptCount": { "type": "integer", "minimum": 0 },
+        "branch": { "type": ["string", "null"] },
+        "worktree": { "type": ["string", "null"] },
+        "baseSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+        "resultSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+        "pullRequest": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/pullRequest" }] },
+        "lastError": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    }
+  },
+  "type": "object",
+  "required": ["schemaVersion", "revision", "auditSha", "status", "bugs"],
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "revision": { "type": "integer", "minimum": 0 },
+    "auditSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+    "status": { "enum": ["not_audited", "ready", "active", "complete", "blocked"] },
+    "bugs": { "type": "array", "items": { "$ref": "#/$defs/bug" } }
+  },
+  "additionalProperties": false
+}
