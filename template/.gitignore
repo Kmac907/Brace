@@ -3,6 +3,8 @@
 .codex/tasks.json
 .codex/bugs.json
 .codex/*-summary.json
+.codex/assignments/
+.codex/results/
 .codex/logs/
 .codex/workflow.lock
 

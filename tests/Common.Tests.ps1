@@ -29,7 +29,7 @@ try {
     $schema = Join-Path (Split-Path $common -Parent) '..\schemas\state.schema.json'
     $path = Join-Path $temporary 'state.json'
     $state = [ordered]@{
-        schemaVersion='1.0';revision=0;repositoryRoot=$temporary;provider='github';repository='owner/repo';remote='origin';targetBranch='main';integrationBranch='ralph/integration';stage='requirements';stageStatus='not_started';requirementsHash=$null;planHash=$null;integrationSha=$null;finalMergeSha=$null;blocker=$null;createdAt=[DateTimeOffset]::UtcNow.ToString('O');updatedAt=[DateTimeOffset]::UtcNow.ToString('O')
+        schemaVersion='1.0';revision=0;repositoryRoot=$temporary;provider='github';repository='owner/repo';remote='origin';remoteUrl='https://github.com/owner/repo.git';targetBranch='main';targetBaseSha=$null;integrationBranch='ralph/integration';configurationHash=('sha256:' + ('0' * 64));taskDefinitionHash=$null;bugDefinitionHash=$null;stage='requirements';stageStatus='not_started';requirementsHash=$null;planHash=$null;integrationSha=$null;finalMergeSha=$null;blocker=$null;createdAt=[DateTimeOffset]::UtcNow.ToString('O');updatedAt=[DateTimeOffset]::UtcNow.ToString('O')
     }
     Write-RalphJsonAtomic -Path $path -Value $state -SchemaPath $schema
     $read = Read-RalphJson -Path $path -SchemaPath $schema

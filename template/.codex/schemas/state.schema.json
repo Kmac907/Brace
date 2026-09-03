@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["schemaVersion", "revision", "repositoryRoot", "provider", "repository", "remote", "targetBranch", "integrationBranch", "stage", "stageStatus", "requirementsHash", "planHash", "integrationSha", "finalMergeSha", "blocker", "createdAt", "updatedAt"],
+  "required": ["schemaVersion", "revision", "repositoryRoot", "provider", "repository", "remote", "remoteUrl", "targetBranch", "targetBaseSha", "integrationBranch", "configurationHash", "taskDefinitionHash", "bugDefinitionHash", "stage", "stageStatus", "requirementsHash", "planHash", "integrationSha", "finalMergeSha", "blocker", "createdAt", "updatedAt"],
   "properties": {
     "schemaVersion": { "const": "1.0" },
     "revision": { "type": "integer", "minimum": 0 },
@@ -9,12 +9,17 @@
     "provider": { "enum": ["github", "azure_devops"] },
     "repository": { "type": "string", "minLength": 1 },
     "remote": { "type": "string", "minLength": 1 },
+    "remoteUrl": { "type": "string", "minLength": 1 },
     "targetBranch": { "type": "string", "minLength": 1 },
+    "targetBaseSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
     "integrationBranch": { "type": "string", "minLength": 1 },
+    "configurationHash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "taskDefinitionHash": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
+    "bugDefinitionHash": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
     "stage": { "enum": ["requirements", "planning", "build", "audit", "complete", "blocked"] },
     "stageStatus": { "enum": ["not_started", "running", "complete", "blocked"] },
-    "requirementsHash": { "type": ["string", "null"] },
-    "planHash": { "type": ["string", "null"] },
+    "requirementsHash": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
+    "planHash": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
     "integrationSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
     "finalMergeSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
     "blocker": {

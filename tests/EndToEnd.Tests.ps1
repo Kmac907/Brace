@@ -26,7 +26,9 @@ try {
     & git -C $project config user.email 'test@example.invalid'
     & git -C $project add --all
     & git -C $project commit -m 'Initial project' | Out-Null
-    & git -C $project remote add origin $remote
+    $hostedRemote = 'https://github.com/fixture/project.git'
+    & git -C $project config "url.$remote.insteadOf" $hostedRemote
+    & git -C $project remote add origin $hostedRemote
     & git -C $project push --set-upstream origin main | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Unable to initialize end-to-end fixture.' }
 

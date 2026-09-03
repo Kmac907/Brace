@@ -1,5 +1,6 @@
 param(
-    [string]$Repository = (Get-Location).Path
+    [string]$Repository = (Get-Location).Path,
+    [switch]$StartNewWorkflow
 )
 
 Set-StrictMode -Version Latest
@@ -16,6 +17,11 @@ $state = $null
 try {
     $state = Read-RalphJson -Path $paths.State -SchemaPath (Join-Path $paths.Schemas 'state.schema.json')
     Assert-RalphStateIdentity -State $state -RepositoryRoot $root -Configuration $configuration
+    if ($StartNewWorkflow) {
+        Reset-RalphCompletedWorkflow -RepositoryRoot $root -Configuration $configuration -State $state
+        $paths = Initialize-RalphStateFiles -RepositoryRoot $root -Configuration $configuration
+        $state = Read-RalphJson -Path $paths.State -SchemaPath (Join-Path $paths.Schemas 'state.schema.json')
+    }
     $tasks = Read-RalphJson -Path $paths.Tasks -SchemaPath (Join-Path $paths.Schemas 'tasks.schema.json')
 
     if ([string]$tasks.status -in @('active', 'complete') -or [string]$state.stage -in @('audit', 'complete') -or @($tasks.tasks | Where-Object { [int]$_.attemptCount -gt 0 }).Count -gt 0) {
@@ -23,6 +29,8 @@ try {
     }
     if ([string]$tasks.status -ceq 'ready' -and [string]$state.stage -ceq 'build') {
         Assert-RalphPlanDrift -State $state -RepositoryRoot $root -RequirePlan
+        Assert-RalphLedgerIdentity -State $state -Ledger $tasks -Kind task
+        [void](Assert-RalphTargetDrift -RepositoryRoot $root -Configuration $configuration -State $state)
         Show-RalphStatus -State $state -Tasks $tasks
         Write-Host 'Planning is already complete. The build loop may run.'
         return
@@ -32,10 +40,14 @@ try {
     if (-not [System.IO.File]::Exists($requirementsPath)) {
         throw 'requirements.md does not exist.'
     }
+    [void](Invoke-RalphNative -Command 'git' -Arguments @('-C', $root, 'fetch', [string]$configuration.remote, '--prune'))
     $currentBranch = (Invoke-RalphNative -Command 'git' -Arguments @('-C', $root, 'branch', '--show-current')).Output.Trim()
     if ($currentBranch -cne [string]$configuration.targetBranch) {
         throw "Planning must run from the target branch $($configuration.targetBranch), not $currentBranch."
     }
+    $localTargetSha = (Invoke-RalphNative -Command 'git' -Arguments @('-C', $root, 'rev-parse', 'HEAD')).Output.Trim()
+    $remoteTargetSha = (Invoke-RalphNative -Command 'git' -Arguments @('-C', $root, 'rev-parse', "$($configuration.remote)/$($configuration.targetBranch)")).Output.Trim()
+    if ($localTargetSha -cne $remoteTargetSha) { throw 'Local target branch must exactly match its remote before planning.' }
     $pendingPaths = @((Invoke-RalphNative -Command 'git' -Arguments @('-C', $root, 'status', '--porcelain', '--untracked-files=all')).Lines | ForEach-Object {
         if ($_.Length -gt 3) { $_.Substring(3).Replace('\', '/') }
     })
@@ -126,10 +138,12 @@ Inspect requirements.md and the existing repository directly. If confirmed clari
             lastError = $null
         }
     }
+    $definitionHash = Get-RalphDefinitionHash -Items @($persistedTasks) -Kind task
     $tasks = [ordered]@{
         schemaVersion = '1.0'
         revision = [int]$tasks.revision + 1
         planHash = $planHash
+        definitionHash = $definitionHash
         status = 'ready'
         tasks = @($persistedTasks)
     }
@@ -139,6 +153,9 @@ Inspect requirements.md and the existing repository directly. If confirmed clari
     $state.stageStatus = 'not_started'
     $state.requirementsHash = Get-RalphFileHash -Path $requirementsPath
     $state.planHash = $planHash
+    $state.targetBaseSha = $remotePlanningSha
+    $state.taskDefinitionHash = $definitionHash
+    $state.bugDefinitionHash = $null
     $state.blocker = $null
     Save-RalphState -State $state -Paths $paths
 

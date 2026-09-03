@@ -1,6 +1,4 @@
-param(
-    [string]$Repository = (Get-Location).Path
-)
+param([string]$Repository = (Get-Location).Path)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -9,199 +7,140 @@ $ErrorActionPreference = 'Stop'
 function Save-BuildLedger {
     param($Ledger, $Paths)
     $Ledger.revision = [int]$Ledger.revision + 1
-    Write-RalphJsonAtomic -Path $Paths.Tasks -Value $Ledger -SchemaPath (Join-Path $Paths.Schemas 'tasks.schema.json')
+    Write-RalphJsonAtomic $Paths.Tasks $Ledger (Join-Path $Paths.Schemas 'tasks.schema.json')
 }
 
-$root = Get-RalphRepositoryRoot -Path $Repository
-$configuration = Get-RalphConfiguration -RepositoryRoot $root
-Assert-RalphPrerequisites -Configuration $configuration -RequireCodex
+function Get-KnownTaskMergeShas {
+    param($Ledger)
+    @($Ledger.tasks | Where-Object { $null -ne $_.pullRequest -and $_.pullRequest.mergeSha } | ForEach-Object { [string]$_.pullRequest.mergeSha })
+}
+
+$root = Get-RalphRepositoryRoot $Repository
+$configuration = Get-RalphConfiguration $root
+Assert-RalphPrerequisites $configuration -RequireCodex
 if (-not (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)) { throw 'PowerShell ThreadJob support is required for concurrent builders.' }
-$paths = Initialize-RalphStateFiles -RepositoryRoot $root -Configuration $configuration
-$lock = Enter-RalphWorkflowLock -Path $paths.Lock
+$paths = Initialize-RalphStateFiles $root $configuration
+$lock = Enter-RalphWorkflowLock $paths.Lock
 $state = $null
 $tasks = $null
 
 try {
-    $state = Read-RalphJson -Path $paths.State -SchemaPath (Join-Path $paths.Schemas 'state.schema.json')
-    $tasks = Read-RalphJson -Path $paths.Tasks -SchemaPath (Join-Path $paths.Schemas 'tasks.schema.json')
-    Assert-RalphStateIdentity -State $state -RepositoryRoot $root -Configuration $configuration
-    Assert-RalphPlanDrift -State $state -RepositoryRoot $root -RequirePlan
-    Assert-RalphGraph -Items @($tasks.tasks) -Kind task
+    $state = Read-RalphJson $paths.State (Join-Path $paths.Schemas 'state.schema.json')
+    $tasks = Read-RalphJson $paths.Tasks (Join-Path $paths.Schemas 'tasks.schema.json')
+    Assert-RalphStateIdentity $state $root $configuration
+    Assert-RalphPlanDrift $state $root -RequirePlan
+    Assert-RalphLedgerIdentity $state $tasks task
+    Assert-RalphGraph @($tasks.tasks) task
+    [void](Assert-RalphTargetDrift $root $configuration $state)
 
     if ([string]$tasks.status -ceq 'complete' -and [string]$state.stage -eq 'audit') {
-        Show-RalphStatus -State $state -Tasks $tasks
+        Show-RalphStatus $state $tasks
         Write-Host 'BUILD COMPLETE: the audit loop may run.'
         return
     }
-    if ([string]$tasks.status -notin @('ready', 'active', 'blocked')) { throw 'Planning has not produced a buildable task queue.' }
-    if ([string]$state.stage -notin @('build', 'blocked')) { throw "The workflow is at stage $($state.stage), not build." }
+    if ([string]$tasks.status -notin @('ready','active','blocked')) { throw 'Planning has not produced a buildable task queue.' }
+    if ([string]$state.stage -notin @('build','blocked')) { throw "The workflow is at stage $($state.stage), not build." }
 
-    $state.stage = 'build'
-    $state.stageStatus = 'running'
-    $state.blocker = $null
-    $tasks.status = 'active'
-    Save-RalphState -State $state -Paths $paths
+    $state.stage='build'; $state.stageStatus='running'; $state.blocker=$null; $tasks.status='active'
+    Save-RalphState $state $paths
 
-    $integrationSha = Ensure-RalphIntegrationBranch -RepositoryRoot $root -Configuration $configuration -State $state
-    $state.integrationSha = $integrationSha
-    Save-RalphState -State $state -Paths $paths
+    # Recover completed agent attempts before scheduling replacements.
+    foreach ($task in @($tasks.tasks | Where-Object status -eq 'active')) {
+        $attemptResult = Read-RalphAttemptResult $paths ([string]$task.taskId) ([int]$task.attemptCount)
+        if ($null -ne $attemptResult -and [bool]$attemptResult.succeeded) { $task.status='result_ready' }
+        else { $task.status='pending'; $task.lastError=if($null -eq $attemptResult){'Interrupted before a durable result was produced.'}else{[string]$attemptResult.error} }
+    }
 
-    foreach ($task in @($tasks.tasks | Where-Object status -eq 'submitted')) {
-        $existing = Get-RalphPullRequest -RepositoryRoot $root -Configuration $configuration -Head ([string]$task.branch) -Base ([string]$configuration.integrationBranch)
-        if ($null -ne $existing -and [string]$existing.state -in @('merged', 'completed')) {
-            $task.pullRequest = $existing
-            $task.status = 'integrated'
-            $state.integrationSha = [string]$existing.mergeSha
-            Save-BuildLedger -Ledger $tasks -Paths $paths
-            try { Remove-RalphMergedAssignment -RepositoryRoot $root -Configuration $configuration -Identity ([string]$task.taskId) -Branch ([string]$task.branch) -PullRequest $existing } catch { Write-Warning $_.Exception.Message }
-        } elseif ($null -ne $existing -and [string]$existing.state -in @('open', 'active')) {
-            $merged = Complete-RalphPullRequest -RepositoryRoot $root -Configuration $configuration -PullRequest $existing
-            $task.pullRequest = $merged
-            $task.status = 'integrated'
-            $state.integrationSha = [string]$merged.mergeSha
-            Save-BuildLedger -Ledger $tasks -Paths $paths
-            try { Remove-RalphMergedAssignment -RepositoryRoot $root -Configuration $configuration -Identity ([string]$task.taskId) -Branch ([string]$task.branch) -PullRequest $merged } catch { Write-Warning $_.Exception.Message }
-        } else {
-            $task.status = 'pending'
-            $task.lastError = 'Submitted task had no reusable pull request; assignment will be reconciled.'
+    # Recover pull requests created or merged immediately before a crash.
+    foreach ($task in @($tasks.tasks | Where-Object status -in @('result_ready','submitted'))) {
+        if (-not $task.resultSha) { $task.status='pending'; continue }
+        $existing = Get-RalphPullRequest $root $configuration ([string]$task.branch) ([string]$configuration.integrationBranch) ([string]$task.resultSha)
+        if ($null -ne $existing) {
+            $merged = Complete-RalphPullRequest $root $configuration $existing
+            $task.pullRequest=$merged; $task.status='integrated'; $task.lastError=$null; $state.integrationSha=[string]$merged.mergeSha
+            Save-BuildLedger $tasks $paths; Save-RalphState $state $paths
+            try { Remove-RalphMergedAssignment $root $configuration ([string]$task.taskId) ([string]$task.branch) $merged } catch { Write-Warning $_.Exception.Message }
         }
     }
-    foreach ($task in @($tasks.tasks | Where-Object status -eq 'active')) {
-        $task.status = 'pending'
-        $task.lastError = 'Resuming an interrupted assignment from its recorded worktree and branch.'
-    }
-    Save-BuildLedger -Ledger $tasks -Paths $paths
+    Save-BuildLedger $tasks $paths
+    $state.integrationSha = Ensure-RalphIntegrationBranch $root $configuration $state (Get-KnownTaskMergeShas $tasks)
+    Save-RalphState $state $paths
 
     while (@($tasks.tasks | Where-Object status -ne 'integrated').Count -gt 0) {
-        Assert-RalphPlanDrift -State $state -RepositoryRoot $root -RequirePlan
-        $exhausted = @($tasks.tasks | Where-Object { $_.status -ne 'integrated' -and [int]$_.attemptCount -ge [int]$configuration.maximumTaskAttempts })
-        if ($exhausted.Count -gt 0) {
-            foreach ($task in $exhausted) { $task.status = 'blocked' }
-            $tasks.status = 'blocked'
-            Save-BuildLedger -Ledger $tasks -Paths $paths
-            throw "Task attempts exhausted: $(@($exhausted.taskId) -join ', ')"
-        }
+        Assert-RalphPlanDrift $state $root -RequirePlan
+        Assert-RalphLedgerIdentity $state $tasks task
+        [void](Assert-RalphTargetDrift $root $configuration $state)
+        $state.integrationSha = Ensure-RalphIntegrationBranch $root $configuration $state (Get-KnownTaskMergeShas $tasks)
 
-        $wave = @(Select-RalphReadyItems -Items @($tasks.tasks) -Kind task -Maximum ([int]$configuration.maximumConcurrentBuilders))
-        if ($wave.Count -eq 0) { throw 'No dependency-ready, non-conflicting tasks remain. Inspect blocked dependencies and path ownership.' }
-
-        $baseSha = (Invoke-RalphNative -Command 'git' -Arguments @('-C', $root, 'rev-parse', [string]$configuration.integrationBranch)).Output.Trim()
-        foreach ($task in $wave) {
-            $task.branch = "worktree/$($task.taskId)"
-            $task.baseSha = $baseSha
-            $task.worktree = New-RalphWorktree -RepositoryRoot $root -Configuration $configuration -Identity ([string]$task.taskId) -Branch ([string]$task.branch) -BaseReference $baseSha
-            $task.status = 'active'
-            $task.attemptCount = [int]$task.attemptCount + 1
-            $task.lastError = $null
-        }
-        Save-BuildLedger -Ledger $tasks -Paths $paths
-
-        $jobs = foreach ($task in $wave) {
-            $taskJson = $task | ConvertTo-Json -Depth 50 -Compress
-            Start-ThreadJob -Name ([string]$task.taskId) -ArgumentList @($PSScriptRoot, $root, [string]$task.worktree, $taskJson) -ScriptBlock {
-                param($ScriptsPath, $RepositoryRoot, $Worktree, $TaskJson)
-                . (Join-Path $ScriptsPath 'common.ps1')
-                $task = $TaskJson | ConvertFrom-Json -Depth 50
-                $context = 'Task assignment:' + [Environment]::NewLine + ($task | ConvertTo-Json -Depth 50)
-                try {
-                    $result = Invoke-RalphRole -RepositoryRoot $RepositoryRoot -WorkingDirectory $Worktree -Role 'builder' -Context $context -SchemaName 'builder-result.schema.json' -Sandbox 'workspace-write'
-                    [pscustomobject]@{ identity = [string]$task.taskId; succeeded = $true; result = $result; error = $null }
-                } catch {
-                    [pscustomobject]@{ identity = [string]$task.taskId; succeeded = $false; result = $null; error = $_.Exception.Message }
-                }
-            }
-        }
-
-        [void](Wait-Job -Job $jobs -Timeout 5400)
-        foreach ($job in $jobs) {
-            $task = @($wave | Where-Object taskId -eq $job.Name)[0]
-            if ($job.State -ne 'Completed') {
-                Stop-Job -Job $job -ErrorAction SilentlyContinue
-                $task.status = 'pending'
-                $task.lastError = 'Builder exceeded the 90-minute assignment deadline.'
-                continue
-            }
-            $jobResult = Receive-Job -Job $job
-            if ($null -eq $jobResult -or -not [bool]$jobResult.succeeded) {
-                $task.status = 'pending'
-                $task.lastError = if ($null -eq $jobResult) { 'Builder returned no result.' } else { [string]$jobResult.error }
-                continue
-            }
-            $result = $jobResult.result
-            if ([string]$result.status -ceq 'blocked') {
-                $task.status = 'pending'
-                $task.lastError = [string]$result.blocker
-                continue
-            }
-
+        # Finish durable successful results first; no second builder attempt is needed.
+        $readyResults = @($tasks.tasks | Where-Object status -in @('result_ready','submitted'))
+        foreach ($task in $readyResults) {
+            $attemptResult = Read-RalphAttemptResult $paths ([string]$task.taskId) ([int]$task.attemptCount)
+            if ($null -eq $attemptResult -or -not [bool]$attemptResult.succeeded) { $task.status='pending'; continue }
+            $result = $attemptResult.result
+            Write-Host "VERIFYING TASK: $($task.taskId) attempt $($task.attemptCount)"
             try {
-                $commit = Assert-RalphAssignmentCommit -Worktree ([string]$task.worktree) -BaseSha ([string]$task.baseSha) -Item $task
+                Assert-RalphPlanDrift $state $root -RequirePlan; Assert-RalphLedgerIdentity $state $tasks task; [void](Assert-RalphTargetDrift $root $configuration $state)
+                $commit = Assert-RalphAssignmentCommit ([string]$task.worktree) ([string]$task.baseSha) $task
                 if ([string]$result.commitSha -cne [string]$commit.Head) { throw 'Builder result commit SHA does not match the worktree HEAD.' }
-                $task.resultSha = [string]$commit.Head
-                $verificationContext = 'Verify only this task:' + [Environment]::NewLine + ($task | ConvertTo-Json -Depth 50) + [Environment]::NewLine + 'Builder result:' + [Environment]::NewLine + ($result | ConvertTo-Json -Depth 50)
-                $verification = Invoke-RalphRole -RepositoryRoot $root -WorkingDirectory ([string]$task.worktree) -Role 'verifier' -Context $verificationContext -SchemaName 'verifier-result.schema.json' -Sandbox 'read-only'
-                if (-not [bool]$verification.approved) { throw "Focused verification failed: $(@($verification.findings) -join '; ')" }
-                $task.status = 'submitted'
-                Save-BuildLedger -Ledger $tasks -Paths $paths
-                $merged = Publish-RalphAssignment -RepositoryRoot $root -Worktree ([string]$task.worktree) -Configuration $configuration -Item $task -Kind task
-                $task.pullRequest = $merged
-                $task.status = 'integrated'
-                $task.lastError = $null
-                $state.integrationSha = [string]$merged.mergeSha
-                [void](Invoke-RalphNative -Command 'git' -Arguments @('-C', $root, 'branch', '-f', [string]$configuration.integrationBranch, "$($configuration.remote)/$($configuration.integrationBranch)"))
-                Save-BuildLedger -Ledger $tasks -Paths $paths
-                Save-RalphState -State $state -Paths $paths
-                try { Remove-RalphMergedAssignment -RepositoryRoot $root -Configuration $configuration -Identity ([string]$task.taskId) -Branch ([string]$task.branch) -PullRequest $merged } catch { Write-Warning $_.Exception.Message }
-            } catch {
-                $task.status = 'pending'
-                $task.lastError = $_.Exception.Message
-                Write-Warning "$($task.taskId) attempt $($task.attemptCount) failed: $($task.lastError) $($_.ScriptStackTrace)"
+                $task.resultSha=[string]$commit.Head; $task.status='result_ready'; Save-BuildLedger $tasks $paths
+                $context='Verify only this task:'+[Environment]::NewLine+($task|ConvertTo-Json -Depth 50)+[Environment]::NewLine+'Builder result:'+[Environment]::NewLine+($result|ConvertTo-Json -Depth 50)
+                $verification=Invoke-RalphRole $root ([string]$task.worktree) 'verifier' $context 'verifier-result.schema.json' 'read-only'
+                if(-not[bool]$verification.approved){throw "Focused verification failed: $(@($verification.findings)-join'; ')"}
+                Assert-RalphPlanDrift $state $root -RequirePlan; Assert-RalphLedgerIdentity $state $tasks task; [void](Assert-RalphTargetDrift $root $configuration $state)
+                $state.integrationSha=Ensure-RalphIntegrationBranch $root $configuration $state (Get-KnownTaskMergeShas $tasks)
+                Write-Host "PUBLISHING TASK PR: $($task.taskId) at $($task.resultSha)"
+                $merged=Publish-RalphAssignment $root ([string]$task.worktree) $configuration $task task
+                Write-Host "TASK PR MERGED: $($task.taskId) -> $($merged.mergeSha)"
+                $task.pullRequest=$merged; $task.status='integrated'; $task.lastError=$null; $state.integrationSha=[string]$merged.mergeSha
+                Save-BuildLedger $tasks $paths; Save-RalphState $state $paths
+                try { Remove-RalphMergedAssignment $root $configuration ([string]$task.taskId) ([string]$task.branch) $merged } catch { Write-Warning $_.Exception.Message }
+            } catch { $task.status=if($task.resultSha){'result_ready'}else{'pending'}; $task.lastError=$_.Exception.Message; Write-Warning "$($task.taskId) attempt $($task.attemptCount) failed: $($task.lastError)" }
+        }
+        Save-BuildLedger $tasks $paths
+        if (@($tasks.tasks | Where-Object status -ne 'integrated').Count -eq 0) { break }
+
+        $exhausted=@($tasks.tasks|Where-Object{$_.status-ne'integrated'-and[int]$_.attemptCount-ge[int]$configuration.maximumTaskAttempts})
+        if($exhausted){foreach($task in $exhausted){$task.status='blocked'};$tasks.status='blocked';Save-BuildLedger $tasks $paths;throw "Task attempts exhausted: $(@($exhausted.taskId)-join', ')"}
+        $wave=@(Select-RalphReadyItems @($tasks.tasks) task ([int]$configuration.maximumConcurrentBuilders))
+        if(-not$wave){throw 'No dependency-ready, non-conflicting tasks remain. Inspect blocked dependencies and path ownership.'}
+        $baseSha=[string]$state.integrationSha
+        foreach($task in $wave){
+            if(-not$task.branch){$task.branch="worktree/$($task.taskId)"}; if(-not$task.baseSha){$task.baseSha=$baseSha}
+            $task.worktree=New-RalphWorktree $root $configuration ([string]$task.taskId) ([string]$task.branch) ([string]$task.baseSha) ([string]$task.resultSha)
+            $task.attemptCount=[int]$task.attemptCount+1; $task.status='active'; $task.lastError=$null
+            $assignment=[ordered]@{schemaVersion='1.0';identity=[string]$task.taskId;attempt=[int]$task.attemptCount;baseSha=[string]$task.baseSha;startingHead=(Invoke-RalphNative git @('-C',[string]$task.worktree,'rev-parse','HEAD')).Output.Trim();createdAt=[DateTimeOffset]::UtcNow.ToString('O');item=$task}
+            Write-RalphImmutableJson (Get-RalphAttemptPath $paths assignment ([string]$task.taskId) ([int]$task.attemptCount)) $assignment
+        }
+        Save-BuildLedger $tasks $paths
+
+        $jobs=foreach($task in $wave){
+            $taskJson=$task|ConvertTo-Json -Depth 50 -Compress; $resultPath=Get-RalphAttemptPath $paths result ([string]$task.taskId) ([int]$task.attemptCount)
+            Start-ThreadJob -Name ([string]$task.taskId) -ArgumentList @($PSScriptRoot,$root,[string]$task.worktree,$taskJson,$resultPath) -ScriptBlock {
+                param($ScriptsPath,$RepositoryRoot,$Worktree,$TaskJson,$ResultPath)
+                . (Join-Path $ScriptsPath 'common.ps1');$task=$TaskJson|ConvertFrom-Json -Depth 50;$context='Task assignment:'+[Environment]::NewLine+($task|ConvertTo-Json -Depth 50)
+                try{$result=Invoke-RalphRole $RepositoryRoot $Worktree 'builder' $context 'builder-result.schema.json' 'workspace-write';$record=[ordered]@{schemaVersion='1.0';identity=[string]$task.taskId;attempt=[int]$task.attemptCount;succeeded=$true;result=$result;error=$null;completedAt=[DateTimeOffset]::UtcNow.ToString('O')}}catch{$record=[ordered]@{schemaVersion='1.0';identity=[string]$task.taskId;attempt=[int]$task.attemptCount;succeeded=$false;result=$null;error=$_.Exception.Message;completedAt=[DateTimeOffset]::UtcNow.ToString('O')}}
+                Write-RalphImmutableJson $ResultPath $record;$record
             }
         }
-        $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
-        Save-BuildLedger -Ledger $tasks -Paths $paths
-        Show-RalphStatus -State $state -Tasks $tasks
+        $outerTimeout=([int]$configuration.agentTimeoutMinutes*60)+[int]$configuration.agentCleanupGraceSeconds+30
+        try {
+            [void](Wait-Job $jobs -Timeout $outerTimeout)
+            foreach($job in $jobs){$task=@($wave|Where-Object { $_.taskId -eq $job.Name })[0];if($job.State-ne'Completed'){Stop-Job $job -ErrorAction SilentlyContinue;$task.status='pending';$task.lastError='Builder did not stop after the bounded agent deadline.';continue};$record=Receive-Job $job;if($null-eq$record-or-not[bool]$record.succeeded){$task.status='pending';$task.lastError=if($null-eq$record){'Builder returned no durable result.'}else{[string]$record.error}}else{$task.status='result_ready'}}
+        } finally { $jobs|ForEach-Object{if($_.State-ne'Completed'){Stop-Job $_ -ErrorAction SilentlyContinue};Remove-Job $_ -Force -ErrorAction SilentlyContinue} }
+        Save-BuildLedger $tasks $paths; Show-RalphStatus $state $tasks
     }
 
-    $verificationWorktree = New-RalphAuditWorktree -RepositoryRoot $root -Configuration $configuration -Reference "$($configuration.remote)/$($configuration.integrationBranch)"
-    try {
-        $integrationContext = "Perform only a lightweight integration verification of completed tasks at integration SHA $($state.integrationSha). Confirm the project builds and the most direct smoke checks pass. Do not perform the deep audit."
-        $integrationVerification = Invoke-RalphRole -RepositoryRoot $root -WorkingDirectory $verificationWorktree -Role 'verifier' -Context $integrationContext -SchemaName 'verifier-result.schema.json' -Sandbox 'read-only'
-        if (-not [bool]$integrationVerification.approved) { throw "Lightweight integration verification failed: $(@($integrationVerification.findings) -join '; ')" }
-    } finally {
-        Remove-RalphAuditWorktree -RepositoryRoot $root -Configuration $configuration
-    }
-
-    $tasks.status = 'complete'
-    Save-BuildLedger -Ledger $tasks -Paths $paths
-    $state.stage = 'audit'
-    $state.stageStatus = 'not_started'
-    $state.blocker = $null
-    Save-RalphState -State $state -Paths $paths
-    $attempts = @($tasks.tasks | ForEach-Object { [int]$_.attemptCount })
-    $summary = [ordered]@{
-        completedAt = [DateTimeOffset]::UtcNow.ToString('O')
-        totalTasks = @($tasks.tasks).Count
-        integratedTasks = @($tasks.tasks | Where-Object status -eq 'integrated').Count
-        totalAttempts = ($attempts | Measure-Object -Sum).Sum
-        averageAttempts = if ($attempts.Count -eq 0) { 0 } else { [Math]::Round((($attempts | Measure-Object -Average).Average), 2) }
-        taskCommits = @($tasks.tasks.resultSha | Where-Object { $null -ne $_ })
-        pullRequests = @($tasks.tasks.pullRequest | Where-Object { $null -ne $_ })
-        integrationSha = $state.integrationSha
-        integrationVerification = $integrationVerification
-        remainingBlockers = @()
-    }
-    Write-RalphSummary -Path $paths.BuildSummary -Summary $summary
-    Show-RalphStatus -State $state -Tasks $tasks
-    Write-Host 'BUILD COMPLETE: all tasks are integrated. The audit loop may run.'
+    Write-Host 'BUILD: final drift check'
+    Assert-RalphPlanDrift $state $root -RequirePlan; Assert-RalphLedgerIdentity $state $tasks task; [void](Assert-RalphTargetDrift $root $configuration $state)
+    $state.integrationSha=Ensure-RalphIntegrationBranch $root $configuration $state (Get-KnownTaskMergeShas $tasks)
+    Write-Host 'BUILD: create integration verifier worktree'
+    $verificationWorktree=New-RalphAuditWorktree $root $configuration "$($configuration.remote)/$($configuration.integrationBranch)"
+    try{Write-Host 'BUILD: run integration verifier';$context="Perform lightweight integration verification at exact SHA $($state.integrationSha). Confirm the build and direct smoke checks only.";$integrationVerification=Invoke-RalphRole $root $verificationWorktree 'verifier' $context 'verifier-result.schema.json' 'read-only';if(-not[bool]$integrationVerification.approved){throw "Lightweight integration verification failed: $(@($integrationVerification.findings)-join'; ')"}}finally{Write-Host 'BUILD: remove verifier worktree';Remove-RalphAuditWorktree $root $configuration}
+    Assert-RalphPlanDrift $state $root -RequirePlan; Assert-RalphLedgerIdentity $state $tasks task; [void](Assert-RalphTargetDrift $root $configuration $state)
+    $tasks.status='complete';Save-BuildLedger $tasks $paths;$state.stage='audit';$state.stageStatus='not_started';$state.blocker=$null;Save-RalphState $state $paths
+    $attempts=@($tasks.tasks|ForEach-Object{[int]$_.attemptCount});$summary=[ordered]@{completedAt=[DateTimeOffset]::UtcNow.ToString('O');totalTasks=@($tasks.tasks).Count;integratedTasks=@($tasks.tasks|Where-Object { $_.status -eq 'integrated' }).Count;totalAttempts=($attempts|Measure-Object -Sum).Sum;averageAttempts=if($attempts.Count){[Math]::Round((($attempts|Measure-Object -Average).Average),2)}else{0};taskCommits=@($tasks.tasks.resultSha|Where-Object{$_});pullRequests=@($tasks.tasks.pullRequest|Where-Object{$_});integrationSha=$state.integrationSha;integrationVerification=$integrationVerification;remainingBlockers=@()}
+    Write-RalphSummary $paths.BuildSummary $summary;Show-RalphStatus $state $tasks;Write-Host 'BUILD COMPLETE: all tasks are integrated. The audit loop may run.'
 }
-catch {
-    if ($null -ne $state) {
-        if ($null -ne $tasks) { try { Save-BuildLedger -Ledger $tasks -Paths $paths } catch {} }
-        Set-RalphBlocked -State $state -Paths $paths -Scope 'build' -Message $_.Exception.Message -RequiredDecision 'Resolve the reported task, provider, drift, or environment blocker, then rerun build-loop.ps1.'
-    }
-    throw
-}
-finally {
-    if ($null -ne $lock) { $lock.Dispose() }
-}
+catch { if($null-ne$state){if($null-ne$tasks){try{Save-BuildLedger $tasks $paths}catch{}};Set-RalphBlocked $state $paths 'build' $null $_.Exception.Message 'Resolve the exact task, provider, drift, or environment blocker, then rerun build-loop.ps1.'};throw }
+finally { if($null-ne$lock){$lock.Dispose()} }

@@ -3,27 +3,31 @@
   "$defs": {
     "pullRequest": {
       "type": "object",
-      "required": ["id", "url", "state", "head", "base", "mergeSha"],
+      "required": ["id", "url", "state", "repository", "head", "headSha", "base", "baseSha", "mergeSha"],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "url": { "type": "string", "minLength": 1 },
         "state": { "type": "string", "minLength": 1 },
+        "repository": { "type": "string", "minLength": 1 },
         "head": { "type": "string", "minLength": 1 },
+        "headSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
         "base": { "type": "string", "minLength": 1 },
+        "baseSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
         "mergeSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" }
       },
       "additionalProperties": false
     },
     "bug": {
       "type": "object",
-      "required": ["bugId", "title", "severity", "category", "status", "requirementIds", "description", "evidence", "actualBehavior", "requiredBehavior", "impact", "requiredCorrection", "acceptanceTest", "dependencies", "allowedPaths", "exclusiveResources", "attemptCount", "branch", "worktree", "baseSha", "resultSha", "pullRequest", "lastError"],
+      "required": ["bugId", "title", "severity", "category", "status", "disposition", "requirementIds", "description", "evidence", "actualBehavior", "requiredBehavior", "impact", "requiredCorrection", "acceptanceTest", "dependencies", "allowedPaths", "exclusiveResources", "attemptCount", "branch", "worktree", "baseSha", "resultSha", "pullRequest", "lastError"],
       "properties": {
         "bugId": { "type": "string", "pattern": "^BUG-[0-9]{4}$" },
         "title": { "type": "string", "minLength": 1 },
         "severity": { "enum": ["critical", "high", "medium", "low", "informational"] },
         "category": { "type": "string", "minLength": 1 },
-        "status": { "enum": ["open", "active", "fixed", "verified", "blocked"] },
-        "requirementIds": { "type": "array", "items": { "type": "string", "pattern": "^REQ-[A-Z0-9-]+" }, "uniqueItems": true },
+        "status": { "enum": ["open", "active", "result_ready", "ready_to_publish", "verified", "blocked"] },
+        "disposition": { "enum": [null, "fixed", "not_reproducible"] },
+        "requirementIds": { "type": "array", "items": { "type": "string", "pattern": "^REQ-[A-Z0-9-]+$" }, "uniqueItems": true },
         "description": { "type": "string", "minLength": 1 },
         "evidence": { "type": "string", "minLength": 1 },
         "actualBehavior": { "type": "string", "minLength": 1 },
@@ -46,11 +50,12 @@
     }
   },
   "type": "object",
-  "required": ["schemaVersion", "revision", "auditSha", "status", "bugs"],
+  "required": ["schemaVersion", "revision", "auditSha", "definitionHash", "status", "bugs"],
   "properties": {
     "schemaVersion": { "const": "1.0" },
     "revision": { "type": "integer", "minimum": 0 },
     "auditSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+    "definitionHash": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
     "status": { "enum": ["not_audited", "ready", "active", "complete", "blocked"] },
     "bugs": { "type": "array", "items": { "$ref": "#/$defs/bug" } }
   },

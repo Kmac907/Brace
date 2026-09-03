@@ -19,13 +19,13 @@ function Save-PullRequests([object[]]$PullRequests) {
     [System.IO.File]::WriteAllText($statePath, ($PullRequests | ConvertTo-Json -Depth 30 -AsArray), $utf8)
 }
 
-if ($CliArguments[0] -ceq 'auth' -and $CliArguments[1] -ceq 'status') { exit 0 }
+if ($CliArguments[0] -ceq 'auth' -and $CliArguments[1] -ceq 'status') { return }
 if ($CliArguments[0] -ceq 'api' -and $CliArguments[1] -ceq 'user') {
     Write-Output 'fixture-owner'
-    exit 0
+    return
 }
 if ($CliArguments[0] -ceq 'repo' -and $CliArguments[1] -ceq 'view') {
-    exit 1
+    [Environment]::Exit(1)
 }
 if ($CliArguments[0] -ceq 'repo' -and $CliArguments[1] -ceq 'create') {
     if ([string]::IsNullOrWhiteSpace($env:RALPH_FAKE_BOOTSTRAP_REMOTE)) {
@@ -34,28 +34,34 @@ if ($CliArguments[0] -ceq 'repo' -and $CliArguments[1] -ceq 'create') {
     $source = Get-ValueAfter '--source'
     [void](& git init --bare $env:RALPH_FAKE_BOOTSTRAP_REMOTE 2>&1)
     if ($LASTEXITCODE -ne 0) { throw 'Unable to initialize fake bootstrap remote.' }
-    [void](& git -C $source remote add origin $env:RALPH_FAKE_BOOTSTRAP_REMOTE 2>&1)
+    $repository = $CliArguments[2]
+    $hostedRemote = "https://github.com/$repository.git"
+    [void](& git -C $source config "url.$env:RALPH_FAKE_BOOTSTRAP_REMOTE.insteadOf" $hostedRemote 2>&1)
+    [void](& git -C $source remote add origin $hostedRemote 2>&1)
     if ($LASTEXITCODE -ne 0) { throw 'Unable to configure fake bootstrap remote.' }
     [void](& git -C $source push --set-upstream origin main 2>&1)
     if ($LASTEXITCODE -ne 0) { throw 'Unable to push fake bootstrap remote.' }
-    exit 0
+    return
 }
 if ($CliArguments[0] -ceq 'pr' -and $CliArguments[1] -ceq 'list') {
     $head = Get-ValueAfter '--head'
     $base = Get-ValueAfter '--base'
     $pullRequestMatches = @(Read-PullRequests | Where-Object { $_.headRefName -ceq $head -and $_.baseRefName -ceq $base })
     Write-Output (ConvertTo-Json -InputObject $pullRequestMatches -Depth 30 -Compress)
-    exit 0
+    return
 }
 if ($CliArguments[0] -ceq 'pr' -and $CliArguments[1] -ceq 'create') {
     $items = @(Read-PullRequests)
     $head = Get-ValueAfter '--head'
     $base = Get-ValueAfter '--base'
+    [void](& git fetch origin 2>&1)
+    $headSha = (& git rev-parse "origin/$head" 2>&1).Trim()
+    $baseSha = (& git rev-parse "origin/$base" 2>&1).Trim()
     $number = $items.Count + 1
-    $items += [pscustomobject]@{number=$number;url="https://example.invalid/pr/$number";state='OPEN';headRefName=$head;baseRefName=$base;mergeCommit=$null}
+    $items += [pscustomobject]@{number=$number;url="https://example.invalid/pr/$number";state='OPEN';headRefName=$head;headRefOid=$headSha;baseRefName=$base;baseRefOid=$baseSha;mergeCommit=$null}
     Save-PullRequests $items
     Write-Output "https://example.invalid/pr/$number"
-    exit 0
+    return
 }
 if ($CliArguments[0] -ceq 'pr' -and $CliArguments[1] -ceq 'merge') {
     $id = [int]$CliArguments[2]
@@ -73,6 +79,6 @@ if ($CliArguments[0] -ceq 'pr' -and $CliArguments[1] -ceq 'merge') {
         if ($LASTEXITCODE -ne 0) { throw 'Fake provider could not delete PR head.' }
     }
     Save-PullRequests $items
-    exit 0
+    return
 }
 throw "Unsupported fake gh invocation: $($CliArguments -join ' ')"

@@ -9,14 +9,10 @@
   "maximumTaskAttempts": 3,
   "maximumBugAttempts": 3,
   "maximumPlanningQuestionRounds": 5,
+  "agentTimeoutMinutes": 90,
+  "agentCleanupGraceSeconds": 10,
   "worktreeRoot": null,
   "deleteMergedBranches": true,
-  "github": {
-    "repository": null
-  },
-  "azureDevOps": {
-    "organization": null,
-    "project": null,
-    "repository": null
-  }
+  "github": { "repository": null },
+  "azureDevOps": { "organization": null, "project": null, "repository": null }
 }
