@@ -1,26 +1,107 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["status", "summary", "commitSha", "changedFiles", "checks", "blocker"],
+  "required": [
+    "status",
+    "summary",
+    "commitSha",
+    "changedFiles",
+    "checks",
+    "blocker"
+  ],
   "properties": {
-    "status": { "enum": ["fixed", "not_reproducible", "blocked"] },
-    "summary": { "type": "string", "minLength": 1 },
-    "commitSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
-    "changedFiles": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "status": {
+      "enum": [
+        "fixed",
+        "not_reproducible",
+        "blocked"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "commitSha": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "changedFiles": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
     "checks": {
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["command", "result", "evidence"],
+        "required": [
+          "command",
+          "result",
+          "evidence"
+        ],
         "properties": {
-          "command": { "type": "string" },
-          "result": { "enum": ["passed", "failed", "skipped"] },
-          "evidence": { "type": "string" }
+          "command": {
+            "type": "string"
+          },
+          "result": {
+            "enum": [
+              "passed",
+              "failed",
+              "skipped"
+            ]
+          },
+          "evidence": {
+            "type": "string"
+          }
         },
         "additionalProperties": false
       }
     },
-    "blocker": { "type": ["string", "null"] }
+    "blocker": {
+      "$ref": "blocker.schema.json"
+    }
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "blocked"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "blocker": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "enum": [
+              "fixed",
+              "not_reproducible"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "blocker": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ]
 }

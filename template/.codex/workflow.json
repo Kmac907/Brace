@@ -9,6 +9,7 @@
   "maximumTaskAttempts": 3,
   "maximumBugAttempts": 3,
   "maximumPlanningQuestionRounds": 5,
+  "maximumAmendmentRounds": 3,
   "agentTimeoutMinutes": 90,
   "agentCleanupGraceSeconds": 10,
   "worktreeRoot": null,

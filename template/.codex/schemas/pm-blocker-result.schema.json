@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "summary",
+    "recommendation",
+    "question",
+    "amendmentRequired",
+    "effects",
+    "options",
+    "affectedTaskIds",
+    "affectedBugIds"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "recommendation": {
+      "type": "string",
+      "minLength": 1
+    },
+    "question": {
+      "type": "string",
+      "minLength": 1
+    },
+    "options": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "optionId",
+          "label",
+          "description",
+          "recommended",
+          "action",
+          "requiresInput",
+          "inputPrompt",
+          "authorizedDocumentationPaths",
+          "bugDispositions"
+        ],
+        "properties": {
+          "optionId": {
+            "type": "string",
+            "pattern": "^OPTION-[0-9]{4}$"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "recommended": {
+            "type": "boolean"
+          },
+          "action": {
+            "enum": [
+              "amend",
+              "disposition",
+              "retry",
+              "stop"
+            ]
+          },
+          "requiresInput": {
+            "type": "boolean"
+          },
+          "inputPrompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "authorizedDocumentationPaths": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          },
+          "bugDispositions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "bugId",
+                "disposition",
+                "evidence"
+              ],
+              "properties": {
+                "bugId": {
+                  "type": "string",
+                  "pattern": "^BUG-[0-9]{4}$"
+                },
+                "disposition": {
+                  "enum": [
+                    "not_reproducible",
+                    "superseded"
+                  ]
+                },
+                "evidence": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "affectedTaskIds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^TASK-[0-9]{4}$"
+      },
+      "uniqueItems": true
+    },
+    "affectedBugIds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^BUG-[0-9]{4}$"
+      },
+      "uniqueItems": true
+    },
+    "amendmentRequired": {
+      "type": "boolean"
+    },
+    "effects": {
+      "type": "object",
+      "required": [
+        "requirements",
+        "plan",
+        "tasks",
+        "bugs",
+        "completedWork",
+        "schedule"
+      ],
+      "properties": {
+        "requirements": {
+          "type": "string",
+          "minLength": 1
+        },
+        "plan": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tasks": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bugs": {
+          "type": "string",
+          "minLength": 1
+        },
+        "completedWork": {
+          "type": "string",
+          "minLength": 1
+        },
+        "schedule": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

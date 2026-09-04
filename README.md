@@ -123,7 +123,23 @@ audit-loop.ps1 -> bugs.json -> BUG worktrees -> bug PRs
 final validation -> project PR -> main -> cleanup
 ```
 
-The three stage scripts are the only normal workflow entry points. Task selection, retries, verification, pull requests, reconciliation, and cleanup are coordinator responsibilities.
+The three stage scripts are the only normal workflow entry points. Task selection, retries, verification, pull requests, reconciliation, and cleanup are coordinator responsibilities. The PM is an internal Codex role invoked by the build or audit loop only when a semantic decision is necessary; there is no separate PM command.
+
+## Ownership and agent communication
+
+The PowerShell coordinator and the Codex agents have deliberately different responsibilities:
+
+| Component | Owns | Must not do |
+| --- | --- | --- |
+| Coordinator scripts | state.json, tasks.json, bugs.json, attempt records, worktrees, branches, retries, provider PRs, merges, reconciliation, and cleanup | Invent requirements, choose product behavior, or make semantic scope decisions |
+| Planner agent | Analyze requirements, ask essential planning questions, normalize requirements, produce plan.md, and propose the initial task graph | Edit ledgers, publish branches, or integrate work |
+| Builder agents | Implement one assigned task and create one focused commit | Edit shared ledgers or contract files, select more work, or contact another agent |
+| Auditor agent | Produce one fresh, bounded whole-project finding set | Edit the repository or run an endless review loop |
+| Bug-fixer agents | Correct one assigned frozen bug and create one focused commit | Add unrelated findings or edit shared ledgers |
+| Verifier agents | Independently verify one assignment or final integration state | Expand a focused review into a new audit |
+| PM agent | Analyze semantic blockers, recommend options, and implement a user-approved requirements/plan amendment | Handle ordinary tool failures, edit source code, edit ledgers, or merge its own work |
+
+Agents do not communicate directly with each other. A builder, fixer, auditor, or verifier returns a schema-validated result to the coordinator. For an operational failure, the coordinator retries or stops under the configured limits. For a semantic blocker, the coordinator passes the exact evidence to the PM, presents the PM's recommendation and alternatives interactively to the user, and records the selected option.
 
 ## Parallel agents
 
@@ -170,14 +186,14 @@ Tracked workflow files travel with the project:
 | `.codex/workflow.json` | Provider, concurrency, retry, timeout, branch, and worktree settings |
 | `.codex/AGENTS.md` | Coordinator-wide agent rules |
 | `.codex/scripts/` | Planning, build, audit, and shared coordinator scripts |
-| `.codex/prompts/` | Planner, builder, verifier, auditor, and bug-fixer role instructions |
+| `.codex/prompts/` | Planner, PM, builder, verifier, auditor, and bug-fixer role instructions |
 | `.codex/schemas/` | Strict JSON contracts for state and agent results |
 
 Mutable workflow records are local and ignored by Git:
 
 | Path | Purpose |
 | --- | --- |
-| `.codex/state.json` | Current stage, frozen identities and hashes, integration SHA, and blocker |
+| `.codex/state.json` | Current stage, frozen identities and hashes, integration SHA, accepted integration merges, blocker, and resumable PM amendment state |
 | `.codex/tasks.json` | Frozen task definitions plus assignment and integration status |
 | `.codex/bugs.json` | Frozen audit findings plus fix and verification status |
 | `.codex/assignments/` | Immutable assignment record for every attempt |
@@ -205,15 +221,39 @@ Checks run at stage startup, between assignment waves, after agent work, and bef
 
 If a script is interrupted, run the same stage script again. It reconciles durable attempt records, worktrees, branches, pull requests, and provider merge results before scheduling replacement work.
 
-When a genuine blocker is found, the script records and prints:
+Blockers are handled by type:
 
-- the blocked stage;
-- the exact reason; and
-- the decision or correction required.
+- Operational blockers include tool failures, authentication, provider outages, timeouts, missing executable dependencies, and exhausted retries. The deterministic coordinator retries when safe and otherwise records the exact correction needed.
+- Semantic blockers include missing project information, a requirements/plan conflict, a scope gap, invalid task decomposition, or a bug-disposition decision. The coordinator invokes the PM agent instead of trying to amend documentation itself.
 
-Assignment-specific failures and attempt counts remain attached to their task or bug in the corresponding ledger.
+For a semantic blocker, the PM works read-only first and returns a recommendation, alternatives, consequences, affected task or bug IDs, and one clear question. The same running script prompts the user immediately. It does not write questions to a JSON inbox or require a separate resume command.
 
-Correct that external condition and rerun the same script. Do not reset ledgers or delete worktrees to force progress.
+If the user approves an amendment, the PM edits only requirements.md and plan.md in worktree/AMEND-NNNN. Integrated work stays immutable. New work is appended as monotonically numbered tasks, and only untouched pending tasks may be superseded. The coordinator validates coverage and dependency integrity, integrates the amendment through a real provider PR, updates the ledgers, and resumes automatically.
+
+If an audit-stage amendment changes scope, the previous audit ledger is archived, new implementation tasks run first, and a fresh whole-project audit is required afterward. Interrupted PM analysis, user selection, amendment work, PR creation, or merge is recovered from state.activeAmendment by rerunning the same build or audit script.
+
+### Interactive blocker example
+
+Suppose a builder proves that a required behavior is missing from both `requirements.md` and `plan.md`. The builder returns a `scope_gap` blocker and does not choose the missing behavior itself. The coordinator pauses new scheduling, preserves every result already produced by the wave, and asks the PM to analyze the evidence. The terminal then shows the PM's recommended option, legitimate alternatives, and the effect of each option.
+
+If the user approves the recommendation, the coordinator records that exact answer. The PM creates one documentation-only commit in `worktree/AMEND-NNNN`; the coordinator verifies the authorized files and decision identity, merges the amendment through a provider pull request, appends any follow-up tasks, supersedes only invalidated untouched tasks, and resumes the build in the same script invocation. If the user selects `stop`, no amendment is made and the workflow remains blocked with the decision preserved.
+
+### Amendment recovery states
+
+`state.json` contains at most one active amendment. Rerunning the same stage script reconciles the recorded state before doing more work:
+
+| State | Durable fact | Resume behavior |
+| --- | --- | --- |
+| `analyzing` | Blocker identity and PM analysis path are reserved | Reuse a valid immutable analysis result, or rerun only the missing analysis |
+| `awaiting_user` | PM options are validated | Ask interactively; if an answer was already persisted, do not ask again |
+| `approved` | Exact option, response, decision hash, and authorized files are recorded | Reconcile or create the amendment worktree and assignment |
+| `agent_active` | PM assignment exists | Reuse a durable result; if a commit exists without a result, recover its structured result without editing |
+| `result_ready` | PM result exists | Verify decision identity, exact commit, changed paths, task graph, and requirement coverage |
+| `submitted` | Exact provider pull-request identity is recorded | Reconcile its repository, head SHA, base SHA, and merge result; do not create a duplicate PR |
+| `integrated` | Provider merge SHA is accepted on the integration branch | Apply validated task and bug ledger changes once |
+| `applied` | Contract hashes and ledgers reflect the amendment | Clean owned resources, clear the active amendment, and resume the recorded stage |
+
+Assignment-specific failures and attempt counts remain attached to their task or bug. Do not reset ledgers or delete worktrees to force progress.
 
 Agent execution is bounded by `agentTimeoutMinutes`. A timed-out Codex process tree is terminated and given `agentCleanupGraceSeconds` to stop before the assignment is retried or blocked.
 
@@ -246,6 +286,7 @@ The bootstrapper writes `.codex/workflow.json`. Important settings are:
 | `maximumTaskAttempts` | `3` | Attempt limit per task |
 | `maximumBugAttempts` | `3` | Attempt limit per bug |
 | `maximumPlanningQuestionRounds` | `5` | Maximum interactive clarification rounds |
+| `maximumAmendmentRounds` | `3` | Maximum user-approved semantic amendment cycles per workflow |
 | `agentTimeoutMinutes` | `90` | Deadline for one Codex role invocation |
 | `agentCleanupGraceSeconds` | `10` | Process-tree teardown grace period |
 | `worktreeRoot` | `null` | Optional external worktree parent; system temporary storage when unset |
@@ -284,6 +325,15 @@ Provider-specific repository identity is written under `github` or `azureDevOps`
 
 Running a remote script with `irm | iex` is convenient but trusts the referenced repository revision. Pin a reviewed release tag or commit when reproducibility is more important than automatically receiving the latest bootstrapper.
 
+## Troubleshooting
+
+- **Authentication or provider outage:** This is operational, so the PM is not invoked. Restore the `gh`, `az`, Git, or network session and rerun the same stage script. The coordinator reuses matching resources and rejects conflicting ones.
+- **Rejected amendment:** Selecting the stop option preserves the blocker and decision. It does not amend project documentation, mutate task or bug definitions, or create a provider pull request. Any reserved amendment worktree and branch remain recoverable coordinator resources. Change project direction only through a new explicit user decision; do not hand-edit coordinator ledgers.
+- **Stale or wrong-head pull request:** The coordinator requires the recorded provider repository, PR ID, source branch, target branch, head SHA, base SHA, and merge SHA. Close or correct the conflicting provider resource, then rerun; it is never accepted by branch name alone.
+- **Scope or task conflict:** The PM must propose monotonically numbered follow-up tasks. The coordinator rejects unknown or cyclic dependencies, uncovered requirements, unsafe paths, forbidden scope, mutation of integrated tasks, and superseding a task whose work is not safely preserved.
+- **Amendment attempts exhausted:** After `maximumAmendmentRounds`, the workflow stops without claiming completion. Existing decisions, immutable agent results, worktrees, and the unresolved blocker remain available for inspection and recovery.
+- **Interrupted amendment:** Do not delete its worktree or state. Rerun the same build or audit script; the recovery table above describes the exact reconciliation behavior.
+
 ## Development and tests
 
 Clone this workflow repository and run:
@@ -292,7 +342,7 @@ Clone this workflow repository and run:
 & .\tests\Run-Tests.ps1
 ```
 
-The suite covers common state behavior, Git worktree isolation, drift and reconciliation, process-tree timeout cleanup, bootstrap behavior, and the complete planning-to-merge workflow. Tests use disposable local Git repositories and deterministic provider and agent fixtures; they do not create real remote repositories.
+The suite covers common state behavior, Git worktree isolation, drift and reconciliation, process-tree timeout cleanup, bootstrap behavior, PM-driven scope amendment and resumption, and the complete planning-to-merge workflow. Tests use disposable local Git repositories and deterministic provider and agent fixtures; they do not create real remote repositories.
 
 When changing workflow behavior, preserve the planning → build → audit design and add deterministic coverage for the affected state transition, recovery path, or cleanup rule.
 

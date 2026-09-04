@@ -23,13 +23,15 @@ Assert-TestThrows -Action { Assert-RalphGraph -Items @($cycle1,$cycle2) -Kind ta
 $unsafe = [pscustomobject]@{ taskId='TASK-0001'; dependencies=@(); allowedPaths=@('**'); exclusiveResources=@(); requirementIds=@('REQ-A-001') }
 Assert-TestThrows -Action { Assert-RalphAssignmentPaths -Item $unsafe } -Pattern 'too broad'
 Assert-TestThrows -Action { Assert-RalphTaskCoverage -Tasks @($task1) -RequirementsMarkdown '- REQ-MISSING-001: required' } -Pattern 'REQ-MISSING-001'
+Assert-TestTrue -Condition (Test-RalphSemanticBlocker ([pscustomobject]@{kind='scope_gap';requiresUserDecision=$true;scopeChangePossible=$true})) -Message 'semantic scope blocker selects PM'
+Assert-TestTrue -Condition (-not (Test-RalphSemanticBlocker ([pscustomobject]@{kind='operational';requiresUserDecision=$false;scopeChangePossible=$false}))) -Message 'operational blocker does not select PM'
 
 $temporary = New-TestDirectory
 try {
     $schema = Join-Path (Split-Path $common -Parent) '..\schemas\state.schema.json'
     $path = Join-Path $temporary 'state.json'
     $state = [ordered]@{
-        schemaVersion='1.0';revision=0;repositoryRoot=$temporary;provider='github';repository='owner/repo';remote='origin';remoteUrl='https://github.com/owner/repo.git';targetBranch='main';targetBaseSha=$null;integrationBranch='ralph/integration';configurationHash=('sha256:' + ('0' * 64));taskDefinitionHash=$null;bugDefinitionHash=$null;stage='requirements';stageStatus='not_started';requirementsHash=$null;planHash=$null;integrationSha=$null;finalMergeSha=$null;blocker=$null;createdAt=[DateTimeOffset]::UtcNow.ToString('O');updatedAt=[DateTimeOffset]::UtcNow.ToString('O')
+        schemaVersion='1.2';revision=0;repositoryRoot=$temporary;provider='github';repository='owner/repo';remote='origin';remoteUrl='https://github.com/owner/repo.git';targetBranch='main';targetBaseSha=$null;integrationBranch='ralph/integration';configurationHash=('sha256:' + ('0' * 64));taskDefinitionHash=$null;bugDefinitionHash=$null;stage='requirements';stageStatus='not_started';requirementsHash=$null;planHash=$null;integrationSha=$null;acceptedIntegrationShas=@();finalMergeSha=$null;blocker=$null;amendmentSequence=0;activeAmendment=$null;createdAt=[DateTimeOffset]::UtcNow.ToString('O');updatedAt=[DateTimeOffset]::UtcNow.ToString('O')
     }
     Write-RalphJsonAtomic -Path $path -Value $state -SchemaPath $schema
     $read = Read-RalphJson -Path $path -SchemaPath $schema

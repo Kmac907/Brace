@@ -6,6 +6,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
+. (Join-Path $PSScriptRoot 'pm.ps1')
 
 $root = Get-RalphRepositoryRoot -Path $Repository
 $configuration = Get-RalphConfiguration -RepositoryRoot $root
@@ -115,6 +116,8 @@ Inspect requirements.md and the existing repository directly. If confirmed clari
     $localPlanningSha = (Invoke-RalphNative -Command 'git' -Arguments @('-C', $root, 'rev-parse', 'HEAD')).Output.Trim()
     $remotePlanningSha = (Invoke-RalphNative -Command 'git' -Arguments @('-C', $root, 'rev-parse', "$($configuration.remote)/$($configuration.targetBranch)")).Output.Trim()
     if ($localPlanningSha -cne $remotePlanningSha) { throw 'Remote target branch does not match the committed planning result.' }
+    $planHash = Get-RalphGitBlobIdentity -RepositoryRoot $root -Reference $remotePlanningSha -Path 'plan.md'
+    $requirementsHash = Get-RalphGitBlobIdentity -RepositoryRoot $root -Reference $remotePlanningSha -Path 'requirements.md'
 
     $persistedTasks = foreach ($task in @($completedResult.tasks)) {
         [ordered]@{
@@ -136,11 +139,13 @@ Inspect requirements.md and the existing repository directly. If confirmed clari
             resultSha = $null
             pullRequest = $null
             lastError = $null
+            amendmentId = $null
+            supersededBy = @()
         }
     }
     $definitionHash = Get-RalphDefinitionHash -Items @($persistedTasks) -Kind task
     $tasks = [ordered]@{
-        schemaVersion = '1.0'
+        schemaVersion = '1.1'
         revision = [int]$tasks.revision + 1
         planHash = $planHash
         definitionHash = $definitionHash
@@ -151,7 +156,7 @@ Inspect requirements.md and the existing repository directly. If confirmed clari
 
     $state.stage = 'build'
     $state.stageStatus = 'not_started'
-    $state.requirementsHash = Get-RalphFileHash -Path $requirementsPath
+    $state.requirementsHash = $requirementsHash
     $state.planHash = $planHash
     $state.targetBaseSha = $remotePlanningSha
     $state.taskDefinitionHash = $definitionHash

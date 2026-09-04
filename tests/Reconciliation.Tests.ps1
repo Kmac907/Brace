@@ -35,8 +35,8 @@ try {
     $state = New-RalphState $repository $configuration 'fixture/project'
     $baseSha = (Invoke-RalphNative git @('rev-parse','HEAD') $repository).Output.Trim()
     $state.targetBaseSha = $baseSha
-    $state.requirementsHash = Get-RalphFileHash (Join-Path $repository 'requirements.md')
-    $state.planHash = Get-RalphFileHash (Join-Path $repository 'plan.md')
+    $state.requirementsHash = Get-RalphGitBlobIdentity $repository $baseSha 'requirements.md'
+    $state.planHash = Get-RalphGitBlobIdentity $repository $baseSha 'plan.md'
     Assert-RalphStateIdentity $state $repository $configuration
     Assert-TestThrows { $state.repository='wrong/repository'; Assert-RalphStateIdentity $state $repository $configuration } 'repository identity'
     $state.repository='fixture/project'

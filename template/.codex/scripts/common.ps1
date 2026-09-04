@@ -164,7 +164,7 @@ function Get-RalphConfiguration {
         if ([string]::IsNullOrWhiteSpace([string]$config.$name)) { throw "workflow.json is missing $name." }
     }
     if ([string]$config.targetBranch -ceq [string]$config.integrationBranch) { throw 'Target and integration branches must differ.' }
-    foreach ($name in @('maximumConcurrentBuilders', 'maximumConcurrentFixers', 'maximumTaskAttempts', 'maximumBugAttempts', 'maximumPlanningQuestionRounds')) {
+    foreach ($name in @('maximumConcurrentBuilders', 'maximumConcurrentFixers', 'maximumTaskAttempts', 'maximumBugAttempts', 'maximumPlanningQuestionRounds', 'maximumAmendmentRounds')) {
         if ([int]$config.$name -lt 1 -or [int]$config.$name -gt 32) { throw "workflow.json field $name must be between 1 and 32." }
     }
     if ([int]$config.agentTimeoutMinutes -lt 1 -or [int]$config.agentTimeoutMinutes -gt 1440) { throw 'agentTimeoutMinutes must be between 1 and 1440.' }
@@ -391,6 +391,34 @@ function Reset-RalphCompletedWorkflow {
         }
     }
     foreach ($file in @($paths.State,$paths.Tasks,$paths.Bugs,$paths.PlanningSummary,$paths.BuildSummary,$paths.AuditSummary)) { if ([IO.File]::Exists($file)) { [IO.File]::Delete($file) } }
+}
+function Recover-RalphCommittedAttempt {
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)]$Paths,
+        [Parameter(Mandatory)]$Item,
+        [ValidateSet('task','bug')][string]$Kind
+    )
+    if (-not $Item.worktree -or -not [IO.Directory]::Exists([string]$Item.worktree)) { return $null }
+    $identity = if ($Kind -eq 'task') { [string]$Item.taskId } else { [string]$Item.bugId }
+    if (-not $Item.baseSha -or [int]$Item.attemptCount -lt 1) { throw "Cannot recover ${identity}: base or attempt identity is missing." }
+    $status = (Invoke-RalphNative git @('-C',[string]$Item.worktree,'status','--porcelain','--untracked-files=all')).Output
+    if (-not [string]::IsNullOrWhiteSpace($status)) { throw "Interrupted worktree contains uncommitted changes: $identity" }
+    $head = (Invoke-RalphNative git @('-C',[string]$Item.worktree,'rev-parse','HEAD')).Output.Trim()
+    if ((Invoke-RalphNative git @('-C',[string]$Item.worktree,'merge-base','--is-ancestor',[string]$Item.baseSha,$head)-AllowedExitCodes @(0,1)).ExitCode -ne 0) { throw "Interrupted worktree does not descend from its recorded base: $identity" }
+    if ($head -ceq [string]$Item.baseSha) { return $null }
+    $schema = if ($Kind -eq 'task') { 'builder-result.schema.json' } else { 'fixer-result.schema.json' }
+    $role = if ($Kind -eq 'task') { 'builder' } else { 'bug-fixer' }
+    $context = "Recovery mode for $identity attempt $($Item.attemptCount). A commit exists but the coordinator result record was interrupted. Inspect exact base $($Item.baseSha) and HEAD $head. Do not edit, commit, or rewrite history. Return the structured result for the existing commit only.`nAssignment:`n$($Item|ConvertTo-Json -Depth 50)"
+    $result = Invoke-RalphRole $RepositoryRoot ([string]$Item.worktree) $role $context $schema 'read-only'
+    $expectedStatus = if ($Kind -eq 'task') { 'completed' } else { 'fixed' }
+    if ([string]$result.status -cne $expectedStatus -or [string]$result.commitSha -cne $head) { throw "Recovered result does not identify the existing $identity commit." }
+    $afterStatus = (Invoke-RalphNative git @('-C',[string]$Item.worktree,'status','--porcelain','--untracked-files=all')).Output
+    $afterHead = (Invoke-RalphNative git @('-C',[string]$Item.worktree,'rev-parse','HEAD')).Output.Trim()
+    if (-not [string]::IsNullOrWhiteSpace($afterStatus) -or $afterHead -cne $head) { throw "Recovery agent modified the $identity worktree." }
+    $record = [ordered]@{schemaVersion='1.0';identity=$identity;attempt=[int]$Item.attemptCount;succeeded=$true;result=$result;error=$null;completedAt=[DateTimeOffset]::UtcNow.ToString('O')}
+    Write-RalphImmutableJson (Get-RalphAttemptPath $Paths result $identity ([int]$Item.attemptCount)) $record
+    [pscustomobject]$record
 }
 function Assert-RalphPlanDrift {
     param(
@@ -635,7 +663,7 @@ function New-RalphWorktree {
     }
     $branchExists=(Invoke-RalphNative git @('-C',$RepositoryRoot,'show-ref','--verify','--quiet',"refs/heads/$Branch")-AllowedExitCodes @(0,1)).ExitCode-eq0
     if($branchExists){[void](Invoke-RalphNative git @('-C',$RepositoryRoot,'worktree','add','--',$path,$Branch))}else{[void](Invoke-RalphNative git @('-C',$RepositoryRoot,'worktree','add','-b',$Branch,'--',$path,$BaseReference))}
-    $head=(Invoke-RalphNative git @('-C',$path,'rev-parse','HEAD')).Output.Trim(); if($branchExists-and(Invoke-RalphNative git @('-C',$path,'merge-base','--is-ancestor',$BaseReference,$head)-AllowedExitCodes @(0,1)).ExitCode-ne0){throw "Existing branch does not descend from its recorded base: $Identity"}; $path
+    $head=(Invoke-RalphNative git @('-C',$path,'rev-parse','HEAD')).Output.Trim(); if($branchExists-and(Invoke-RalphNative git @('-C',$path,'merge-base','--is-ancestor',$BaseReference,$head)-AllowedExitCodes @(0,1)).ExitCode-ne0){throw "Existing branch does not descend from its recorded base: $Identity"}; if($ExpectedHeadSha-and$head-cne$ExpectedHeadSha){throw "Existing branch HEAD differs from its recorded result: $Identity"}; $path
 }
 
 function Remove-RalphWorktree {
@@ -670,6 +698,8 @@ function Assert-RalphAssignmentCommit {
     $head = (Invoke-RalphNative -Command 'git' -Arguments @('-C', $Worktree, 'rev-parse', 'HEAD')).Output.Trim()
     $ancestor = (Invoke-RalphNative -Command 'git' -Arguments @('-C', $Worktree, 'merge-base', '--is-ancestor', $BaseSha, $head) -AllowedExitCodes @(0, 1)).ExitCode -eq 0
     if (-not $ancestor -or $head -ceq $BaseSha) { throw 'Agent did not create a descendant commit for the assignment.' }
+    $commitCount = [int](Invoke-RalphNative git @('-C', $Worktree, 'rev-list', '--count', "$BaseSha..$head")).Output.Trim()
+    if ($commitCount -ne 1) { throw "Agent assignment must contain exactly one commit; found $commitCount." }
     $changed = @((Invoke-RalphNative -Command 'git' -Arguments @('-C', $Worktree, 'diff', '--name-only', "$BaseSha..$head")).Lines)
     foreach ($changedPath in $changed) {
         $normalized = ([string]$changedPath).Replace('\', '/')
@@ -685,7 +715,7 @@ function Assert-RalphAssignmentCommit {
 
 function Ensure-RalphIntegrationBranch {
     param([Parameter(Mandatory)][string]$RepositoryRoot,[Parameter(Mandatory)]$Configuration,[Parameter(Mandatory)]$State,[string[]]$AllowedMergeShas=@())
-    [void](Invoke-RalphNative git @('-C',$RepositoryRoot,'fetch',[string]$Configuration.remote,'--prune')); $branch=[string]$Configuration.integrationBranch; $remote=[string]$Configuration.remote; $target=[string]$Configuration.targetBranch
+    [void](Invoke-RalphNative git @('-C',$RepositoryRoot,'fetch',[string]$Configuration.remote,'--prune')); $branch=[string]$Configuration.integrationBranch; $remote=[string]$Configuration.remote; $target=[string]$Configuration.targetBranch; $AllowedMergeShas=@($AllowedMergeShas)+@($State.acceptedIntegrationShas)
     $localExists=(Invoke-RalphNative git @('-C',$RepositoryRoot,'show-ref','--verify','--quiet',"refs/heads/$branch")-AllowedExitCodes @(0,1)).ExitCode-eq0; $remoteExists=(Invoke-RalphNative git @('-C',$RepositoryRoot,'show-ref','--verify','--quiet',"refs/remotes/$remote/$branch")-AllowedExitCodes @(0,1)).ExitCode-eq0
     if(-not$localExists-and-not$remoteExists){[void](Invoke-RalphNative git @('-C',$RepositoryRoot,'branch',$branch,"$remote/$target"));[void](Invoke-RalphNative git @('-C',$RepositoryRoot,'push','--set-upstream',$remote,$branch))}elseif(-not$localExists){[void](Invoke-RalphNative git @('-C',$RepositoryRoot,'branch','--track',$branch,"$remote/$branch"))}elseif(-not$remoteExists){throw "Local integration branch exists without its remote counterpart: $branch"}
     $localSha=(Invoke-RalphNative git @('-C',$RepositoryRoot,'rev-parse',$branch)).Output.Trim(); $remoteSha=(Invoke-RalphNative git @('-C',$RepositoryRoot,'rev-parse',"$remote/$branch")).Output.Trim()
@@ -809,3 +839,7 @@ function Remove-RalphAuditWorktree {
     }
     Remove-RalphEmptyWorktreeContainers -RepositoryRoot $RepositoryRoot -Configuration $Configuration
 }
+
+# Load optional PM and amendment support after the base coordinator functions.
+$ralphPmPath = Join-Path $PSScriptRoot 'pm.ps1'
+if ([IO.File]::Exists($ralphPmPath)) { . $ralphPmPath }

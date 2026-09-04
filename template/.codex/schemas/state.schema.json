@@ -1,45 +1,479 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["schemaVersion", "revision", "repositoryRoot", "provider", "repository", "remote", "remoteUrl", "targetBranch", "targetBaseSha", "integrationBranch", "configurationHash", "taskDefinitionHash", "bugDefinitionHash", "stage", "stageStatus", "requirementsHash", "planHash", "integrationSha", "finalMergeSha", "blocker", "createdAt", "updatedAt"],
+  "required": [
+    "schemaVersion",
+    "revision",
+    "repositoryRoot",
+    "provider",
+    "repository",
+    "remote",
+    "remoteUrl",
+    "targetBranch",
+    "targetBaseSha",
+    "integrationBranch",
+    "configurationHash",
+    "taskDefinitionHash",
+    "bugDefinitionHash",
+    "stage",
+    "stageStatus",
+    "requirementsHash",
+    "planHash",
+    "integrationSha",
+    "acceptedIntegrationShas",
+    "finalMergeSha",
+    "blocker",
+    "amendmentSequence",
+    "activeAmendment",
+    "createdAt",
+    "updatedAt"
+  ],
   "properties": {
-    "schemaVersion": { "const": "1.0" },
-    "revision": { "type": "integer", "minimum": 0 },
-    "repositoryRoot": { "type": "string", "minLength": 1 },
-    "provider": { "enum": ["github", "azure_devops"] },
-    "repository": { "type": "string", "minLength": 1 },
-    "remote": { "type": "string", "minLength": 1 },
-    "remoteUrl": { "type": "string", "minLength": 1 },
-    "targetBranch": { "type": "string", "minLength": 1 },
-    "targetBaseSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
-    "integrationBranch": { "type": "string", "minLength": 1 },
-    "configurationHash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-    "taskDefinitionHash": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
-    "bugDefinitionHash": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
-    "stage": { "enum": ["requirements", "planning", "build", "audit", "complete", "blocked"] },
-    "stageStatus": { "enum": ["not_started", "running", "complete", "blocked"] },
-    "requirementsHash": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
-    "planHash": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
-    "integrationSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
-    "finalMergeSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+    "schemaVersion": {
+      "const": "1.2"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "repositoryRoot": {
+      "type": "string",
+      "minLength": 1
+    },
+    "provider": {
+      "enum": [
+        "github",
+        "azure_devops"
+      ]
+    },
+    "repository": {
+      "type": "string",
+      "minLength": 1
+    },
+    "remote": {
+      "type": "string",
+      "minLength": 1
+    },
+    "remoteUrl": {
+      "type": "string",
+      "minLength": 1
+    },
+    "targetBranch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "targetBaseSha": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "integrationBranch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "configurationHash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "taskDefinitionHash": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "bugDefinitionHash": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "stage": {
+      "enum": [
+        "requirements",
+        "planning",
+        "build",
+        "audit",
+        "complete",
+        "blocked"
+      ]
+    },
+    "stageStatus": {
+      "enum": [
+        "not_started",
+        "running",
+        "awaiting_user",
+        "amending",
+        "complete",
+        "blocked"
+      ]
+    },
+    "requirementsHash": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^(sha256:[0-9a-f]{64}|gitblob:[0-9a-f]{40,64})$"
+    },
+    "planHash": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^(sha256:[0-9a-f]{64}|gitblob:[0-9a-f]{40,64})$"
+    },
+    "integrationSha": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "acceptedIntegrationShas": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{40}$"
+      },
+      "uniqueItems": true
+    },
+    "finalMergeSha": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
     "blocker": {
       "oneOf": [
-        { "type": "null" },
+        {
+          "type": "null"
+        },
         {
           "type": "object",
-          "required": ["scope", "identity", "message", "requiredDecision"],
+          "required": [
+            "scope",
+            "identity",
+            "message",
+            "requiredDecision"
+          ],
           "properties": {
-            "scope": { "type": "string" },
-            "identity": { "type": ["string", "null"] },
-            "message": { "type": "string", "minLength": 1 },
-            "requiredDecision": { "type": "string", "minLength": 1 }
+            "scope": {
+              "type": "string"
+            },
+            "identity": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1
+            },
+            "requiredDecision": {
+              "type": "string",
+              "minLength": 1
+            }
           },
           "additionalProperties": false
         }
       ]
     },
-    "createdAt": { "type": "string", "format": "date-time" },
-    "updatedAt": { "type": "string", "format": "date-time" }
+    "amendmentSequence": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "activeAmendment": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "amendmentId",
+            "sourceStage",
+            "sourceKind",
+            "sourceIdentity",
+            "status",
+            "blocker",
+            "analysisResultPath",
+            "selectedOptionId",
+            "userResponse",
+            "decisionIdentity",
+            "authorizedDocumentationPaths",
+            "branch",
+            "worktree",
+            "baseSha",
+            "resultSha",
+            "pullRequest",
+            "affectedTaskIds",
+            "affectedBugIds",
+            "resumeStage",
+            "attemptCount"
+          ],
+          "properties": {
+            "amendmentId": {
+              "type": "string",
+              "pattern": "^AMEND-[0-9]{4}$"
+            },
+            "sourceStage": {
+              "enum": [
+                "build",
+                "audit"
+              ]
+            },
+            "sourceKind": {
+              "enum": [
+                "task",
+                "bug",
+                "verification",
+                "audit"
+              ]
+            },
+            "sourceIdentity": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "enum": [
+                "analyzing",
+                "awaiting_user",
+                "approved",
+                "agent_active",
+                "result_ready",
+                "submitted",
+                "integrated",
+                "applied"
+              ]
+            },
+            "blocker": {
+              "type": "object",
+              "required": [
+                "kind",
+                "message",
+                "evidence",
+                "affectedIdentity",
+                "requiresUserDecision",
+                "scopeChangePossible",
+                "smallestResolution",
+                "prohibitedDecisions"
+              ],
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "operational",
+                    "missing_information",
+                    "contract_conflict",
+                    "scope_gap",
+                    "task_decomposition",
+                    "bug_disposition"
+                  ]
+                },
+                "message": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "evidence": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "requiresUserDecision": {
+                  "type": "boolean"
+                },
+                "scopeChangePossible": {
+                  "type": "boolean"
+                },
+                "affectedIdentity": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^(TASK|BUG)-[0-9]{4}$"
+                },
+                "smallestResolution": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "prohibitedDecisions": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uniqueItems": true
+                }
+              },
+              "additionalProperties": false
+            },
+            "analysisResultPath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "selectedOptionId": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^OPTION-[0-9]{4}$"
+            },
+            "userResponse": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "worktree": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "baseSha": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "resultSha": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "pullRequest": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "url",
+                    "state",
+                    "repository",
+                    "head",
+                    "headSha",
+                    "base",
+                    "baseSha",
+                    "mergeSha"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "url": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "state": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "repository": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "head": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "headSha": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{40}$"
+                    },
+                    "base": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "baseSha": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{40}$"
+                    },
+                    "mergeSha": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "pattern": "^[0-9a-f]{40}$"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "affectedTaskIds": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^TASK-[0-9]{4}$"
+              },
+              "uniqueItems": true
+            },
+            "affectedBugIds": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^BUG-[0-9]{4}$"
+              },
+              "uniqueItems": true
+            },
+            "resumeStage": {
+              "enum": [
+                "build",
+                "audit"
+              ]
+            },
+            "attemptCount": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "decisionIdentity": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "authorizedDocumentationPaths": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
   },
   "additionalProperties": false
 }
