@@ -66,6 +66,8 @@ Open the generated `requirements.md` and replace every `TODO`. Requirements use 
 
 Describe the expected behavior, constraints, integrations, security boundaries, failure handling, testing, delivery, and acceptance criteria. Mark intentionally excluded work as a non-goal instead of leaving it ambiguous.
 
+To turn an existing project idea into the template efficiently, copy the reusable instructions from [`REQUIREMENTS-PROMPT.md`](template/REQUIREMENTS-PROMPT.md) into your coding-agent session and paste the idea where indicated. The idea may be a short paragraph, rough notes, an existing specification, or a detailed proposal. The prompt asks one concise batch of questions only when blocking ambiguity exists and never invents requirements.
+
 ### 3. Run planning
 
 From the generated project root:

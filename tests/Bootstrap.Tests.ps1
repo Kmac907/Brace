@@ -31,6 +31,7 @@ try {
 
     $target = Join-Path $projects 'fixture-project'
     Assert-TestTrue -Condition ([IO.File]::Exists((Join-Path $target 'requirements.md'))) -Message 'requirements template copied'
+    Assert-TestTrue -Condition ([IO.File]::Exists((Join-Path $target 'REQUIREMENTS-PROMPT.md'))) -Message 'requirements authoring prompt copied'
     Assert-TestTrue -Condition ([IO.File]::Exists((Join-Path $target '.codex\scripts\planning-loop.ps1'))) -Message 'planning loop copied'
     Assert-TestTrue -Condition ([IO.File]::Exists((Join-Path $target '.codex\state.json'))) -Message 'workflow state initialized'
     $workflow = [IO.File]::ReadAllText((Join-Path $target '.codex\workflow.json')) | ConvertFrom-Json
