@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/brace-banner.png" width="900" alt="Brace: isolated Git branches converging safely inside code braces">
+  <img src="assets/brace-logo.png" width="900" alt="Brace: isolated Git branches converging safely inside code braces">
 </p>
 
 <h1 align="center">Brace</h1>
