@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square" alt="Python 3.11 or newer">
   <img src="https://img.shields.io/badge/agents-Codex-111827?style=flat-square" alt="Codex agents">
   <img src="https://img.shields.io/badge/providers-GitHub%20%7C%20Azure%20DevOps-2563EB?style=flat-square" alt="GitHub and Azure DevOps">
-  <img src="https://img.shields.io/badge/license-all%20rights%20reserved-4B5563?style=flat-square" alt="All rights reserved">
+  <img src="https://img.shields.io/badge/license-GPLv3-blue?style=flat-square" alt="GNU GPL version 3">
 </p>
 
 ---
@@ -238,4 +238,4 @@ Tests use temporary local Git repositories and mocked provider and agent boundar
 
 ## License
 
-Copyright © 2026 Kmac907. All rights reserved. See [LICENSE](LICENSE).
+Copyright © 2026 Kmac907. Brace is licensed under the [GNU General Public License version 3](LICENSE).
