@@ -26,6 +26,24 @@ Assert-TestThrows -Action { Assert-RalphTaskCoverage -Tasks @($task1) -Requireme
 Assert-TestTrue -Condition (Test-RalphSemanticBlocker ([pscustomobject]@{kind='scope_gap';requiresUserDecision=$true;scopeChangePossible=$true})) -Message 'semantic scope blocker selects PM'
 Assert-TestTrue -Condition (-not (Test-RalphSemanticBlocker ([pscustomobject]@{kind='operational';requiresUserDecision=$false;scopeChangePossible=$false}))) -Message 'operational blocker does not select PM'
 
+$templateRoot = Join-Path (Split-Path $common -Parent) '..'
+$plannerPrompt = [System.IO.File]::ReadAllText((Join-Path $templateRoot 'prompts\planner.md'))
+$pmPrompt = [System.IO.File]::ReadAllText((Join-Path $templateRoot 'prompts\project-manager.md'))
+Assert-TestTrue -Condition $plannerPrompt.Contains('one agent in one bounded session') -Message 'planner requires single-session tasks'
+Assert-TestTrue -Condition $plannerPrompt.Contains('executable UI or browser verification when the repository provides suitable tooling') -Message 'planner requires conditional UI verification'
+Assert-TestTrue -Condition $pmPrompt.Contains('one agent in one bounded session') -Message 'PM follow-up tasks preserve sizing rule'
+Assert-TestTrue -Condition $pmPrompt.Contains('executable UI or browser verification when the repository provides suitable tooling') -Message 'PM follow-up tasks preserve conditional UI verification'
+$invalidPromptCharacters = @(
+    Get-ChildItem -LiteralPath (Join-Path $templateRoot 'prompts') -Filter '*.md' |
+        ForEach-Object {
+            $promptPath = $_.FullName
+            [System.IO.File]::ReadAllText($promptPath).ToCharArray() |
+                Where-Object { [int]$_ -lt 32 -and $_ -notin @("`t", "`r", "`n") } |
+                ForEach-Object { "$promptPath contains U+$('{0:X4}' -f [int]$_)" }
+        }
+)
+Assert-TestEqual -Expected 0 -Actual $invalidPromptCharacters.Count -Message 'agent prompts contain no unexpected control characters'
+
 $temporary = New-TestDirectory
 try {
     $schema = Join-Path (Split-Path $common -Parent) '..\schemas\state.schema.json'

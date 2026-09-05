@@ -24,17 +24,23 @@ The provider account must be allowed to create repositories, branches, and pull 
 
 ## Quick start
 
-### 1. Create the project
+### 1. Bootstrap the project
 
-The shortest bootstrap runs directly from this repository and prompts for the project name, local parent directory, and provider:
+The shortest bootstrap runs directly from this repository. It first asks whether you are installing into an existing Git repository:
 
 ```powershell
 irm https://raw.githubusercontent.com/Kmac907/worktree-ralph/main/New-WorktreeRalphProject.ps1 | iex
 ```
 
+```text
+Is this an existing Git repository? [y/N]
+```
+
+Answer `N` to create a new local project and remote repository. Answer `Y` to install the workflow into an existing clean repository. The existing-repository path defaults to the current directory.
+
 This executes code downloaded from `Kmac907/worktree-ralph` with your current PowerShell permissions. Review the script first if you do not trust the repository or its maintainers. For reproducible automation, replace `main` in the URL with a release tag or exact commit.
 
-To supply the settings without prompts:
+To create a new project without prompts:
 
 ```powershell
 $bootstrap = irm https://raw.githubusercontent.com/Kmac907/worktree-ralph/main/New-WorktreeRalphProject.ps1
@@ -48,7 +54,18 @@ $bootstrap = irm https://raw.githubusercontent.com/Kmac907/worktree-ralph/main/N
     -MaximumConcurrentFixers 3
 ```
 
-The bootstrapper:
+To install into an existing repository without prompts:
+
+```powershell
+$bootstrap = irm https://raw.githubusercontent.com/Kmac907/worktree-ralph/main/New-WorktreeRalphProject.ps1
+
+& ([scriptblock]::Create([string]$bootstrap)) `
+    -ExistingRepositoryPath C:\Code\Projects\MyExistingProject `
+    -MaximumConcurrentBuilders 3 `
+    -MaximumConcurrentFixers 3
+```
+
+For a new project, the bootstrapper:
 
 - creates an empty local project directory;
 - copies the repository-local workflow template;
@@ -59,6 +76,22 @@ The bootstrapper:
 - removes its temporary clone after successful setup.
 
 It refuses to overwrite a non-empty destination or reuse an existing remote repository.
+
+For an existing project, the bootstrapper:
+
+- requires a clean Git worktree on the provider's target branch;
+- requires local `HEAD` to exactly match the corresponding `origin` branch;
+- detects GitHub or Azure DevOps identity from `origin`;
+- refuses an existing `.codex` directory instead of overwriting it;
+- installs the repository-local `.codex` workflow;
+- preserves existing source files, `requirements.md`, and `REQUIREMENTS-PROMPT.md`;
+- appends bounded Worktree Ralph sections to existing `.gitignore`, `.gitattributes`, and `AGENTS.md` files;
+- creates missing requirement and instruction templates;
+- validates the copied scripts and stages only workflow-owned paths;
+- creates and pushes one focused installation commit; and
+- initializes ignored local workflow state using the detected repository identity.
+
+It never initializes another Git repository, creates another remote, rewrites history, force-pushes, or overwrites an existing workflow installation. If the remote, branch, provider, or repository identity cannot be determined safely, it stops with an exact error before installation.
 
 ### 2. Write the requirements
 
@@ -86,6 +119,8 @@ When planning finishes, it:
 - writes the local `tasks.json` queue;
 - commits and pushes the planning documents to `main`; and
 - prints `PLANNING COMPLETE` with a project summary.
+
+Implementation tasks must fit one bounded agent session and produce one focused commit. Tasks that change user-visible behavior include executable UI or browser verification when the project provides suitable tooling; otherwise they use the best available project-specific verification.
 
 ### 4. Run the build
 
@@ -302,6 +337,7 @@ Provider-specific repository identity is written under `github` or `azureDevOps`
 
 | Parameter | Behavior |
 | --- | --- |
+| `ExistingRepositoryPath` | Installs into this existing clean repository and skips the interactive existing/new question |
 | `ProjectName` | New local directory and remote repository name; prompted when omitted |
 | `ParentDirectory` | Existing local parent directory; prompted when omitted |
 | `Provider` | `github` or `azure_devops`; prompted when omitted |
@@ -316,6 +352,8 @@ Provider-specific repository identity is written under `github` or `azureDevOps`
 | `GitUserEmail` | Repository-local Git author override |
 | `SourceRepository` | Workflow source; defaults to this GitHub repository |
 
+`ExistingRepositoryPath` cannot be combined with `ProjectName` or `ParentDirectory`. Supplying the new-project parameters selects the original new-project flow for unattended use. With neither mode supplied, the bootstrapper asks the single existing-repository question.
+
 ## Security model
 
 - The scripts do not write provider or Codex credentials into the project.
@@ -329,6 +367,9 @@ Running a remote script with `irm | iex` is convenient but trusts the referenced
 
 ## Troubleshooting
 
+- **Existing repository is dirty:** Commit or preserve every tracked and untracked change, then rerun the bootstrapper. It intentionally makes no installation changes in this condition.
+- **Existing `.codex` directory:** The bootstrapper does not guess whether an existing `.codex` tree is compatible. Inspect or remove it deliberately before retrying; an installed Worktree Ralph project should continue with its repository-local stage scripts instead of being bootstrapped again.
+- **Branch or remote mismatch:** Check out the remote's target branch and make it exactly match `origin`. The bootstrapper will not install on a feature branch, adopt an unpushed commit, or infer an unsupported provider URL.
 - **Authentication or provider outage:** This is operational, so the PM is not invoked. Restore the `gh`, `az`, Git, or network session and rerun the same stage script. The coordinator reuses matching resources and rejects conflicting ones.
 - **Rejected amendment:** Selecting the stop option preserves the blocker and decision. It does not amend project documentation, mutate task or bug definitions, or create a provider pull request. Any reserved amendment worktree and branch remain recoverable coordinator resources. Change project direction only through a new explicit user decision; do not hand-edit coordinator ledgers.
 - **Stale or wrong-head pull request:** The coordinator requires the recorded provider repository, PR ID, source branch, target branch, head SHA, base SHA, and merge SHA. Close or correct the conflicting provider resource, then rerun; it is never accepted by branch name alone.
