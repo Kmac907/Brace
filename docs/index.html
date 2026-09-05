@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Brace coordinates controlled multi-agent development workflows from plan to merge using isolated Git worktrees and verified pull requests.">
-  <meta name="theme-color" content="#07111b">
+  <meta name="description" content="Brace coordinates controlled multi-agent development from plan to merge using isolated Git worktrees and verified pull requests.">
+  <meta name="theme-color" content="#0a0d0f">
   <meta property="og:title" content="Brace — Controlled agent workflows">
   <meta property="og:description" content="Branch-safe repository agent coordination, from plan to merge.">
   <meta property="og:type" content="website">
@@ -17,174 +17,99 @@
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
-  <header class="site-header">
-    <nav class="nav shell" aria-label="Main navigation">
-      <a class="brand" href="#top" aria-label="Brace home"><span aria-hidden="true">{</span> Brace <span aria-hidden="true">}</span></a>
-      <div class="nav-links">
-        <a href="#workflow">Workflow</a>
-        <a href="#safety">Safety</a>
-        <a href="#install">Install</a>
-        <a class="nav-github" href="https://github.com/Kmac907/Brace">GitHub <span aria-hidden="true">↗</span></a>
-      </div>
-    </nav>
+  <header class="chrome">
+    <div class="chrome-title"><span class="lights" aria-hidden="true">● ● ●</span><span>~/brace — README.md</span></div>
+    <a href="https://github.com/Kmac907/Brace">view on github ↗</a>
   </header>
 
   <main id="main">
-    <section class="hero shell" id="top">
-      <div class="hero-copy">
-        <p class="eyebrow"><span class="pulse" aria-hidden="true"></span> Branch-safe agent coordination</p>
-        <h1>Plan once.<br><span>Build in parallel.</span><br>Merge with proof.</h1>
-        <p class="lede">Brace turns project requirements into controlled multi-agent delivery. Every task gets an isolated worktree, every change crosses a verified pull request, and every decision leaves a durable record.</p>
-        <div class="hero-actions">
-          <a class="button primary" href="#install">Get started</a>
-          <a class="button secondary" href="https://github.com/Kmac907/Brace">View on GitHub</a>
-        </div>
-        <ul class="proof-list" aria-label="Brace capabilities">
-          <li>GitHub + Azure DevOps</li>
-          <li>Python 3.11+</li>
-          <li>GPLv3</li>
-        </ul>
-      </div>
-
-      <div class="hero-visual" aria-label="Three isolated agent branches converging through verified pull requests">
-        <div class="halo"></div>
-        <img src="assets/brace-logo.png" alt="Brace branch convergence mark" width="780" height="440">
-        <div class="run-card">
-          <div class="run-top"><span>brace build</span><span class="live">running</span></div>
-          <div class="run-row"><span class="dot cyan"></span><code>TASK-0007</code><strong>integrated</strong></div>
-          <div class="run-row"><span class="dot teal"></span><code>TASK-0008</code><strong>verified</strong></div>
-          <div class="run-row"><span class="dot amber"></span><code>TASK-0009</code><strong>building</strong></div>
-          <div class="run-progress"><span></span></div>
-          <p>2 of 3 tasks safely integrated</p>
-        </div>
-      </div>
+    <section class="hero" id="top">
+      <img class="logo" src="assets/brace-logo.png" width="420" height="210" alt="Brace branches converging safely inside code braces">
+      <p class="path">~/brace <span>❯</span></p>
+      <h1>brace<span class="cursor" aria-hidden="true">▋</span></h1>
+      <p class="tagline">Controlled agent workflows,<br>from plan to merge.</p>
+      <p class="comment">// Branch-Safe Repository Agent Coordination Engine.</p>
+      <nav class="hero-links" aria-label="Project links">
+        <a href="#install">install</a>
+        <a href="#workflow">how it works</a>
+        <a href="https://github.com/Kmac907/Brace">source</a>
+      </nav>
     </section>
 
-    <section class="signal-strip" aria-label="Core guarantees">
-      <div class="shell signal-grid">
-        <div><strong>01</strong><span>One worktree per assignment</span></div>
-        <div><strong>02</strong><span>Exact commit and PR identity</span></div>
-        <div><strong>03</strong><span>Restart-safe durable state</span></div>
-      </div>
+    <section id="idea">
+      <p class="label"><span>##</span> the_whole_idea</p>
+      <h2>Many agents. One repository history you can trust.</h2>
+      <p class="lead">Brace turns a project contract into isolated work, validates every result, and integrates it through real pull requests. Agents implement. Brace coordinates.</p>
+      <pre class="flow" aria-label="Brace workflow from requirements to main"><code><span class="muted">requirements.md</span>
+      │
+      ▼
+<span class="cyan">plan</span> ──→ <span class="cyan">parallel tasks</span> ──→ <span class="teal">verified PRs</span>
+                                      │
+                                      ▼
+                               <span class="amber">deep audit</span>
+                                      │
+                                      ▼
+<span class="muted">main</span> ←── <span class="teal">brace/integration</span> ←── <span class="amber">bug fixes</span></code></pre>
     </section>
 
-    <section class="section shell" id="workflow">
-      <div class="section-heading">
-        <p class="eyebrow">The workflow</p>
-        <h2>Three stages. One controlled path.</h2>
-        <p>Agents do the reasoning and implementation. Brace owns scheduling, validation, integration, and recovery.</p>
-      </div>
-      <div class="stages">
-        <article class="stage-card">
-          <span class="stage-number">01</span>
-          <div class="stage-icon" aria-hidden="true">⌁</div>
-          <h3>Plan</h3>
-          <p>Turn <code>requirements.md</code> into a validated plan and dependency-aware task graph. Missing decisions return to you—not a guess.</p>
-          <span class="stage-output">plan.md + tasks.json</span>
-        </article>
-        <article class="stage-card featured">
-          <span class="stage-number">02</span>
-          <div class="stage-icon" aria-hidden="true">⑂</div>
-          <h3>Build</h3>
-          <p>Run dependency-ready tasks in parallel, each on its own branch and worktree. Verify the result before its pull request can merge.</p>
-          <span class="stage-output">worktrees + verified PRs</span>
-        </article>
-        <article class="stage-card">
-          <span class="stage-number">03</span>
-          <div class="stage-icon" aria-hidden="true">✓</div>
-          <h3>Audit</h3>
-          <p>Freeze a whole-project finding set, fix bugs independently, run final validation, and merge the proven integration branch.</p>
-          <span class="stage-output">bugs.json + final merge</span>
-        </article>
-      </div>
+    <section id="workflow">
+      <p class="label"><span>##</span> the_workflow</p>
+      <h2>Three deliberate stages.</h2>
+      <ol class="stages">
+        <li>
+          <span class="number">01</span>
+          <div><h3>plan</h3><p>Read <code>requirements.md</code>, resolve only necessary questions, then produce a validated plan and dependency-aware task graph.</p></div>
+          <code>plan.md + tasks.json</code>
+        </li>
+        <li>
+          <span class="number">02</span>
+          <div><h3>build</h3><p>Run ready tasks in parallel worktrees. Verify each focused commit before its provider pull request reaches the integration branch.</p></div>
+          <code>worktrees + PRs</code>
+        </li>
+        <li>
+          <span class="number">03</span>
+          <div><h3>audit</h3><p>Freeze a whole-project bug set, repair findings independently, validate the complete result, then merge to main.</p></div>
+          <code>bugs.json + merge</code>
+        </li>
+      </ol>
     </section>
 
-    <section class="section safety-section" id="safety">
-      <div class="shell safety-layout">
-        <div class="section-heading sticky-heading">
-          <p class="eyebrow">Built for unattended work</p>
-          <h2>Parallel agents.<br>Shared control.</h2>
-          <p>Brace keeps agents isolated while the coordinator enforces one consistent repository history.</p>
-        </div>
-        <div class="feature-list">
-          <article>
-            <span aria-hidden="true">{01}</span>
-            <div><h3>Isolation by default</h3><p>Builders, fixers, and project amendments operate in separate external Git worktrees. Agents never write over one another.</p></div>
-          </article>
-          <article>
-            <span aria-hidden="true">{02}</span>
-            <div><h3>Provider-backed integration</h3><p>Task and bug branches merge through real GitHub or Azure DevOps pull requests—not hidden local merges.</p></div>
-          </article>
-          <article>
-            <span aria-hidden="true">{03}</span>
-            <div><h3>Drift stops the line</h3><p>Brace checks repository, contract, branch, commit, ledger, and pull-request identities before critical transitions.</p></div>
-          </article>
-          <article>
-            <span aria-hidden="true">{04}</span>
-            <div><h3>Recovery is state, not memory</h3><p>Immutable assignments and results make interrupted work reconcilable without inventing progress or repeating completed steps.</p></div>
-          </article>
-          <article>
-            <span aria-hidden="true">{05}</span>
-            <div><h3>People own scope</h3><p>Operational failures retry within bounds. Semantic blockers surface an evidence-backed recommendation for your decision.</p></div>
-          </article>
-        </div>
-      </div>
+    <section id="safety">
+      <p class="label"><span>##</span> built_for_real_repositories</p>
+      <h2>Fast where it can be.<br>Strict where it matters.</h2>
+      <dl class="checks">
+        <div><dt>isolated worktrees</dt><dd>One branch and checkout per task, bug, or approved amendment.</dd></div>
+        <div><dt>exact identity</dt><dd>Repository, commit, branch, pull request, and merge identities are verified.</dd></div>
+        <div><dt>drift detection</dt><dd>Unknown contract or integration changes stop the workflow instead of being assumed safe.</dd></div>
+        <div><dt>durable recovery</dt><dd>Assignments, results, and state survive interruption without inventing progress.</dd></div>
+        <div><dt>human authority</dt><dd>Retries handle operations. Decisions that change scope return to you.</dd></div>
+      </dl>
+      <p class="note">// GitHub and Azure DevOps are supported. Agents never merge directly to main.</p>
     </section>
 
-    <section class="section shell model-section">
-      <div class="model-copy">
-        <p class="eyebrow">Git is the boundary</p>
-        <h2>Every piece of work has an address.</h2>
-        <p>No shared agent checkout. No ambiguous commit. No direct agent merge to main.</p>
-      </div>
-      <div class="git-model" role="img" aria-label="Task and bug branches merge into the Brace integration branch, which merges into main after final validation">
-        <div class="model-row"><code>worktree/TASK-0001</code><span class="track cyan-track"></span><b>verified</b></div>
-        <div class="model-row"><code>worktree/TASK-0002</code><span class="track teal-track"></span><b>verified</b></div>
-        <div class="model-row"><code>worktree/BUG-0001</code><span class="track amber-track"></span><b>fixed</b></div>
-        <div class="merge-row"><span>brace/integration</span><i aria-hidden="true">→</i><strong>main</strong></div>
-      </div>
-    </section>
+    <section id="install">
+      <p class="label"><span>##</span> install</p>
+      <h2>Start with requirements.</h2>
+      <div class="terminal">
+        <div class="terminal-title"><span>terminal</span><span>brace@main</span></div>
+        <pre><code><span class="muted"># install the CLI</span>
+<span class="amber">$</span> uv tool install git+https://github.com/Kmac907/Brace.git
 
-    <section class="section install-section" id="install">
-      <div class="shell install-grid">
-        <div>
-          <p class="eyebrow">Start with requirements</p>
-          <h2>From blank repository to controlled build.</h2>
-          <p>Install Brace with uv, initialize a new or existing repository, then run the three deliberate workflow stages.</p>
-          <a class="text-link" href="https://github.com/Kmac907/Brace#quick-start">Read the complete guide <span aria-hidden="true">→</span></a>
-        </div>
-        <div class="terminal" aria-label="Brace installation commands">
-          <div class="terminal-bar"><span></span><span></span><span></span><small>terminal</small></div>
-          <pre><code><span class="comment"># Install the CLI</span>
-<span class="prompt">$</span> uv tool install git+https://github.com/Kmac907/Brace.git
+<span class="muted"># add Brace to a new or existing repository</span>
+<span class="amber">$</span> brace init
 
-<span class="comment"># Add Brace to a repository</span>
-<span class="prompt">$</span> brace init
-
-<span class="comment"># Run the controlled workflow</span>
-<span class="prompt">$</span> brace plan
-<span class="prompt">$</span> brace build
-<span class="prompt">$</span> brace audit</code></pre>
-        </div>
+<span class="muted"># run the controlled workflow</span>
+<span class="amber">$</span> brace plan
+<span class="amber">$</span> brace build
+<span class="amber">$</span> brace audit</code></pre>
       </div>
-    </section>
-
-    <section class="cta shell">
-      <p class="eyebrow">One coordinator. Many agents.</p>
-      <h2>Keep parallel work fast—and your repository understandable.</h2>
-      <div class="hero-actions centered">
-        <a class="button primary" href="https://github.com/Kmac907/Brace">Explore Brace on GitHub</a>
-        <a class="button secondary" href="#install">Install with uv</a>
-      </div>
+      <p><a class="arrow" href="https://github.com/Kmac907/Brace#quick-start">read the complete guide →</a></p>
     </section>
   </main>
 
   <footer>
-    <div class="shell footer-inner">
-      <a class="brand" href="#top"><span aria-hidden="true">{</span> Brace <span aria-hidden="true">}</span></a>
-      <p>Branch-Safe Repository Agent Coordination Engine.</p>
-      <p><a href="https://github.com/Kmac907/Brace/blob/main/LICENSE">GPLv3</a> · © 2026 Kmac907</p>
-    </div>
+    <p><span>~/brace ❯</span> the safest merge is the one you can explain.</p>
+    <p><a href="https://github.com/Kmac907/Brace/blob/main/LICENSE">GPLv3</a> · <a href="https://github.com/Kmac907/Brace">Kmac907/Brace</a></p>
   </footer>
 </body>
 </html>
