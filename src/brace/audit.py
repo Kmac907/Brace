@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import warnings
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -55,7 +54,7 @@ from .project_manager import (
     is_semantic_blocker,
     structured_blocker,
 )
-from .ui import status
+from .ui import status, success, warning
 
 InputReader = Callable[[dict[str, Any], str, dict[str, Any] | None], str]
 
@@ -159,7 +158,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 raise BraceError("Every active implementation task must be integrated before audit begins.")
             if state["stage"] == "complete":
                 show_status(state, tasks, bugs)
-                print("PROJECT COMPLETE: audit, bug fixes, validation, and final merge are finished.")
+                success("PROJECT COMPLETE: audit, bug fixes, validation, and final merge are finished.")
                 return "complete"
             if state["stage"] not in {"audit", "blocked"}:
                 raise BraceError(f"The workflow is at stage {state['stage']}, not audit.")
@@ -180,7 +179,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     "projectPullRequest": final_pr, "finalMergeSha": state["finalMergeSha"],
                 })
                 show_status(state, tasks, bugs)
-                print("PROJECT COMPLETE: recovered and verified the final project merge.")
+                success("PROJECT COMPLETE: recovered and verified the final project merge.")
                 return "complete"
 
             assert_target_drift(root, config, state)
@@ -238,7 +237,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     try:
                         remove_merged_assignment(root, config, bug["bugId"], bug["branch"], merged)
                     except Exception as error:
-                        warnings.warn(str(error))
+                        warning(str(error))
             save_ledger(bugs, paths)
             state["integrationSha"] = ensure_integration_branch(root, config, state, known_merges(tasks, bugs))
             save_state(state, paths)
@@ -306,7 +305,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     try:
                         remove_merged_assignment(root, config, bug["bugId"], bug["branch"], merged)
                     except Exception as error:
-                        warnings.warn(str(error))
+                        warning(str(error))
                 if not any(bug["status"] != "verified" for bug in bugs["bugs"]):
                     break
                 exhausted = [bug for bug in bugs["bugs"] if bug["status"] != "verified" and bug["attemptCount"] >= config["maximumBugAttempts"]]
@@ -380,19 +379,19 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 "finalValidation": final_validation, "projectPullRequest": project_pr, "finalMergeSha": final_sha, "remainingLimitations": [],
             })
             show_status(state, tasks, bugs)
-            print("PROJECT COMPLETE: audit, bug fixes, validation, merge, and cleanup succeeded.")
+            success("PROJECT COMPLETE: audit, bug fixes, validation, merge, and cleanup succeeded.")
             return "complete"
         except Exception as error:
             if audit_worktree is not None:
                 try:
                     remove_audit_worktree(root, config)
                 except Exception as cleanup_error:
-                    warnings.warn(f"Unable to remove audit worktree while handling an error: {cleanup_error}", stacklevel=2)
+                    warning(f"Unable to remove audit worktree while handling an error: {cleanup_error}")
             if state is not None:
                 if bugs is not None:
                     try:
                         save_ledger(bugs, paths)
                     except Exception as save_error:
-                        warnings.warn(f"Unable to preserve bug ledger while handling an error: {save_error}", stacklevel=2)
+                        warning(f"Unable to preserve bug ledger while handling an error: {save_error}")
                 set_blocked(state, paths, "audit", None, str(error), "Resolve the exact bug, provider, validation, drift, or environment blocker, then rerun brace audit.")
             raise

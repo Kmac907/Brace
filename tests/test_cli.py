@@ -42,6 +42,39 @@ class CliTests(unittest.TestCase):
             self.assertEqual(cli.main(["plan"]), 1)
             report.assert_called_once_with("failed")
 
+    def test_interrupts_and_unexpected_errors_are_rendered(self) -> None:
+        with patch.object(cli, "_dispatch", side_effect=KeyboardInterrupt), patch.object(cli, "error") as report:
+            self.assertEqual(cli.main(["plan"]), 130)
+            report.assert_called_once_with("Interrupted.")
+        with patch.object(cli, "_dispatch", side_effect=RuntimeError("boom")), patch.object(cli, "traceback") as report:
+            self.assertEqual(cli.main(["plan"]), 1)
+            report.assert_called_once_with()
+
+    def test_error_and_warning_output_is_compact_and_clean(self) -> None:
+        output = io.StringIO()
+        terminal = Console(file=output, force_terminal=False, color_system=None, width=100, theme=ui.THEME)
+        with patch.object(ui, "error_console", terminal):
+            ui.error("Interrupted.")
+            ui.warning("Cleanup was deferred.")
+        rendered = output.getvalue()
+        self.assertTrue(rendered.startswith("\n"))
+        self.assertIn("Brace error", rendered)
+        self.assertIn("Warning: Cleanup was deferred.", rendered)
+        self.assertNotIn("UserWarning", rendered)
+        self.assertLess(max(map(len, rendered.splitlines())), 50)
+
+    def test_unexpected_traceback_uses_rich_renderer(self) -> None:
+        output = io.StringIO()
+        terminal = Console(file=output, force_terminal=False, color_system=None, width=100, theme=ui.THEME)
+        with patch.object(ui, "error_console", terminal):
+            try:
+                raise RuntimeError("boom")
+            except RuntimeError:
+                ui.traceback()
+        rendered = output.getvalue()
+        self.assertIn("Traceback", rendered)
+        self.assertIn("RuntimeError: boom", rendered)
+
     def test_plain_status_has_progress_without_terminal_codes(self) -> None:
         output = io.StringIO()
         state = {

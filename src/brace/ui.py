@@ -31,8 +31,26 @@ def status(message: str):
     return console.status(message, spinner="dots", spinner_style="brace")
 
 
+def info(message: str, style: str | None = None) -> None:
+    console.print(message, style=style, markup=False)
+
+
+def success(message: str) -> None:
+    info(message, "success")
+
+
+def warning(message: str) -> None:
+    error_console.print(f"Warning: {message}", style="warning", markup=False)
+
+
 def error(message: str) -> None:
-    error_console.print(Panel(message, title="Brace error", border_style="error"), markup=False)
+    error_console.print()
+    error_console.print(Panel.fit(message, title="Brace error", border_style="error"), markup=False)
+
+
+def traceback() -> None:
+    error_console.print()
+    error_console.print_exception(show_locals=False)
 
 
 def render_status(state: dict[str, Any], tasks: dict[str, Any] | None = None, bugs: dict[str, Any] | None = None) -> None:

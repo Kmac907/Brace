@@ -31,7 +31,7 @@ from .common import (
     write_text_atomic,
 )
 from .project_manager import persisted_task
-from .ui import ask, status
+from .ui import ask, info, status, success
 
 
 def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
@@ -56,7 +56,7 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
                 assert_ledger_identity(state, tasks, "task")
                 assert_target_drift(root, config, state)
                 show_status(state, tasks)
-                print("Planning is already complete. The build loop may run.")
+                success("Planning is already complete. The build loop may run.")
                 return
 
             requirements_path = root / "requirements.md"
@@ -92,7 +92,7 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
                         raise BraceError("Planner requested clarification without returning questions.")
                     answers = []
                     for question in result["questions"]:
-                        print(f"\nPLANNING QUESTION {question['questionId']}\n{question['question']}\nWhy this is needed: {question['reason']}")
+                        info(f"\nPLANNING QUESTION {question['questionId']}\n{question['question']}\nWhy this is needed: {question['reason']}", "brace")
                         answer = ask("Answer").strip()
                         if not answer:
                             raise BraceError(f"No answer was supplied for {question['questionId']}.")
@@ -148,7 +148,7 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
             }
             write_summary(paths.planning_summary, summary)
             show_status(state, tasks)
-            print("PLANNING COMPLETE: requirements, plan, and task queue are ready.")
+            success("PLANNING COMPLETE: requirements, plan, and task queue are ready.")
         except Exception as error:
             if state is not None:
                 set_blocked(state, paths, "planning", None, str(error), "Correct the reported requirement, configuration, or environment issue, then rerun brace plan.")

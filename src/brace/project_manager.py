@@ -31,7 +31,7 @@ from .common import (
     write_immutable_json,
     write_json_atomic,
 )
-from .ui import ask
+from .ui import ask, info
 
 InputReader = Callable[[dict[str, Any], str, dict[str, Any] | None], str]
 
@@ -220,13 +220,13 @@ def complete_disposition_decision(root: str | Path, config: dict[str, Any], stat
 
 
 def _select_option(analysis: dict[str, Any], amendment: dict[str, Any], input_reader: InputReader | None) -> dict[str, Any]:
-    print(f"\nPM DECISION REQUIRED: {amendment['amendmentId']}\n{analysis['summary']}")
-    print(f"Recommendation: {analysis['recommendation']}")
+    info(f"\nPM DECISION REQUIRED: {amendment['amendmentId']}\n{analysis['summary']}", "warning")
+    info(f"Recommendation: {analysis['recommendation']}")
     effects = analysis["effects"]
-    print("Effects: " + "; ".join(f"{key}={effects[key]}" for key in ("requirements", "plan", "tasks", "bugs", "completedWork", "schedule")))
+    info("Effects: " + "; ".join(f"{key}={effects[key]}" for key in ("requirements", "plan", "tasks", "bugs", "completedWork", "schedule")))
     for option in analysis["options"]:
-        print(f"  {option['optionId']}: {option['label']}{' [recommended]' if option['recommended'] else ''}\n    {option['description']}")
-    print(analysis["question"])
+        info(f"  {option['optionId']}: {option['label']}{' [recommended]' if option['recommended'] else ''}\n    {option['description']}")
+    info(analysis["question"], "brace")
     selection = (input_reader(analysis, "option", None) if input_reader else ask("Select an option ID")).strip().upper()
     matches = [option for option in analysis["options"] if option["optionId"] == selection]
     if len(matches) != 1:

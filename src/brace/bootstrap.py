@@ -5,7 +5,6 @@ import json
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import unquote
@@ -14,7 +13,7 @@ from uuid import uuid4
 from importlib.resources import files
 
 from .common import get_configuration, initialize_state_files, read_json
-from .ui import ask, confirm
+from .ui import ask, confirm, info, success, warning
 
 
 class BootstrapError(RuntimeError):
@@ -68,7 +67,7 @@ def existing_details(path: str) -> dict[str, str]:
         raise BootstrapError(f"Path is not a Git repository: {requested}")
     root = Path(root_result).resolve()
     if root != requested:
-        print(f"Using repository root: {root}")
+        info(f"Using repository root: {root}")
     if run("git", ["-C", str(root), "status", "--porcelain", "--untracked-files=all"]).strip():
         raise BootstrapError(f"Existing repository worktree is not clean: {root}")
     if (root / ".codex").is_dir():
@@ -115,7 +114,7 @@ def copy_template(template: Path, target: Path, existing: bool) -> None:
     for name in ("requirements.md", "REQUIREMENTS-PROMPT.md"):
         destination = target / name
         if destination.exists():
-            print(f"Preserved existing {name}")
+            info(f"Preserved existing {name}")
         else:
             shutil.copy2(template / name, destination)
     add_section(target / ".gitignore", "BRACE", (template / ".gitignore").read_text(encoding="utf-8"))
@@ -233,7 +232,7 @@ def bootstrap(args: argparse.Namespace) -> None:
             raise BootstrapError("Bootstrap staged unexpected paths: " + ", ".join(unexpected))
         if not staged or ".codex/workflow.json" not in staged:
             raise BootstrapError("Bootstrap did not stage the required workflow payload.")
-        print("FILES TO COMMIT:\n  " + "\n  ".join(staged))
+        info("FILES TO COMMIT:\n  " + "\n  ".join(staged))
         run("git", ["commit", "-m", "Install Brace workflow" if use_existing else "Initialize Brace project"], target)
 
         if use_existing:
@@ -256,7 +255,7 @@ def bootstrap(args: argparse.Namespace) -> None:
         if state["repository"] != identity:
             raise BootstrapError("Initialized state does not match the remote repository.")
         succeeded = True
-        print(f"\n{'BRACE INSTALLED' if use_existing else 'BRACE PROJECT CREATED'}\nPROJECT:      {target}\nREMOTE:       {identity}\nTARGET:       {target_branch}\nINITIAL SHA:  {local_sha}\nNEXT:         Complete requirements.md, then run brace plan.")
+        success(f"\n{'BRACE INSTALLED' if use_existing else 'BRACE PROJECT CREATED'}\nPROJECT:      {target}\nREMOTE:       {identity}\nTARGET:       {target_branch}\nINITIAL SHA:  {local_sha}\nNEXT:         Complete requirements.md, then run brace plan.")
     finally:
         if temporary is not None and succeeded:
             expected_parent = Path(tempfile.gettempdir()).resolve()
@@ -265,9 +264,9 @@ def bootstrap(args: argparse.Namespace) -> None:
                 raise BootstrapError(f"Refusing to remove unexpected temporary directory: {resolved}")
             shutil.rmtree(resolved)
         elif not succeeded:
-            print(f"Bootstrap failed. The destination was preserved: {target}", file=sys.stderr)
+            warning(f"Bootstrap failed. The destination was preserved: {target}")
             if temporary is not None:
-                print(f"Temporary source clone was preserved for diagnosis: {temporary}", file=sys.stderr)
+                warning(f"Temporary source clone was preserved for diagnosis: {temporary}")
 
 def add_arguments(result: argparse.ArgumentParser) -> None:
     result.add_argument("--source-repository")

@@ -5,7 +5,7 @@ from collections.abc import Sequence
 
 from . import __version__, audit, bootstrap, build, planning
 from .common import BraceError
-from .ui import error
+from .ui import error, traceback
 
 
 def parser() -> argparse.ArgumentParser:
@@ -55,3 +55,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         error("Interrupted.")
         return 130
+    except EOFError:
+        error("Input closed.")
+        return 1
+    except Exception:
+        traceback()
+        return 1

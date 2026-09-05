@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import warnings
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -49,7 +48,7 @@ from .project_manager import (
     is_semantic_blocker,
     structured_blocker,
 )
-from .ui import status
+from .ui import info, status, success, warning
 
 InputReader = Callable[[dict[str, Any], str, dict[str, Any] | None], str]
 
@@ -111,14 +110,14 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 resolution = invoke_pm_resolution(root, config, state, paths, tasks, bugs, amendment["sourceStage"], amendment["sourceKind"], amendment["sourceIdentity"], amendment["blocker"], input_reader)
                 if resolution["resumeStage"] == "audit":
                     show_status(state, tasks, bugs)
-                    print("PM AMENDMENT COMPLETE: resume the audit loop.")
+                    success("PM AMENDMENT COMPLETE: resume the audit loop.")
                     return "audit"
 
             _checks(root, config, state, tasks)
             assert_graph(tasks["tasks"], "task")
             if tasks["status"] == "complete" and state["stage"] == "audit":
                 show_status(state, tasks)
-                print("BUILD COMPLETE: the audit loop may run.")
+                success("BUILD COMPLETE: the audit loop may run.")
                 return "audit"
             if tasks["status"] not in {"ready", "active", "blocked"}:
                 raise BraceError("Planning has not produced a buildable task queue.")
@@ -147,7 +146,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     try:
                         remove_merged_assignment(root, config, task["taskId"], task["branch"], merged)
                     except Exception as error:
-                        warnings.warn(str(error))
+                        warning(str(error))
             save_ledger(tasks, paths)
             state["integrationSha"] = ensure_integration_branch(root, config, state, known_merges(tasks))
             save_state(state, paths)
@@ -186,7 +185,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                             raise BraceError("Builder result commit SHA does not match the worktree HEAD.")
                         task["resultSha"] = commit["Head"]
                         save_ledger(tasks, paths)
-                        print(f"VERIFYING TASK: {task['taskId']} attempt {task['attemptCount']}")
+                        info(f"VERIFYING TASK: {task['taskId']} attempt {task['attemptCount']}")
                         verification = invoke_role(root, task["worktree"], "verifier", f"Verify only this task:\n{pretty_json(task)}\nBuilder result:\n{pretty_json(result)}", "verifier-result.schema.json", "read-only")
                         if not verification["approved"]:
                             blocker = structured_blocker(verification["blocker"], "build", task["taskId"])
@@ -204,7 +203,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                         if state.get("activeAmendment"):
                             raise
                         task.update(status="pending", resultSha=None, lastError=str(error))
-                        warnings.warn(f"{task['taskId']} attempt {task['attemptCount']} failed verification: {error}")
+                        warning(f"{task['taskId']} attempt {task['attemptCount']} failed verification: {error}")
                 if amendment_handled:
                     continue
                 save_ledger(tasks, paths)
@@ -213,9 +212,9 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     try:
                         _checks(root, config, state, tasks)
                         state["integrationSha"] = ensure_integration_branch(root, config, state, known_merges(tasks))
-                        print(f"PUBLISHING TASK PR: {task['taskId']} at {task['resultSha']}")
+                        info(f"PUBLISHING TASK PR: {task['taskId']} at {task['resultSha']}")
                         merged = publish_assignment(root, task["worktree"], config, task, "task")
-                        print(f"TASK PR MERGED: {task['taskId']} -> {merged['mergeSha']}")
+                        success(f"TASK PR MERGED: {task['taskId']} -> {merged['mergeSha']}")
                         task.update(pullRequest=merged, status="integrated", lastError=None)
                         state["integrationSha"] = merged["mergeSha"]
                         save_ledger(tasks, paths)
@@ -223,10 +222,10 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                         try:
                             remove_merged_assignment(root, config, task["taskId"], task["branch"], merged)
                         except Exception as error:
-                            warnings.warn(str(error))
+                            warning(str(error))
                     except Exception as error:
                         task.update(status="verified_ready", lastError=str(error))
-                        warnings.warn(f"{task['taskId']} publish failed: {error}")
+                        warning(f"{task['taskId']} publish failed: {error}")
                 save_ledger(tasks, paths)
                 if not any(task["status"] not in {"integrated", "superseded"} for task in tasks["tasks"]):
                     break
@@ -265,7 +264,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 save_ledger(tasks, paths)
                 show_status(state, tasks)
 
-            print("BUILD: final drift check")
+            info("BUILD: final drift check")
             _checks(root, config, state, tasks)
             state["integrationSha"] = ensure_integration_branch(root, config, state, known_merges(tasks))
             verification_worktree = new_audit_worktree(root, config, f"{config['remote']}/{config['integrationBranch']}")
@@ -297,7 +296,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 "integrationSha": state["integrationSha"], "integrationVerification": verification, "remainingBlockers": [],
             })
             show_status(state, tasks)
-            print("BUILD COMPLETE: all active tasks are integrated. The audit loop may run.")
+            success("BUILD COMPLETE: all active tasks are integrated. The audit loop may run.")
             return "audit"
         except Exception as error:
             if state is not None:
@@ -305,6 +304,6 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     try:
                         save_ledger(tasks, paths)
                     except Exception as save_error:
-                        warnings.warn(f"Unable to preserve task ledger while handling an error: {save_error}", stacklevel=2)
+                        warning(f"Unable to preserve task ledger while handling an error: {save_error}")
                 set_blocked(state, paths, "build", None, str(error), "Resolve the exact task, provider, drift, or environment blocker, then rerun brace build.")
             raise
