@@ -55,6 +55,13 @@ class SiteTests(unittest.TestCase):
         ):
             self.assertIn(required, workflow)
 
+    def test_motion_has_an_accessible_fallback(self) -> None:
+        styles = (SITE / "styles.css").read_text(encoding="utf-8")
+        for animation in ("cursor-blink", "logo-drift", "prompt-nudge", "enter", "signal"):
+            self.assertIn(f"@keyframes {animation}", styles)
+        self.assertIn("@media (prefers-reduced-motion: reduce)", styles)
+        self.assertIn("animation: none !important", styles)
+
 
 if __name__ == "__main__":
     unittest.main()
