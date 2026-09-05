@@ -15,7 +15,7 @@ from support import RepositoryTestCase
 class WorkflowTests(RepositoryTestCase):
     def prepare(self) -> tuple[Path, Path, dict]:
         root, remote, config = self.make_repository()
-        source_template = Path(os.environ.get("RALPH_SOURCE_ROOT", Path(__file__).resolve().parents[1])) / "template"
+        source_template = Path(os.environ.get("BRACE_SOURCE_ROOT", Path(__file__).resolve().parents[1])) / "template"
         shutil.copy2(source_template / ".gitignore", root / ".gitignore")
         shutil.copytree(source_template / ".codex" / "prompts", root / ".codex" / "prompts", dirs_exist_ok=True)
         shutil.copy2(source_template / ".codex" / "AGENTS.md", root / ".codex" / "AGENTS.md")

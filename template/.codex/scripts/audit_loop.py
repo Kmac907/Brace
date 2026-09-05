@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from common import (
-    RalphError,
+    BraceError,
     WorkflowLock,
     assert_assignment_commit,
     assert_graph,
@@ -99,7 +99,7 @@ def remove_completed_artifacts(root: Path, config: dict[str, Any], tasks: dict[s
                 run_native("git", ["-C", root, "push", config["remote"], "--delete", branch])
                 run_native("git", ["-C", root, "fetch", config["remote"], "--prune"])
                 if run_native("git", ["-C", root, "show-ref", "--verify", "--quiet", remote_ref], allowed_exit_codes=(0, 1)).returncode == 0:
-                    raise RalphError(f"Remote assignment branch survived final cleanup: {branch}")
+                    raise BraceError(f"Remote assignment branch survived final cleanup: {branch}")
 
 
 def complete_project_cleanup(root: Path, config: dict[str, Any], tasks: dict[str, Any], bugs: dict[str, Any], final_sha: str) -> None:
@@ -117,7 +117,7 @@ def complete_project_cleanup(root: Path, config: dict[str, Any], tasks: dict[str
     remove_empty_worktree_containers(root, config)
     base = worktree_base(root, config)
     if base.is_dir() and any(base.iterdir()):
-        raise RalphError("Owned worktree cleanup left orphaned directories.")
+        raise BraceError("Owned worktree cleanup left orphaned directories.")
 
 
 def _checks(root: Path, config: dict[str, Any], state: dict[str, Any], tasks: dict[str, Any], bugs: dict[str, Any] | None = None) -> None:
@@ -156,20 +156,20 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
             assert_plan_drift(state, root, require_plan=True)
             assert_ledger_identity(state, tasks, "task")
             if tasks["status"] != "complete" or any(task["status"] not in {"integrated", "superseded"} for task in tasks["tasks"]):
-                raise RalphError("Every active implementation task must be integrated before audit begins.")
+                raise BraceError("Every active implementation task must be integrated before audit begins.")
             if state["stage"] == "complete":
                 show_status(state, tasks, bugs)
                 print("PROJECT COMPLETE: audit, bug fixes, validation, and final merge are finished.")
                 return "complete"
             if state["stage"] not in {"audit", "blocked"}:
-                raise RalphError(f"The workflow is at stage {state['stage']}, not audit.")
+                raise BraceError(f"The workflow is at stage {state['stage']}, not audit.")
 
             run_native("git", ["-C", root, "fetch", config["remote"], "--prune"])
             current_target = run_native("git", ["-C", root, "rev-parse", f"{config['remote']}/{config['targetBranch']}"]).output.strip()
             if state.get("targetBaseSha") and current_target != state["targetBaseSha"] and state.get("integrationSha"):
                 final_pr = get_pull_request(root, config, config["integrationBranch"], config["targetBranch"], state["integrationSha"])
                 if not final_pr or final_pr["state"] not in {"merged", "completed"}:
-                    raise RalphError("Target branch advanced without the exact workflow project pull request.")
+                    raise BraceError("Target branch advanced without the exact workflow project pull request.")
                 final_pr = complete_pull_request(root, config, final_pr)
                 complete_project_cleanup(root, config, tasks, bugs, final_pr["mergeSha"])
                 state.update(stage="complete", stageStatus="complete", finalMergeSha=final_pr["mergeSha"], blocker=None)
@@ -198,11 +198,11 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                         remove_audit_worktree(root, config)
                         audit_worktree = None
                         return resume
-                    raise RalphError(f"Audit blocked: {blocker['message']}")
+                    raise BraceError(f"Audit blocked: {blocker['message']}")
                 _checks(root, config, state, tasks)
                 unchanged = ensure_integration_branch(root, config, state, known_merges(tasks, bugs))
                 if unchanged != state["integrationSha"]:
-                    raise RalphError("Integration changed while the deep audit was running.")
+                    raise BraceError("Integration changed while the deep audit was running.")
                 if audit_result["bugs"]:
                     assert_graph(audit_result["bugs"], "bug")
                 persisted = [persisted_bug(bug) for bug in audit_result["bugs"]]
@@ -215,7 +215,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 audit_worktree = None
             else:
                 if not bugs.get("auditSha"):
-                    raise RalphError("Existing bug ledger has no audit SHA.")
+                    raise BraceError("Existing bug ledger has no audit SHA.")
                 assert_ledger_identity(state, bugs, "bug")
                 if bugs["bugs"]:
                     assert_graph(bugs["bugs"], "bug")
@@ -267,19 +267,19 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                             blocker = structured_blocker(result["blocker"], "audit", bug["bugId"])
                             if is_semantic_blocker(blocker):
                                 return _handle_semantic(root, config, state, paths, tasks, bugs, "bug", bug["bugId"], blocker, input_reader)
-                            raise RalphError(f"Bug fixer blocked: {blocker['message']}")
+                            raise BraceError(f"Bug fixer blocked: {blocker['message']}")
                         context_label = "not-reproducible disposition" if result["status"] == "not_reproducible" else "bug correction"
                         if result["status"] != "not_reproducible":
                             commit = assert_assignment_commit(bug["worktree"], bug["baseSha"], bug)
                             if result["commitSha"] != commit["Head"]:
-                                raise RalphError("Fixer result commit SHA does not match worktree HEAD.")
+                                raise BraceError("Fixer result commit SHA does not match worktree HEAD.")
                             bug["resultSha"] = commit["Head"]
                         verification = invoke_role(root, bug["worktree"], "verifier", f"Verify only this {context_label}:\n{pretty_json(bug)}\n{pretty_json(result)}", "verifier-result.schema.json", "read-only")
                         if not verification["approved"]:
                             blocker = structured_blocker(verification["blocker"], "audit", bug["bugId"])
                             if is_semantic_blocker(blocker):
                                 return _handle_semantic(root, config, state, paths, tasks, bugs, "verification", bug["bugId"], blocker, input_reader)
-                            raise RalphError(f"{context_label.capitalize()} was rejected: " + "; ".join(verification["findings"]))
+                            raise BraceError(f"{context_label.capitalize()} was rejected: " + "; ".join(verification["findings"]))
                         _checks(root, config, state, tasks, bugs)
                         if result["status"] == "not_reproducible":
                             bug.update(disposition="not_reproducible", status="verified", lastError=None)
@@ -314,10 +314,10 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                         bug["status"] = "blocked"
                     bugs["status"] = "blocked"
                     save_ledger(bugs, paths)
-                    raise RalphError("Bug attempts exhausted: " + ", ".join(bug["bugId"] for bug in exhausted))
+                    raise BraceError("Bug attempts exhausted: " + ", ".join(bug["bugId"] for bug in exhausted))
                 wave = select_ready_items(bugs["bugs"], "bug", config["maximumConcurrentFixers"])
                 if not wave:
-                    raise RalphError("No dependency-ready, non-conflicting bugs remain.")
+                    raise BraceError("No dependency-ready, non-conflicting bugs remain.")
                 base_sha = state["integrationSha"]
                 for bug in wave:
                     bug["branch"] = bug.get("branch") or f"worktree/{bug['bugId']}"
@@ -353,14 +353,14 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     remove_audit_worktree(root, config)
                     audit_worktree = None
                     return resume
-                raise RalphError("Final validation failed: " + "; ".join(final_validation["findings"]))
+                raise BraceError("Final validation failed: " + "; ".join(final_validation["findings"]))
             remove_audit_worktree(root, config)
             audit_worktree = None
             _checks(root, config, state, tasks, bugs)
             head_sha = ensure_integration_branch(root, config, state, known_merges(tasks, bugs))
             if head_sha != state["integrationSha"]:
-                raise RalphError("Integration changed during final validation.")
-            project_pr = new_pull_request(root, config, config["integrationBranch"], config["targetBranch"], head_sha, state["targetBaseSha"], "Complete project implementation", f"Completed Worktree Ralph project and verified {len(bugs['bugs'])} audit findings at {head_sha}.")
+                raise BraceError("Integration changed during final validation.")
+            project_pr = new_pull_request(root, config, config["integrationBranch"], config["targetBranch"], head_sha, state["targetBaseSha"], "Complete project implementation", f"Completed Brace project and verified {len(bugs['bugs'])} audit findings at {head_sha}.")
             project_pr = complete_pull_request(root, config, project_pr)
             final_sha = project_pr["mergeSha"]
             complete_project_cleanup(root, config, tasks, bugs, final_sha)
@@ -397,7 +397,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Audit and repair a built Worktree Ralph project.")
+    parser = argparse.ArgumentParser(description="Audit and repair a built Brace project.")
     parser.add_argument("repository", nargs="?", default=".")
     args = parser.parse_args()
     next_stage = run(args.repository)

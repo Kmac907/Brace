@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import unquote
 from uuid import uuid4
 
-SOURCE_REPOSITORY = "https://github.com/Kmac907/worktree-ralph.git"
+SOURCE_REPOSITORY = "https://github.com/Kmac907/brace.git"
 
 
 class BootstrapError(RuntimeError):
@@ -117,11 +117,11 @@ def copy_template(template: Path, target: Path, existing: bool) -> None:
             print(f"Preserved existing {name}")
         else:
             shutil.copy2(template / name, destination)
-    add_section(target / ".gitignore", "WORKTREE RALPH", (template / ".gitignore").read_text(encoding="utf-8"))
-    add_section(target / ".gitattributes", "WORKTREE RALPH", (template / ".gitattributes").read_text(encoding="utf-8"))
+    add_section(target / ".gitignore", "BRACE", (template / ".gitignore").read_text(encoding="utf-8"))
+    add_section(target / ".gitattributes", "BRACE", (template / ".gitattributes").read_text(encoding="utf-8"))
     agents = target / "AGENTS.md"
     if agents.exists():
-        add_section(agents, "WORKTREE RALPH", (template / "AGENTS.md").read_text(encoding="utf-8"))
+        add_section(agents, "BRACE", (template / "AGENTS.md").read_text(encoding="utf-8"))
     else:
         shutil.copy2(template / "AGENTS.md", agents)
 
@@ -195,7 +195,7 @@ def bootstrap(args: argparse.Namespace) -> None:
             if code == 0:
                 raise BootstrapError(f"Azure DevOps repository already exists: {args.project_name}")
 
-    temporary = Path(tempfile.gettempdir()) / f"worktree-ralph-bootstrap-{uuid4().hex}"
+    temporary = Path(tempfile.gettempdir()) / f"brace-bootstrap-{uuid4().hex}"
     source = temporary / "source"
     succeeded = False
     temporary.mkdir()
@@ -239,7 +239,7 @@ def bootstrap(args: argparse.Namespace) -> None:
         if not staged or ".codex/workflow.json" not in staged:
             raise BootstrapError("Bootstrap did not stage the required workflow payload.")
         print("FILES TO COMMIT:\n  " + "\n  ".join(staged))
-        run("git", ["commit", "-m", "Install Worktree Ralph workflow" if use_existing else "Initialize Worktree Ralph project"], target)
+        run("git", ["commit", "-m", "Install Brace workflow" if use_existing else "Initialize Brace project"], target)
 
         if use_existing:
             run("git", ["push", "origin", target_branch], target)
@@ -264,12 +264,12 @@ def bootstrap(args: argparse.Namespace) -> None:
         if state["repository"] != identity:
             raise BootstrapError("Initialized state does not match the remote repository.")
         succeeded = True
-        print(f"\n{'WORKTREE RALPH INSTALLED' if use_existing else 'WORKTREE RALPH PROJECT CREATED'}\nPROJECT:      {target}\nREMOTE:       {identity}\nTARGET:       {target_branch}\nINITIAL SHA:  {local_sha}\nNEXT:         Complete requirements.md, then run python .codex/scripts/planning_loop.py.")
+        print(f"\n{'BRACE INSTALLED' if use_existing else 'BRACE PROJECT CREATED'}\nPROJECT:      {target}\nREMOTE:       {identity}\nTARGET:       {target_branch}\nINITIAL SHA:  {local_sha}\nNEXT:         Complete requirements.md, then run python .codex/scripts/planning_loop.py.")
     finally:
         if succeeded:
             expected_parent = Path(tempfile.gettempdir()).resolve()
             resolved = temporary.resolve()
-            if resolved.parent != expected_parent or not re.fullmatch(r"worktree-ralph-bootstrap-[0-9a-f]{32}", resolved.name):
+            if resolved.parent != expected_parent or not re.fullmatch(r"brace-bootstrap-[0-9a-f]{32}", resolved.name):
                 raise BootstrapError(f"Refusing to remove unexpected temporary directory: {resolved}")
             shutil.rmtree(resolved)
         else:
@@ -278,7 +278,7 @@ def bootstrap(args: argparse.Namespace) -> None:
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="Create or install a portable Worktree Ralph project.")
+    result = argparse.ArgumentParser(description="Create or install a portable Brace project.")
     result.add_argument("--source-repository", default=SOURCE_REPOSITORY)
     result.add_argument("--existing-repository-path")
     result.add_argument("--project-name")

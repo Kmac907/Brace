@@ -7,7 +7,7 @@ from typing import Any
 
 from common import (
     Paths,
-    RalphError,
+    BraceError,
     assert_graph,
     assert_task_coverage,
     attempt_path,
@@ -49,17 +49,17 @@ def structured_blocker(blocker: Any, scope: str, identity: str | None) -> dict[s
     required = ("kind", "message", "evidence", "affectedIdentity", "requiresUserDecision", "scopeChangePossible", "smallestResolution", "prohibitedDecisions")
     for name in required:
         if name not in blocker:
-            raise RalphError(f"Structured blocker is missing {name}.")
+            raise BraceError(f"Structured blocker is missing {name}.")
     if blocker["kind"] not in {"operational", "missing_information", "contract_conflict", "scope_gap", "task_decomposition", "bug_disposition"}:
-        raise RalphError(f"Unsupported blocker kind: {blocker['kind']}")
+        raise BraceError(f"Unsupported blocker kind: {blocker['kind']}")
     if not str(blocker["evidence"]).strip():
-        raise RalphError("Structured blocker evidence is empty.")
+        raise BraceError("Structured blocker evidence is empty.")
     if not str(blocker["smallestResolution"]).strip():
-        raise RalphError("Structured blocker smallestResolution is empty.")
+        raise BraceError("Structured blocker smallestResolution is empty.")
     if affected and blocker["affectedIdentity"] != affected:
-        raise RalphError(f"Structured blocker identity does not match {affected}.")
+        raise BraceError(f"Structured blocker identity does not match {affected}.")
     if not affected and blocker["affectedIdentity"]:
-        raise RalphError("A workflow-level blocker cannot claim an unrelated task or bug identity.")
+        raise BraceError("A workflow-level blocker cannot claim an unrelated task or bug identity.")
     return blocker
 
 
@@ -70,7 +70,7 @@ def is_semantic_blocker(blocker: dict[str, Any] | None) -> bool:
 def maximum_amendment_rounds(config: dict[str, Any]) -> int:
     value = int(config.get("maximumAmendmentRounds", 3))
     if not 1 <= value <= 32:
-        raise RalphError("maximumAmendmentRounds must be between 1 and 32.")
+        raise BraceError("maximumAmendmentRounds must be between 1 and 32.")
     return value
 
 
@@ -88,28 +88,28 @@ def persisted_task(definition: dict[str, Any], amendment_id: str | None = None) 
 
 def assert_pm_analysis(analysis: dict[str, Any], tasks: dict[str, Any], bugs: dict[str, Any] | None, source_stage: str) -> None:
     if sum(bool(option["recommended"]) for option in analysis["options"]) != 1:
-        raise RalphError("PM analysis must identify exactly one recommended option.")
+        raise BraceError("PM analysis must identify exactly one recommended option.")
     task_ids = {task["taskId"] for task in tasks["tasks"]}
     bug_ids = {bug["bugId"] for bug in (bugs or {}).get("bugs", [])}
     for task_id in analysis["affectedTaskIds"]:
         if task_id not in task_ids:
-            raise RalphError(f"PM analysis references unknown task {task_id}.")
+            raise BraceError(f"PM analysis references unknown task {task_id}.")
     for bug_id in analysis["affectedBugIds"]:
         if bug_id not in bug_ids:
-            raise RalphError(f"PM analysis references unknown bug {bug_id}.")
+            raise BraceError(f"PM analysis references unknown bug {bug_id}.")
     for option in analysis["options"]:
         if option["requiresInput"] and not str(option.get("inputPrompt") or "").strip():
-            raise RalphError(f"PM option {option['optionId']} requires input but has no input prompt.")
+            raise BraceError(f"PM option {option['optionId']} requires input but has no input prompt.")
         if option["action"] == "disposition":
             if source_stage != "audit" or not option["bugDispositions"]:
-                raise RalphError("Bug disposition options are valid only during audit and must contain a disposition.")
+                raise BraceError("Bug disposition options are valid only during audit and must contain a disposition.")
             if option["authorizedDocumentationPaths"]:
-                raise RalphError("A disposition-only option cannot authorize documentation changes.")
+                raise BraceError("A disposition-only option cannot authorize documentation changes.")
             for change in option["bugDispositions"]:
                 if change["bugId"] not in analysis["affectedBugIds"]:
-                    raise RalphError(f"Disposition for {change['bugId']} is not in the affected bug set.")
+                    raise BraceError(f"Disposition for {change['bugId']} is not in the affected bug set.")
         elif option["bugDispositions"]:
-            raise RalphError(f"PM option {option['optionId']} includes bug dispositions but is not a disposition action.")
+            raise BraceError(f"PM option {option['optionId']} includes bug dispositions but is not a disposition action.")
 
 
 def authorized_documentation_paths(option: dict[str, Any]) -> list[str]:
@@ -119,7 +119,7 @@ def authorized_documentation_paths(option: dict[str, Any]) -> list[str]:
         if normalized in result:
             continue
         if not safe_relative_pattern(normalized) or re.search(r"(^|/)\.codex(/|$)", normalized) or not normalized.lower().endswith(".md"):
-            raise RalphError(f"PM documentation path is not a safe Markdown path: {value}")
+            raise BraceError(f"PM documentation path is not a safe Markdown path: {value}")
         result.append(normalized)
     return result
 
@@ -132,7 +132,7 @@ def new_amendment_worktree(root: str | Path, config: dict[str, Any], identity: s
     from common import worktree_base
 
     if not re.fullmatch(r"AMEND-\d{4}", identity):
-        raise RalphError(f"Invalid amendment identity: {identity}")
+        raise BraceError(f"Invalid amendment identity: {identity}")
     branch = f"worktree/{identity}"
     base = worktree_base(root, config)
     base.mkdir(parents=True, exist_ok=True)
@@ -140,14 +140,14 @@ def new_amendment_worktree(root: str | Path, config: dict[str, Any], identity: s
     if path.is_dir():
         actual = run_native("git", ["-C", path, "branch", "--show-current"]).output.strip()
         if actual != branch:
-            raise RalphError(f"Existing amendment worktree has branch {actual}.")
+            raise BraceError(f"Existing amendment worktree has branch {actual}.")
         if run_native("git", ["-C", path, "status", "--porcelain", "--untracked-files=all"]).output.strip():
-            raise RalphError("Amendment worktree contains uncommitted changes.")
+            raise BraceError("Amendment worktree contains uncommitted changes.")
         head = run_native("git", ["-C", path, "rev-parse", "HEAD"]).output.strip()
         if expected_head and head != expected_head:
-            raise RalphError("Amendment worktree HEAD differs from its recorded result.")
+            raise BraceError("Amendment worktree HEAD differs from its recorded result.")
         if run_native("git", ["-C", path, "merge-base", "--is-ancestor", base_reference, head], allowed_exit_codes=(0, 1)).returncode != 0:
-            raise RalphError("Amendment branch does not descend from its recorded base.")
+            raise BraceError("Amendment branch does not descend from its recorded base.")
         return path
     exists = run_native("git", ["-C", root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], allowed_exit_codes=(0, 1)).returncode == 0
     run_native("git", ["-C", root, "worktree", "add", *( ["--", path, branch] if exists else ["-b", branch, "--", path, base_reference] )])
@@ -156,29 +156,29 @@ def new_amendment_worktree(root: str | Path, config: dict[str, Any], identity: s
 
 def assert_amendment_commit(worktree: str | Path, base_sha: str, authorized_paths: list[str]) -> dict[str, Any]:
     if run_native("git", ["-C", worktree, "status", "--porcelain", "--untracked-files=all"]).output.strip():
-        raise RalphError("PM amendment worktree is not clean.")
+        raise BraceError("PM amendment worktree is not clean.")
     head = run_native("git", ["-C", worktree, "rev-parse", "HEAD"]).output.strip()
     if head == base_sha or run_native("git", ["-C", worktree, "merge-base", "--is-ancestor", base_sha, head], allowed_exit_codes=(0, 1)).returncode != 0:
-        raise RalphError("PM did not create a descendant amendment commit.")
+        raise BraceError("PM did not create a descendant amendment commit.")
     count = int(run_native("git", ["-C", worktree, "rev-list", "--count", f"{base_sha}..{head}"]).output.strip())
     if count != 1:
-        raise RalphError(f"PM amendment must contain exactly one commit; found {count}.")
+        raise BraceError(f"PM amendment must contain exactly one commit; found {count}.")
     changed = [line for line in run_native("git", ["-C", worktree, "diff", "--name-only", f"{base_sha}..{head}"]).lines if line]
     for path in changed:
         if path not in authorized_paths:
-            raise RalphError(f"PM modified an unauthorized path: {path}")
+            raise BraceError(f"PM modified an unauthorized path: {path}")
     if not changed:
-        raise RalphError("PM amendment commit changed no approved documentation.")
+        raise BraceError("PM amendment commit changed no approved documentation.")
     return {"Head": head, "ChangedFiles": changed}
 
 
 def assert_pm_result_identity(result: dict[str, Any], amendment: dict[str, Any], commit: dict[str, Any]) -> None:
     if result["decisionIdentity"] != amendment["decisionIdentity"] or result["selectedOptionId"] != amendment["selectedOptionId"]:
-        raise RalphError("PM result does not match the approved user decision.")
+        raise BraceError("PM result does not match the approved user decision.")
     if result["commitSha"] != commit["Head"]:
-        raise RalphError("PM result commit SHA does not match amendment worktree HEAD.")
+        raise BraceError("PM result commit SHA does not match amendment worktree HEAD.")
     if sorted(result["changedFiles"]) != sorted(commit["ChangedFiles"]):
-        raise RalphError("PM result changedFiles does not match the amendment commit.")
+        raise BraceError("PM result changedFiles does not match the amendment commit.")
 
 
 def save_pm_task_ledger(tasks: dict[str, Any], paths: Paths) -> None:
@@ -197,10 +197,10 @@ def complete_disposition_decision(root: str | Path, config: dict[str, Any], stat
     for disposition in option["bugDispositions"]:
         bug = by_id.get(disposition["bugId"])
         if not bug:
-            raise RalphError(f"Disposition references unknown bug {disposition['bugId']}.")
+            raise BraceError(f"Disposition references unknown bug {disposition['bugId']}.")
         if bug["status"] == "verified":
             if bug["disposition"] != disposition["disposition"] or bug["amendmentId"] != amendment["amendmentId"] or bug["dispositionEvidence"] != disposition["evidence"]:
-                raise RalphError(f"Bug {bug['bugId']} was verified by a different decision.")
+                raise BraceError(f"Bug {bug['bugId']} was verified by a different decision.")
             continue
         bug.update(status="verified", disposition=disposition["disposition"], amendmentId=amendment["amendmentId"], lastError=None, dispositionEvidence=disposition["evidence"])
         changed = True
@@ -229,15 +229,15 @@ def _select_option(analysis: dict[str, Any], amendment: dict[str, Any], input_re
     selection = (input_reader(analysis, "option", None) if input_reader else input("Select an option ID: ")).strip().upper()
     matches = [option for option in analysis["options"] if option["optionId"] == selection]
     if len(matches) != 1:
-        raise RalphError(f"Unknown PM option: {selection}")
+        raise BraceError(f"Unknown PM option: {selection}")
     option = matches[0]
     response = selection
     if option["requiresInput"]:
         response = (input_reader(analysis, "value", option) if input_reader else input(f"{option['inputPrompt']}: ")).strip()
         if not response:
-            raise RalphError(f"PM option {selection} requires a nonempty response.")
+            raise BraceError(f"PM option {selection} requires a nonempty response.")
         if len(response) > 4096:
-            raise RalphError("PM response exceeds 4096 characters.")
+            raise BraceError("PM response exceeds 4096 characters.")
     amendment.update(selectedOptionId=selection, userResponse=response)
     amendment["decisionIdentity"] = decision_identity(amendment["amendmentId"], selection, response, analysis["question"])
     return option
@@ -252,10 +252,10 @@ def invoke_pm_resolution(
     if not state.get("activeAmendment"):
         value = structured_blocker(blocker, source_stage, source_identity)
         if not is_semantic_blocker(value):
-            raise RalphError(f"Operational blocker requires correction, not a PM decision: {value['message']}")
+            raise BraceError(f"Operational blocker requires correction, not a PM decision: {value['message']}")
         sequence = int(state["amendmentSequence"]) + 1
         if sequence > maximum_amendment_rounds(config):
-            raise RalphError(f"Semantic amendment limit exhausted at {sequence} attempts.")
+            raise BraceError(f"Semantic amendment limit exhausted at {sequence} attempts.")
         identity = f"AMEND-{sequence:04d}"
         state["amendmentSequence"] = sequence
         state["activeAmendment"] = {
@@ -304,7 +304,7 @@ def invoke_pm_resolution(
         option = options.get(amendment.get("selectedOptionId")) or _select_option(analysis, amendment, input_reader)
         save_state(state, paths)
         if option["action"] == "stop":
-            raise RalphError(f"User selected stop for {identity}.")
+            raise BraceError(f"User selected stop for {identity}.")
         if option["action"] == "retry":
             remove_worktree(root, config, identity, amendment["branch"])
             state.update(activeAmendment=None, blocker=None, stage=source_stage, stageStatus="running")
@@ -312,10 +312,10 @@ def invoke_pm_resolution(
             return {"action": "retry", "resumeStage": source_stage, "amendmentId": identity, "sourceSuperseded": False}
         if option["action"] == "disposition":
             if bugs is None:
-                raise RalphError("A disposition requires a bug ledger.")
+                raise BraceError("A disposition requires a bug ledger.")
             return complete_disposition_decision(root, config, state, paths, tasks, bugs, amendment, option)
         if not analysis["amendmentRequired"]:
-            raise RalphError("The selected amendment conflicts with PM analysis stating that no amendment is required.")
+            raise BraceError("The selected amendment conflicts with PM analysis stating that no amendment is required.")
         amendment.update(authorizedDocumentationPaths=authorized_documentation_paths(option), status="approved")
         state["stageStatus"] = "amending"
         save_state(state, paths)
@@ -346,7 +346,7 @@ def invoke_pm_resolution(
             ))
             result = invoke_role(root, amendment["worktree"], "project-manager", context, "pm-amendment-result.schema.json", "read-only" if mode == "recover_result" else "workspace-write")
             if result["status"] != "completed":
-                raise RalphError(f"PM amendment blocked: {result.get('blocker')}")
+                raise BraceError(f"PM amendment blocked: {result.get('blocker')}")
             record = {"schemaVersion": "1.0", "identity": identity, "attempt": 1, "succeeded": True, "result": result, "error": None, "completedAt": utc_now()}
             write_immutable_json(result_path, record)
         amendment["status"] = "result_ready"
@@ -361,36 +361,36 @@ def invoke_pm_resolution(
         expected = max((int(task["taskId"][5:]) for task in tasks["tasks"]), default=0) + 1
         for index, task in enumerate(result["newTasks"]):
             if task["taskId"] != f"TASK-{expected + index:04d}":
-                raise RalphError("PM follow-up task IDs must append monotonically.")
+                raise BraceError("PM follow-up task IDs must append monotonically.")
         if result["supersededTaskIds"] and not result["newTasks"]:
-            raise RalphError("A superseded task requires at least one replacement follow-up task.")
+            raise BraceError("A superseded task requires at least one replacement follow-up task.")
         for task_id in result["supersededTaskIds"]:
             matches = [task for task in tasks["tasks"] if task["taskId"] == task_id]
             if len(matches) != 1:
-                raise RalphError(f"PM superseded an unknown task: {task_id}")
+                raise BraceError(f"PM superseded an unknown task: {task_id}")
             task = matches[0]
             if task["status"] in {"integrated", "active", "submitted"}:
-                raise RalphError(f"PM cannot supersede task {task_id} because it is active, integrated, or submitted.")
+                raise BraceError(f"PM cannot supersede task {task_id} because it is active, integrated, or submitted.")
             if task.get("resultSha"):
                 durable = read_attempt_result(paths, task_id, task["attemptCount"])
                 if not durable or not durable["succeeded"] or task["status"] not in {"result_ready", "verified_ready"}:
-                    raise RalphError(f"PM cannot supersede task {task_id} because its unintegrated result is not durably preserved.")
+                    raise BraceError(f"PM cannot supersede task {task_id} because its unintegrated result is not durably preserved.")
             if task.get("worktree") and Path(task["worktree"]).is_dir():
                 dirty = run_native("git", ["-C", task["worktree"], "status", "--porcelain", "--untracked-files=all"]).output.strip()
                 head = run_native("git", ["-C", task["worktree"], "rev-parse", "HEAD"]).output.strip()
                 if dirty or (head != task["baseSha"] and head != task.get("resultSha")):
-                    raise RalphError(f"PM cannot supersede task {task_id} because its worktree contains unrecorded work.")
+                    raise BraceError(f"PM cannot supersede task {task_id} because its worktree contains unrecorded work.")
         candidate = tasks["tasks"] + [persisted_task(task, identity) for task in result["newTasks"]]
         assert_graph(candidate, "task")
         superseded = set(result["supersededTaskIds"])
         for task in candidate:
             if task["taskId"] not in superseded and superseded.intersection(task["dependencies"]):
-                raise RalphError(f"{task['taskId']} depends on a superseded task.")
+                raise BraceError(f"{task['taskId']} depends on a superseded task.")
         requirements = read_git_text(amendment["worktree"], commit["Head"], "requirements.md")
         assert_task_coverage([task for task in candidate if task["taskId"] not in superseded], requirements)
         verification = invoke_role(root, amendment["worktree"], "verifier", "Verify this approved project amendment against the exact user decision.\n" + pretty_json(result), "verifier-result.schema.json", "read-only")
         if not verification["approved"]:
-            raise RalphError("PM amendment semantic verification failed: " + "; ".join(verification["findings"]))
+            raise BraceError("PM amendment semantic verification failed: " + "; ".join(verification["findings"]))
         run_native("git", ["-C", amendment["worktree"], "push", "--set-upstream", config["remote"], amendment["branch"]])
         run_native("git", ["-C", root, "fetch", config["remote"], "--prune"])
         base = run_native("git", ["-C", root, "rev-parse", f"{config['remote']}/{config['integrationBranch']}"]).output.strip()
@@ -401,7 +401,7 @@ def invoke_pm_resolution(
     if amendment["status"] == "submitted":
         pr = get_pull_request(root, config, amendment["branch"], config["integrationBranch"], amendment["resultSha"], amendment["pullRequest"]["id"])
         if pr is None:
-            raise RalphError("Unable to reconcile the amendment pull request.")
+            raise BraceError("Unable to reconcile the amendment pull request.")
         merged = complete_pull_request(root, config, pr)
         amendment.update(pullRequest=merged, status="integrated")
         state["integrationSha"] = merged["mergeSha"]
@@ -441,4 +441,4 @@ def invoke_pm_resolution(
         state.update(activeAmendment=None, blocker=None, stage=resume, stageStatus="running")
         save_state(state, paths)
         return {"action": "amended", "resumeStage": resume, "amendmentId": identity, "sourceSuperseded": source_superseded}
-    raise RalphError(f"Unsupported amendment state: {amendment['status']}")
+    raise BraceError(f"Unsupported amendment state: {amendment['status']}")

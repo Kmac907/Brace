@@ -1,4 +1,4 @@
-# Worktree Ralph development instructions
+# Brace development instructions
 
 - Preserve the three-stage design: planning, build, and audit/bug-fix.
 - Keep the workflow repository-local and portable. Do not introduce an installer, service, compiled application, or global module.

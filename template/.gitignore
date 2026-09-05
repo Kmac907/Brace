@@ -1,4 +1,4 @@
-# Worktree Ralph local state and diagnostics
+# Brace local state and diagnostics
 .codex/state.json
 .codex/tasks.json
 .codex/bugs.json

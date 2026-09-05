@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from common import (
-    RalphError,
+    BraceError,
     WorkflowLock,
     assert_assignment_commit,
     assert_graph,
@@ -67,11 +67,11 @@ def reset_after_amendment(task: dict[str, Any], root: Path, config: dict[str, An
     worktree = task.get("worktree")
     if worktree and Path(worktree).is_dir():
         if run_native("git", ["-C", worktree, "status", "--porcelain", "--untracked-files=all"]).output.strip():
-            raise RalphError(f"Preserving {task['taskId']}: its pre-amendment worktree is dirty.")
+            raise BraceError(f"Preserving {task['taskId']}: its pre-amendment worktree is dirty.")
         head = run_native("git", ["-C", worktree, "rev-parse", "HEAD"]).output.strip()
         if task["status"] == "superseded":
             if head != task["baseSha"] and head != task.get("resultSha"):
-                raise RalphError(f"Preserving {task['taskId']}: a superseded task has unrecorded work.")
+                raise BraceError(f"Preserving {task['taskId']}: a superseded task has unrecorded work.")
             remove_worktree(root, config, task["taskId"], task["branch"])
             task.update(branch=None, worktree=None, baseSha=None, resultSha=None, pullRequest=None)
             return
@@ -121,9 +121,9 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 print("BUILD COMPLETE: the audit loop may run.")
                 return "audit"
             if tasks["status"] not in {"ready", "active", "blocked"}:
-                raise RalphError("Planning has not produced a buildable task queue.")
+                raise BraceError("Planning has not produced a buildable task queue.")
             if state["stage"] not in {"build", "blocked"}:
-                raise RalphError(f"The workflow is at stage {state['stage']}, not build.")
+                raise BraceError(f"The workflow is at stage {state['stage']}, not build.")
             state.update(stage="build", stageStatus="running", blocker=None)
             tasks["status"] = "active"
             save_state(state, paths)
@@ -183,7 +183,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                         _checks(root, config, state, tasks)
                         commit = assert_assignment_commit(task["worktree"], task["baseSha"], task)
                         if result["commitSha"] != commit["Head"]:
-                            raise RalphError("Builder result commit SHA does not match the worktree HEAD.")
+                            raise BraceError("Builder result commit SHA does not match the worktree HEAD.")
                         task["resultSha"] = commit["Head"]
                         save_ledger(tasks, paths)
                         print(f"VERIFYING TASK: {task['taskId']} attempt {task['attemptCount']}")
@@ -237,10 +237,10 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                         task["status"] = "blocked"
                     tasks["status"] = "blocked"
                     save_ledger(tasks, paths)
-                    raise RalphError("Task attempts exhausted: " + ", ".join(task["taskId"] for task in exhausted))
+                    raise BraceError("Task attempts exhausted: " + ", ".join(task["taskId"] for task in exhausted))
                 wave = select_ready_items(tasks["tasks"], "task", config["maximumConcurrentBuilders"])
                 if not wave:
-                    raise RalphError("No dependency-ready, non-conflicting tasks remain. Inspect blocked dependencies and path ownership.")
+                    raise BraceError("No dependency-ready, non-conflicting tasks remain. Inspect blocked dependencies and path ownership.")
                 base_sha = state["integrationSha"]
                 for task in wave:
                     task["branch"] = task.get("branch") or f"worktree/{task['taskId']}"
@@ -276,7 +276,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     if is_semantic_blocker(blocker):
                         _semantic_resolution(root, config, state, paths, tasks, bugs, None, "verification", blocker, input_reader)
                         return "build"
-                    raise RalphError("Lightweight integration verification failed: " + "; ".join(verification["findings"]))
+                    raise BraceError("Lightweight integration verification failed: " + "; ".join(verification["findings"]))
             finally:
                 remove_audit_worktree(root, config)
             _checks(root, config, state, tasks)
@@ -310,7 +310,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a planned Worktree Ralph project.")
+    parser = argparse.ArgumentParser(description="Build a planned Brace project.")
     parser.add_argument("repository", nargs="?", default=".")
     args = parser.parse_args()
     next_stage = run(args.repository)

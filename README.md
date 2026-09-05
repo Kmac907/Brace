@@ -1,6 +1,6 @@
-# Worktree Ralph
+# Brace
 
-Worktree Ralph is a portable, repository-local workflow for taking a project from requirements to a merged implementation with isolated Codex agents.
+Branch-Safe Repository Agent Coordination Engine. Controlled agent workflows, from plan to merge.
 
 It has three scripts:
 
@@ -35,8 +35,8 @@ A generated project carries the same dependency declaration at `.codex/requireme
 Download and review the bootstrapper, then run it:
 
 ```text
-curl -fsSLO https://raw.githubusercontent.com/Kmac907/worktree-ralph/main/new_worktree_ralph_project.py
-python new_worktree_ralph_project.py
+curl -fsSLO https://raw.githubusercontent.com/Kmac907/brace/main/new_brace_project.py
+python new_brace_project.py
 ```
 
 The bootstrapper asks whether the project already exists.
@@ -44,7 +44,7 @@ The bootstrapper asks whether the project already exists.
 For an existing repository:
 
 ```text
-python new_worktree_ralph_project.py --existing-repository-path /path/to/repository
+python new_brace_project.py --existing-repository-path /path/to/repository
 ```
 
 The existing repository must be clean, checked out on its remote default branch, exactly synchronized with `origin`, and must not already contain `.codex`. Existing project documentation is preserved.
@@ -52,7 +52,7 @@ The existing repository must be clean, checked out on its remote default branch,
 For a new repository, supply values interactively or with arguments:
 
 ```text
-python new_worktree_ralph_project.py --project-name example --parent-directory /projects --provider github
+python new_brace_project.py --project-name example --parent-directory /projects --provider github
 ```
 
 The bootstrapper copies the workflow, configures `.codex/workflow.json`, commits it, creates or updates the remote repository, verifies the remote SHA, and initializes local workflow state.
@@ -83,7 +83,7 @@ Planning stops before implementation. Review:
 python .codex/scripts/build_loop.py
 ```
 
-The build loop resumes from persisted state, reconciles existing branches, worktrees, commits, and pull requests, then runs dependency-ready non-conflicting tasks up to `maximumConcurrentBuilders`. Each task receives its own worktree and `worktree/TASK-NNNN` branch. A verifier checks the focused result before the coordinator creates and merges its pull request into `ralph/integration`.
+The build loop resumes from persisted state, reconciles existing branches, worktrees, commits, and pull requests, then runs dependency-ready non-conflicting tasks up to `maximumConcurrentBuilders`. Each task receives its own worktree and `worktree/TASK-NNNN` branch. A verifier checks the focused result before the coordinator creates and merges its pull request into `brace/integration`.
 
 The build stage ends after all active tasks are integrated and lightweight integration verification passes. It writes `.codex/build-summary.json`.
 
@@ -144,7 +144,7 @@ External worktrees use:
 └── AMEND-0001/
 ```
 
-Owned branches use `ralph/integration`, `worktree/TASK-NNNN`, `worktree/BUG-NNNN`, and `worktree/AMEND-NNNN`.
+Owned branches use `brace/integration`, `worktree/TASK-NNNN`, `worktree/BUG-NNNN`, and `worktree/AMEND-NNNN`.
 
 ## Drift detection and recovery
 

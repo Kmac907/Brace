@@ -65,7 +65,7 @@ FINAL VALIDATION
 4. Confirm requirements do not contradict one another.
 5. Confirm open questions are genuinely unresolved.
 6. Confirm there are no TODO placeholders.
-7. Confirm requirements are detailed enough for the Worktree Ralph planning loop to create plan.md and a task graph.
+7. Confirm requirements are detailed enough for the Brace planning loop to create plan.md and a task graph.
 8. Write the final document to the repository-root requirements.md.
 9. Return a concise summary containing the number of requirements by category, important constraints and non-goals, confirmed clarifications, unresolved open questions, and whether requirements.md is ready for the planning loop.
 

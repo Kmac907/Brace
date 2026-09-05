@@ -41,14 +41,14 @@ class RepositoryTestCase(unittest.TestCase):
         self.git(root, "init", "-b", "main")
         self.git(root, "config", "user.name", "Test")
         self.git(root, "config", "user.email", "test@example.invalid")
-        source = Path(os.environ.get("RALPH_SOURCE_ROOT", Path(__file__).resolve().parents[1]))
+        source = Path(os.environ.get("BRACE_SOURCE_ROOT", Path(__file__).resolve().parents[1]))
         shutil.copytree(source / "template" / ".codex" / "schemas", root / ".codex" / "schemas")
         (root / ".codex" / "prompts").mkdir()
         (root / ".codex" / "logs").mkdir()
         (root / ".codex" / "AGENTS.md").write_text("test", encoding="utf-8")
         config = {
             "schemaVersion": "1.0", "provider": "github", "remote": "origin", "targetBranch": "main",
-            "integrationBranch": "ralph/integration", "deleteMergedBranches": True,
+            "integrationBranch": "brace/integration", "deleteMergedBranches": True,
             "worktreeRoot": str(self.base / "worktrees"), "maximumConcurrentBuilders": 2,
             "maximumConcurrentFixers": 2, "maximumTaskAttempts": 3, "maximumBugAttempts": 3,
             "maximumPlanningQuestionRounds": 3, "maximumAmendmentRounds": 3,

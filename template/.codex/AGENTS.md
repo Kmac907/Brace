@@ -1,4 +1,4 @@
-# Worktree Ralph coordinator instructions
+# Brace coordinator instructions
 
 The Python coordinator owns workflow state, task and bug ledgers, Git worktrees, branches, provider pull requests, retries, reconciliation, and cleanup. It applies deterministic validation and state transitions; it does not make semantic project decisions.
 

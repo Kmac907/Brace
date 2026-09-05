@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from common import (
-    RalphError,
+    BraceError,
     WorkflowLock,
     assert_graph,
     assert_ledger_identity,
@@ -50,7 +50,7 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
                 state = read_json(paths.state, paths.schemas / "state.schema.json")
             tasks = read_json(paths.tasks, paths.schemas / "tasks.schema.json")
             if tasks["status"] in {"active", "complete"} or state["stage"] in {"audit", "complete"} or any(task["attemptCount"] > 0 for task in tasks["tasks"]):
-                raise RalphError("Planning cannot replace a task queue after implementation has begun.")
+                raise BraceError("Planning cannot replace a task queue after implementation has begun.")
             if tasks["status"] == "ready" and state["stage"] == "build":
                 assert_plan_drift(state, root, require_plan=True)
                 assert_ledger_identity(state, tasks, "task")
@@ -61,19 +61,19 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
 
             requirements_path = root / "requirements.md"
             if not requirements_path.exists():
-                raise RalphError("requirements.md does not exist.")
+                raise BraceError("requirements.md does not exist.")
             run_native("git", ["-C", root, "fetch", config["remote"], "--prune"])
             current_branch = run_native("git", ["-C", root, "branch", "--show-current"]).output.strip()
             if current_branch != config["targetBranch"]:
-                raise RalphError(f"Planning must run from the target branch {config['targetBranch']}, not {current_branch}.")
+                raise BraceError(f"Planning must run from the target branch {config['targetBranch']}, not {current_branch}.")
             local_sha = run_native("git", ["-C", root, "rev-parse", "HEAD"]).output.strip()
             remote_sha = run_native("git", ["-C", root, "rev-parse", f"{config['remote']}/{config['targetBranch']}"]).output.strip()
             if local_sha != remote_sha:
-                raise RalphError("Local target branch must exactly match its remote before planning.")
+                raise BraceError("Local target branch must exactly match its remote before planning.")
             pending = [line[3:].replace("\\", "/") for line in run_native("git", ["-C", root, "status", "--porcelain", "--untracked-files=all"]).lines if len(line) > 3]
             unexpected = [path for path in pending if path not in {"requirements.md", "plan.md"}]
             if unexpected:
-                raise RalphError("Planning found unrelated uncommitted work: " + ", ".join(unexpected))
+                raise BraceError("Planning found unrelated uncommitted work: " + ", ".join(unexpected))
 
             state.update(stage="planning", stageStatus="running", blocker=None)
             save_state(state, paths)
@@ -88,28 +88,28 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
                 result = invoke_role(root, root, "planner", context, "planning-result.schema.json", "read-only")
                 if result["status"] == "questions":
                     if not result["questions"]:
-                        raise RalphError("Planner requested clarification without returning questions.")
+                        raise BraceError("Planner requested clarification without returning questions.")
                     answers = []
                     for question in result["questions"]:
                         print(f"\nPLANNING QUESTION {question['questionId']}\n{question['question']}\nWhy this is needed: {question['reason']}")
                         answer = input("Answer: ").strip()
                         if not answer:
-                            raise RalphError(f"No answer was supplied for {question['questionId']}.")
+                            raise BraceError(f"No answer was supplied for {question['questionId']}.")
                         answers.append(f"### {question['questionId']}\n\nQuestion: {question['question']}\n\nAnswer: {answer}")
                     write_text_atomic(requirements_path, read_text(requirements_path).rstrip() + "\n\n" + "\n\n".join(answers) + "\n")
                     continue
                 if not result["normalizedRequirementsMarkdown"].strip():
-                    raise RalphError("Planner completed without normalized requirements.")
+                    raise BraceError("Planner completed without normalized requirements.")
                 if not result["planMarkdown"].strip():
-                    raise RalphError("Planner completed without plan.md content.")
+                    raise BraceError("Planner completed without plan.md content.")
                 if not result["tasks"]:
-                    raise RalphError("Planner completed without implementation tasks.")
+                    raise BraceError("Planner completed without implementation tasks.")
                 assert_graph(result["tasks"], "task")
                 assert_task_coverage(result["tasks"], result["normalizedRequirementsMarkdown"], result["summary"]["deferredRequirementIds"])
                 completed = result
                 break
             if completed is None:
-                raise RalphError(f"Planning did not complete within {config['maximumPlanningQuestionRounds']} clarification rounds.")
+                raise BraceError(f"Planning did not complete within {config['maximumPlanningQuestionRounds']} clarification rounds.")
 
             write_text_atomic(requirements_path, completed["normalizedRequirementsMarkdown"].rstrip())
             write_text_atomic(root / "plan.md", completed["planMarkdown"].rstrip())
@@ -121,7 +121,7 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
             local_sha = run_native("git", ["-C", root, "rev-parse", "HEAD"]).output.strip()
             remote_sha = run_native("git", ["-C", root, "rev-parse", f"{config['remote']}/{config['targetBranch']}"]).output.strip()
             if local_sha != remote_sha:
-                raise RalphError("Remote target branch does not match the committed planning result.")
+                raise BraceError("Remote target branch does not match the committed planning result.")
 
             persisted = [persisted_task(task) for task in completed["tasks"]]
             plan_hash = git_blob_identity(root, remote_sha, "plan.md")
@@ -155,7 +155,7 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plan a Worktree Ralph project.")
+    parser = argparse.ArgumentParser(description="Plan a Brace project.")
     parser.add_argument("repository", nargs="?", default=".")
     parser.add_argument("--start-new-workflow", action="store_true")
     args = parser.parse_args()

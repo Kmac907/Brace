@@ -3,7 +3,7 @@
   "provider": "github",
   "remote": "origin",
   "targetBranch": "main",
-  "integrationBranch": "ralph/integration",
+  "integrationBranch": "brace/integration",
   "maximumConcurrentBuilders": 3,
   "maximumConcurrentFixers": 3,
   "maximumTaskAttempts": 3,
