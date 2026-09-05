@@ -1,20 +1,12 @@
 from __future__ import annotations
 
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-REPOSITORY = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPOSITORY))
-sys.path.insert(0, str(REPOSITORY / "template" / ".codex" / "scripts"))
-
-import common
-import project_manager
-
-import new_brace_project as bootstrap
+from brace import bootstrap, common, project_manager
 
 
 class SafetyTests(unittest.TestCase):

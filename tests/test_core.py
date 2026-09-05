@@ -1,19 +1,12 @@
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import time
 import unittest
 from pathlib import Path
 
-REPOSITORY = Path(__file__).resolve().parents[1]
-SCRIPTS = REPOSITORY / "template" / ".codex" / "scripts"
-SOURCE_ROOT = Path(os.environ.get("BRACE_SOURCE_ROOT", REPOSITORY))
-sys.path.insert(0, str(SCRIPTS))
-
-import common
-import project_manager
+from brace import common, project_manager
 from support import RepositoryTestCase
 
 

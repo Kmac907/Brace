@@ -59,36 +59,34 @@ Agents never communicate directly. Brace gives each agent one immutable assignme
 
 ### Requirements
 
-- Python 3.11 or newer
+- [uv](https://docs.astral.sh/uv/) 0.12.9 or newer
 - Git
 - Authenticated [Codex CLI](https://github.com/openai/codex)
-- `jsonschema`
 - Authenticated GitHub CLI (`gh`), or Azure CLI (`az`) with the Azure DevOps extension
 - Configured Git `user.name` and `user.email`
 
-Install the Python dependency:
+Install Brace as an isolated command-line tool:
 
 ```bash
-python -m pip install "jsonschema>=4.18,<5"
+uv tool install git+https://github.com/Kmac907/Brace.git
 ```
+
+For local development, run `uv tool install .` from a Brace checkout.
 
 ### 1. Add Brace to a project
 
-Download and review the bootstrapper:
-
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Kmac907/Brace/main/new_brace_project.py
-python new_brace_project.py
+brace init
 ```
 
-It asks whether the project is new or already exists. For unattended setup:
+Brace asks whether the project is new or already exists. For unattended setup:
 
 ```bash
 # Existing repository
-python new_brace_project.py --existing-repository-path /path/to/repository
+brace init --existing-repository-path /path/to/repository
 
 # New GitHub repository
-python new_brace_project.py \
+brace init \
   --project-name example \
   --parent-directory /projects \
   --provider github
@@ -96,7 +94,7 @@ python new_brace_project.py \
 
 An existing repository must be clean, checked out on its remote default branch, exactly synchronized with `origin`, and must not already contain `.codex`. Existing project documentation is preserved.
 
-The bootstrapper runs with your account permissions and can create repositories and push commits. Pin the download URL to a reviewed tag or commit when reproducibility matters.
+`brace init` runs with your account permissions and can create repositories and push commits. Pin the installation URL to a reviewed tag or commit when reproducibility matters.
 
 ### 2. Write the requirements
 
@@ -105,7 +103,7 @@ Use `REQUIREMENTS-PROMPT.md` to turn the project idea into the generated `requir
 ### 3. Plan
 
 ```bash
-python .codex/scripts/planning_loop.py
+brace plan
 ```
 
 Planning reads the repository and `requirements.md`. If essential information is missing, it asks in the same terminal, incorporates the answers, and retries. It then writes and validates `plan.md`, the dependency graph, requirement coverage, and `.codex/tasks.json`.
@@ -115,7 +113,7 @@ Planning stops before implementation so you can review `plan.md`, `.codex/tasks.
 ### 4. Build
 
 ```bash
-python .codex/scripts/build_loop.py
+brace build
 ```
 
 The build loop reconciles persisted work, selects dependency-ready non-conflicting tasks, and runs up to `maximumConcurrentBuilders` agents. Each verified task is integrated into `brace/integration` through a provider pull request. No command is required per task.
@@ -123,7 +121,7 @@ The build loop reconciles persisted work, selects dependency-ready non-conflicti
 ### 5. Audit and finish
 
 ```bash
-python .codex/scripts/audit_loop.py
+brace audit
 ```
 
 The audit loop reviews the exact integration commit once, freezes its findings in `.codex/bugs.json`, and runs up to `maximumConcurrentFixers` independent fixes. After all findings are verified, Brace validates the final integration branch, merges the project pull request, and removes owned worktrees and branches.
@@ -212,14 +210,14 @@ Changing frozen configuration is treated as drift.
 After a workflow reaches completion, update and commit `requirements.md`, then run:
 
 ```bash
-python .codex/scripts/planning_loop.py --start-new-workflow
+brace plan --start-new-workflow
 ```
 
 Brace replaces completed ledgers only after verifying the previous final merge and cleanup.
 
 ## Troubleshooting
 
-- **Missing dependency** — run `python -m pip install -r .codex/requirements.txt`.
+- **Broken installation** — reinstall Brace with `uv tool install --force git+https://github.com/Kmac907/Brace.git`.
 - **Authentication failure** — repair the Codex, Git, `gh`, or `az` session and rerun the same stage.
 - **Dirty worktree** — preserve or commit the reported files; Brace never discards them.
 - **Unknown integration commit** — reconcile the unowned commit or pull request before resuming.
@@ -229,9 +227,11 @@ Brace replaces completed ledgers only after verifying the previous final merge a
 ## Development
 
 ```bash
-python -m pip install -r requirements.txt
-python -m compileall -q new_brace_project.py template/.codex/scripts tests
-python -m unittest discover -s tests -v
+uv sync --locked
+uv run python -m compileall -q src tests
+uv run python -m unittest discover -s tests -v
+uv run brace --help
+uv build --no-sources
 ```
 
 Tests use temporary local Git repositories and mocked provider and agent boundaries. They do not create remote pull requests.

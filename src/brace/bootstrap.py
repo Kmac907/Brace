@@ -11,11 +11,18 @@ from pathlib import Path
 from urllib.parse import unquote
 from uuid import uuid4
 
-SOURCE_REPOSITORY = "https://github.com/Kmac907/brace.git"
+from importlib.resources import files
+
+from .common import get_configuration, initialize_state_files, read_json
+from .ui import ask, confirm
 
 
 class BootstrapError(RuntimeError):
     pass
+
+
+def bundled_template() -> Path:
+    return Path(str(files("brace").joinpath("resources", "template")))
 
 
 def probe(command: str, arguments: list[str], cwd: str | Path = ".") -> tuple[int, str]:
@@ -34,20 +41,14 @@ def run(command: str, arguments: list[str], cwd: str | Path = ".", allowed: tupl
 
 
 def required(value: str | None, prompt: str) -> str:
-    result = (value or input(f"{prompt}: ")).strip()
+    result = (value or ask(prompt)).strip()
     if not result:
         raise BootstrapError(f"{prompt} is required.")
     return result
 
 
 def existing_choice() -> bool:
-    answer = input("Is this an existing Git repository? [y/N]: ").strip().lower()
-    if answer in {"", "n", "no"}:
-        return False
-    if answer in {"y", "yes"}:
-        return True
-    raise BootstrapError("Answer y or n.")
-
+    return confirm("Is this an existing Git repository?", default=False)
 
 def add_section(path: Path, name: str, content: str) -> None:
     begin, end = f"# BEGIN {name}", f"# END {name}"
@@ -108,9 +109,9 @@ def existing_details(path: str) -> dict[str, str]:
 
 def copy_template(template: Path, target: Path, existing: bool) -> None:
     if not existing:
-        shutil.copytree(template, target, dirs_exist_ok=True)
+        shutil.copytree(template, target, dirs_exist_ok=True, ignore=shutil.ignore_patterns("scripts", "requirements.txt"))
         return
-    shutil.copytree(template / ".codex", target / ".codex")
+    shutil.copytree(template / ".codex", target / ".codex", ignore=shutil.ignore_patterns("scripts", "requirements.txt"))
     for name in ("requirements.md", "REQUIREMENTS-PROMPT.md"):
         destination = target / name
         if destination.exists():
@@ -127,17 +128,12 @@ def copy_template(template: Path, target: Path, existing: bool) -> None:
 
 
 def bootstrap(args: argparse.Namespace) -> None:
-    try:
-        import jsonschema  # noqa: F401
-    except ImportError as error:
-        raise BootstrapError("Install the required dependency first: python -m pip install \"jsonschema>=4.18,<5\"") from error
-
     use_existing = bool(args.existing_repository_path)
     if use_existing and (args.project_name or args.parent_directory):
         raise BootstrapError("Existing repository path cannot be combined with project name or parent directory.")
     if not use_existing and not args.project_name and not args.parent_directory and existing_choice():
         use_existing = True
-        args.existing_repository_path = input(f"Existing repository path [{Path.cwd()}]: ").strip() or str(Path.cwd())
+        args.existing_repository_path = ask("Existing repository path", default=str(Path.cwd())).strip()
 
     for command in ("git", "codex"):
         if not shutil.which(command):
@@ -166,7 +162,7 @@ def bootstrap(args: argparse.Namespace) -> None:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", args.project_name):
             raise BootstrapError("Project name contains unsupported characters.")
         args.parent_directory = required(args.parent_directory, "Local parent directory")
-        args.provider = (args.provider or input("Provider (github or azure_devops): ")).strip().lower()
+        args.provider = (args.provider or ask("Provider (github or azure_devops)")).strip().lower()
         if args.provider not in {"github", "azure_devops"}:
             raise BootstrapError("Provider must be github or azure_devops.")
         target = (Path(args.parent_directory).resolve() / args.project_name).resolve()
@@ -195,15 +191,21 @@ def bootstrap(args: argparse.Namespace) -> None:
             if code == 0:
                 raise BootstrapError(f"Azure DevOps repository already exists: {args.project_name}")
 
-    temporary = Path(tempfile.gettempdir()) / f"brace-bootstrap-{uuid4().hex}"
-    source = temporary / "source"
+    temporary = None
     succeeded = False
-    temporary.mkdir()
     try:
-        run("git", ["clone", "--depth", "1", "--", args.source_repository, str(source)])
-        template = source / "template"
-        if not template.is_dir():
-            raise BootstrapError(f"Source repository has no template directory: {args.source_repository}")
+        if args.source_repository:
+            temporary = Path(tempfile.gettempdir()) / f"brace-bootstrap-{uuid4().hex}"
+            source = temporary / "source"
+            temporary.mkdir()
+            run("git", ["clone", "--depth", "1", "--", args.source_repository, str(source)])
+            template = source / "template"
+            if not template.is_dir():
+                template = source / "src" / "brace" / "resources" / "template"
+            if not template.is_dir():
+                raise BootstrapError(f"Source repository has no template directory: {args.source_repository}")
+        else:
+            template = bundled_template()
         copy_template(template, target, use_existing)
         workflow_path = target / ".codex" / "workflow.json"
         workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
@@ -222,13 +224,6 @@ def bootstrap(args: argparse.Namespace) -> None:
             run("git", ["config", "user.email", args.git_user_email.strip()], target)
         if not run("git", ["config", "user.name"], target, (0, 1)).strip() or not run("git", ["config", "user.email"], target, (0, 1)).strip():
             raise BootstrapError("Git user.name and user.email must be configured before bootstrap.")
-
-        scripts = list((target / ".codex" / "scripts").glob("*.py"))
-        if not scripts:
-            raise BootstrapError("Copied workflow has no Python scripts.")
-        compile_result = subprocess.run([sys.executable, "-m", "py_compile", *map(str, scripts)], capture_output=True, text=True, check=False)
-        if compile_result.returncode:
-            raise BootstrapError("Copied workflow scripts are invalid:\n" + compile_result.stderr)
 
         run("git", ["add", "--force", "--", ".codex"], target)
         run("git", ["add", "--", ".gitignore", ".gitattributes", "AGENTS.md", "requirements.md", "REQUIREMENTS-PROMPT.md"], target)
@@ -256,30 +251,26 @@ def bootstrap(args: argparse.Namespace) -> None:
         local_sha = run("git", ["rev-parse", "HEAD"], target).strip()
         if local_sha != run("git", ["rev-parse", f"origin/{target_branch}"], target).strip():
             raise BootstrapError(f"Remote {target_branch} does not match the bootstrap commit.")
-        sys.path.insert(0, str(target / ".codex" / "scripts"))
-        from common import get_configuration, initialize_state_files, read_json
-
         paths = initialize_state_files(target, get_configuration(target))
         state = read_json(paths.state, paths.schemas / "state.schema.json")
         if state["repository"] != identity:
             raise BootstrapError("Initialized state does not match the remote repository.")
         succeeded = True
-        print(f"\n{'BRACE INSTALLED' if use_existing else 'BRACE PROJECT CREATED'}\nPROJECT:      {target}\nREMOTE:       {identity}\nTARGET:       {target_branch}\nINITIAL SHA:  {local_sha}\nNEXT:         Complete requirements.md, then run python .codex/scripts/planning_loop.py.")
+        print(f"\n{'BRACE INSTALLED' if use_existing else 'BRACE PROJECT CREATED'}\nPROJECT:      {target}\nREMOTE:       {identity}\nTARGET:       {target_branch}\nINITIAL SHA:  {local_sha}\nNEXT:         Complete requirements.md, then run brace plan.")
     finally:
-        if succeeded:
+        if temporary is not None and succeeded:
             expected_parent = Path(tempfile.gettempdir()).resolve()
             resolved = temporary.resolve()
             if resolved.parent != expected_parent or not re.fullmatch(r"brace-bootstrap-[0-9a-f]{32}", resolved.name):
                 raise BootstrapError(f"Refusing to remove unexpected temporary directory: {resolved}")
             shutil.rmtree(resolved)
-        else:
+        elif not succeeded:
             print(f"Bootstrap failed. The destination was preserved: {target}", file=sys.stderr)
-            print(f"Temporary source clone was preserved for diagnosis: {temporary}", file=sys.stderr)
+            if temporary is not None:
+                print(f"Temporary source clone was preserved for diagnosis: {temporary}", file=sys.stderr)
 
-
-def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="Create or install a portable Brace project.")
-    result.add_argument("--source-repository", default=SOURCE_REPOSITORY)
+def add_arguments(result: argparse.ArgumentParser) -> None:
+    result.add_argument("--source-repository")
     result.add_argument("--existing-repository-path")
     result.add_argument("--project-name")
     result.add_argument("--parent-directory")
@@ -293,8 +284,3 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--worktree-root")
     result.add_argument("--git-user-name")
     result.add_argument("--git-user-email")
-    return result
-
-
-if __name__ == "__main__":
-    bootstrap(parser().parse_args())

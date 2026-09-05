@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
-from common import (
+from .common import (
     BraceError,
     WorkflowLock,
     assert_graph,
@@ -31,7 +30,8 @@ from common import (
     write_summary,
     write_text_atomic,
 )
-from project_manager import persisted_task
+from .project_manager import persisted_task
+from .ui import ask, status
 
 
 def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
@@ -85,14 +85,15 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
                     "treat them as authoritative. If the requirements are sufficient, return the normalized requirements, "
                     "complete plan, and complete task graph now."
                 )
-                result = invoke_role(root, root, "planner", context, "planning-result.schema.json", "read-only")
+                with status(f"Planning project (round {round_number})"):
+                    result = invoke_role(root, root, "planner", context, "planning-result.schema.json", "read-only")
                 if result["status"] == "questions":
                     if not result["questions"]:
                         raise BraceError("Planner requested clarification without returning questions.")
                     answers = []
                     for question in result["questions"]:
                         print(f"\nPLANNING QUESTION {question['questionId']}\n{question['question']}\nWhy this is needed: {question['reason']}")
-                        answer = input("Answer: ").strip()
+                        answer = ask("Answer").strip()
                         if not answer:
                             raise BraceError(f"No answer was supplied for {question['questionId']}.")
                         answers.append(f"### {question['questionId']}\n\nQuestion: {question['question']}\n\nAnswer: {answer}")
@@ -150,17 +151,5 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
             print("PLANNING COMPLETE: requirements, plan, and task queue are ready.")
         except Exception as error:
             if state is not None:
-                set_blocked(state, paths, "planning", None, str(error), "Correct the reported requirement, configuration, or environment issue, then rerun planning_loop.py.")
+                set_blocked(state, paths, "planning", None, str(error), "Correct the reported requirement, configuration, or environment issue, then rerun brace plan.")
             raise
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Plan a Brace project.")
-    parser.add_argument("repository", nargs="?", default=".")
-    parser.add_argument("--start-new-workflow", action="store_true")
-    args = parser.parse_args()
-    run(args.repository, args.start_new_workflow)
-
-
-if __name__ == "__main__":
-    main()

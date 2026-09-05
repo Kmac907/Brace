@@ -1,7 +1,7 @@
 # Brace development instructions
 
 - Preserve the three-stage design: planning, build, and audit/bug-fix.
-- Keep the workflow repository-local and portable. Do not introduce an installer, service, compiled application, or global module.
+- Keep project state repository-local and portable. Brace itself is a uv-packaged Python CLI; do not introduce a service or compiled application.
 - Use Python 3.11+ and resolve support files relative to `__file__`.
 - Prefer the Python standard library; add dependencies only for trust-boundary functionality the standard library does not provide.
 - Never embed credentials, user-specific paths, repository identities, or remote identities.

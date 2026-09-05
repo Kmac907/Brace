@@ -179,7 +179,7 @@ def validate_json(value: Any, schema_path: str | Path) -> None:
     try:
         import jsonschema
     except ImportError as exc:
-        raise BraceError("Python package 'jsonschema' is required. Install requirements.txt.") from exc
+        raise BraceError("Python package 'jsonschema' is required; reinstall Brace.") from exc
     path = Path(schema_path).resolve()
     if not path.is_file():
         raise BraceError(f"JSON schema does not exist: {path}")
@@ -934,20 +934,9 @@ def write_summary(path: str | Path, summary: dict[str, Any]) -> None:
 
 
 def show_status(state: dict[str, Any], tasks: dict[str, Any] | None = None, bugs: dict[str, Any] | None = None) -> None:
-    print()
-    print(f"STAGE:           {state['stage']}")
-    print(f"STATUS:          {state['stageStatus']}")
-    print(f"REPOSITORY:      {state['repository']}")
-    print(f"TARGET:          {state['targetBranch']}")
-    print(f"INTEGRATION:     {state['integrationBranch']}")
-    print(f"INTEGRATION SHA: {state.get('integrationSha') or ''}")
-    if tasks is not None:
-        print(f"TASKS:           {sum(item['status'] == 'integrated' for item in tasks['tasks'])}/{len(tasks['tasks'])} integrated")
-    if bugs is not None:
-        print(f"BUGS:            {sum(item['status'] == 'verified' for item in bugs['bugs'])}/{len(bugs['bugs'])} verified")
-    if state.get("blocker"):
-        print(f"BLOCKER:         {state['blocker']['message']}")
-        print(f"DECISION:        {state['blocker']['requiredDecision']}")
+    from .ui import render_status
+
+    render_status(state, tasks, bugs)
 
 
 def new_audit_worktree(root: str | Path, config: dict[str, Any], reference: str) -> Path:

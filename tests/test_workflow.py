@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-import os
 import shutil
 from pathlib import Path
 from unittest.mock import patch
 
-import audit_loop
-import build_loop
-import common
-import planning_loop
+from brace import audit as audit_loop
+from brace import build as build_loop
+from brace import common
+from brace import planning as planning_loop
+from brace.bootstrap import bundled_template
 from support import RepositoryTestCase
 
 
 class WorkflowTests(RepositoryTestCase):
     def prepare(self) -> tuple[Path, Path, dict]:
         root, remote, config = self.make_repository()
-        source_template = Path(os.environ.get("BRACE_SOURCE_ROOT", Path(__file__).resolve().parents[1])) / "template"
+        source_template = bundled_template()
         shutil.copy2(source_template / ".gitignore", root / ".gitignore")
         shutil.copytree(source_template / ".codex" / "prompts", root / ".codex" / "prompts", dirs_exist_ok=True)
         shutil.copy2(source_template / ".codex" / "AGENTS.md", root / ".codex" / "AGENTS.md")

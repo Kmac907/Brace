@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import argparse
 import warnings
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from common import (
+from .common import (
     BraceError,
     WorkflowLock,
     assert_assignment_commit,
@@ -45,11 +44,12 @@ from common import (
     write_json_atomic,
     write_summary,
 )
-from project_manager import (
+from .project_manager import (
     invoke_pm_resolution,
     is_semantic_blocker,
     structured_blocker,
 )
+from .ui import status
 
 InputReader = Callable[[dict[str, Any], str, dict[str, Any] | None], str]
 
@@ -138,7 +138,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
             for task in (item for item in tasks["tasks"] if item["status"] in {"result_ready", "verified_ready", "submitted"} and item.get("resultSha")):
                 existing = get_pull_request(root, config, task["branch"], config["integrationBranch"], task["resultSha"])
                 if existing:
-                    from common import complete_pull_request
+                    from .common import complete_pull_request
                     merged = complete_pull_request(root, config, existing)
                     task.update(pullRequest=merged, status="integrated", lastError=None)
                     state["integrationSha"] = merged["mergeSha"]
@@ -270,7 +270,8 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
             state["integrationSha"] = ensure_integration_branch(root, config, state, known_merges(tasks))
             verification_worktree = new_audit_worktree(root, config, f"{config['remote']}/{config['integrationBranch']}")
             try:
-                verification = invoke_role(root, verification_worktree, "verifier", f"Perform lightweight integration verification at exact SHA {state['integrationSha']}. Confirm the build and direct smoke checks only.", "verifier-result.schema.json", "read-only")
+                with status("Running integration verification"):
+                    verification = invoke_role(root, verification_worktree, "verifier", f"Perform lightweight integration verification at exact SHA {state['integrationSha']}. Confirm the build and direct smoke checks only.", "verifier-result.schema.json", "read-only")
                 if not verification["approved"]:
                     blocker = structured_blocker(verification["blocker"], "build", None)
                     if is_semantic_blocker(blocker):
@@ -305,18 +306,5 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                         save_ledger(tasks, paths)
                     except Exception as save_error:
                         warnings.warn(f"Unable to preserve task ledger while handling an error: {save_error}", stacklevel=2)
-                set_blocked(state, paths, "build", None, str(error), "Resolve the exact task, provider, drift, or environment blocker, then rerun build_loop.py.")
+                set_blocked(state, paths, "build", None, str(error), "Resolve the exact task, provider, drift, or environment blocker, then rerun brace build.")
             raise
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a planned Brace project.")
-    parser.add_argument("repository", nargs="?", default=".")
-    args = parser.parse_args()
-    next_stage = run(args.repository)
-    while next_stage == "build":
-        next_stage = run(args.repository)
-
-
-if __name__ == "__main__":
-    main()

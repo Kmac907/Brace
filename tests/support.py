@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+
+from brace.bootstrap import bundled_template
 
 
 class RepositoryTestCase(unittest.TestCase):
@@ -41,8 +42,7 @@ class RepositoryTestCase(unittest.TestCase):
         self.git(root, "init", "-b", "main")
         self.git(root, "config", "user.name", "Test")
         self.git(root, "config", "user.email", "test@example.invalid")
-        source = Path(os.environ.get("BRACE_SOURCE_ROOT", Path(__file__).resolve().parents[1]))
-        shutil.copytree(source / "template" / ".codex" / "schemas", root / ".codex" / "schemas")
+        shutil.copytree(bundled_template() / ".codex" / "schemas", root / ".codex" / "schemas")
         (root / ".codex" / "prompts").mkdir()
         (root / ".codex" / "logs").mkdir()
         (root / ".codex" / "AGENTS.md").write_text("test", encoding="utf-8")

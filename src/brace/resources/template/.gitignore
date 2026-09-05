@@ -7,7 +7,6 @@
 .codex/results/
 .codex/logs/
 .codex/workflow.lock
-.codex/scripts/__pycache__/
 *.pyc
 
 # Common local build output

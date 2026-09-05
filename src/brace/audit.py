@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import warnings
 from collections import Counter
 from collections.abc import Callable
@@ -8,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from common import (
+from .common import (
     BraceError,
     WorkflowLock,
     assert_assignment_commit,
@@ -51,11 +50,12 @@ from common import (
     write_json_atomic,
     write_summary,
 )
-from project_manager import (
+from .project_manager import (
     invoke_pm_resolution,
     is_semantic_blocker,
     structured_blocker,
 )
+from .ui import status
 
 InputReader = Callable[[dict[str, Any], str, dict[str, Any] | None], str]
 
@@ -190,7 +190,8 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
 
             if bugs["status"] == "not_audited":
                 audit_worktree = new_audit_worktree(root, config, f"{config['remote']}/{config['integrationBranch']}")
-                audit_result = invoke_role(root, audit_worktree, "auditor", f"Audit the complete implementation at exact integration commit {state['integrationSha']}. Return the complete bounded finding set in one response. Do not edit the worktree.", "audit-result.schema.json", "read-only")
+                with status("Running deep project audit"):
+                    audit_result = invoke_role(root, audit_worktree, "auditor", f"Audit the complete implementation at exact integration commit {state['integrationSha']}. Return the complete bounded finding set in one response. Do not edit the worktree.", "audit-result.schema.json", "read-only")
                 if audit_result["status"] == "blocked":
                     blocker = structured_blocker(audit_result["blocker"], "audit", None)
                     if is_semantic_blocker(blocker):
@@ -345,7 +346,8 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
             bugs["status"] = "complete"
             save_ledger(bugs, paths)
             audit_worktree = new_audit_worktree(root, config, f"{config['remote']}/{config['integrationBranch']}")
-            final_validation = invoke_role(root, audit_worktree, "verifier", f"Run final project validation at exact integration SHA {state['integrationSha']}. Execute the project-wide commands from plan.md.", "verifier-result.schema.json", "read-only")
+            with status("Running final project validation"):
+                final_validation = invoke_role(root, audit_worktree, "verifier", f"Run final project validation at exact integration SHA {state['integrationSha']}. Execute the project-wide commands from plan.md.", "verifier-result.schema.json", "read-only")
             if not final_validation["approved"]:
                 blocker = structured_blocker(final_validation["blocker"], "audit", None)
                 if is_semantic_blocker(blocker):
@@ -392,21 +394,5 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                         save_ledger(bugs, paths)
                     except Exception as save_error:
                         warnings.warn(f"Unable to preserve bug ledger while handling an error: {save_error}", stacklevel=2)
-                set_blocked(state, paths, "audit", None, str(error), "Resolve the exact bug, provider, validation, drift, or environment blocker, then rerun audit_loop.py.")
+                set_blocked(state, paths, "audit", None, str(error), "Resolve the exact bug, provider, validation, drift, or environment blocker, then rerun brace audit.")
             raise
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Audit and repair a built Brace project.")
-    parser.add_argument("repository", nargs="?", default=".")
-    args = parser.parse_args()
-    next_stage = run(args.repository)
-    while next_stage == "build":
-        from build_loop import run as run_build
-        next_stage = run_build(args.repository)
-        if next_stage == "audit":
-            next_stage = run(args.repository)
-
-
-if __name__ == "__main__":
-    main()

@@ -5,7 +5,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from common import (
+from .common import (
     Paths,
     BraceError,
     assert_graph,
@@ -31,6 +31,7 @@ from common import (
     write_immutable_json,
     write_json_atomic,
 )
+from .ui import ask
 
 InputReader = Callable[[dict[str, Any], str, dict[str, Any] | None], str]
 
@@ -129,7 +130,7 @@ def decision_identity(amendment_id: str, option_id: str, response: str, question
 
 
 def new_amendment_worktree(root: str | Path, config: dict[str, Any], identity: str, base_reference: str, expected_head: str | None = None) -> Path:
-    from common import worktree_base
+    from .common import worktree_base
 
     if not re.fullmatch(r"AMEND-\d{4}", identity):
         raise BraceError(f"Invalid amendment identity: {identity}")
@@ -226,14 +227,14 @@ def _select_option(analysis: dict[str, Any], amendment: dict[str, Any], input_re
     for option in analysis["options"]:
         print(f"  {option['optionId']}: {option['label']}{' [recommended]' if option['recommended'] else ''}\n    {option['description']}")
     print(analysis["question"])
-    selection = (input_reader(analysis, "option", None) if input_reader else input("Select an option ID: ")).strip().upper()
+    selection = (input_reader(analysis, "option", None) if input_reader else ask("Select an option ID")).strip().upper()
     matches = [option for option in analysis["options"] if option["optionId"] == selection]
     if len(matches) != 1:
         raise BraceError(f"Unknown PM option: {selection}")
     option = matches[0]
     response = selection
     if option["requiresInput"]:
-        response = (input_reader(analysis, "value", option) if input_reader else input(f"{option['inputPrompt']}: ")).strip()
+        response = (input_reader(analysis, "value", option) if input_reader else ask(option["inputPrompt"])).strip()
         if not response:
             raise BraceError(f"PM option {selection} requires a nonempty response.")
         if len(response) > 4096:
@@ -433,7 +434,7 @@ def invoke_pm_resolution(
         save_state(state, paths)
 
     if amendment["status"] == "applied":
-        from common import remove_merged_assignment
+        from .common import remove_merged_assignment
 
         remove_merged_assignment(root, config, identity, amendment["branch"], amendment["pullRequest"])
         source_superseded = source_identity in result["supersededTaskIds"]
