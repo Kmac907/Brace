@@ -27,6 +27,15 @@ SEMANTIC_BLOCKERS = {
     "bug_disposition",
 }
 
+PONYTAIL_GUIDANCE = """# Optional Ponytail efficiency guidance
+
+When the `ponytail:ponytail` skill is available and this assignment involves implementation, implementation design, refactoring, debugging, or code review, load and use it at full level.
+If it is unavailable, continue without it; Ponytail is optional and its absence is not a blocker.
+Never use it to weaken explicit requirements, input validation, security, accessibility, error handling, or required tests.
+The role's required JSON output schema overrides Ponytail's response-format guidance.
+Do not use it for work that is only prose, status reporting, or a semantic user decision.
+"""
+
 
 class BraceError(RuntimeError):
     pass
@@ -925,7 +934,7 @@ def invoke_codex(prompt: str, cwd: str | Path, schema_path: str | Path, sandbox:
 
 def invoke_role(root: str | Path, cwd: str | Path, role: str, context: str, schema_name: str, sandbox: str) -> dict[str, Any]:
     paths, config = Paths(root), get_configuration(root)
-    prompt = f"{read_text(paths.codex / 'AGENTS.md')}\n\n{read_text(paths.prompts / f'{role}.md')}\n\n# Assignment context\n\n{context}"
+    prompt = f"{read_text(paths.codex / 'AGENTS.md')}\n\n{PONYTAIL_GUIDANCE}\n{read_text(paths.prompts / f'{role}.md')}\n\n# Assignment context\n\n{context}"
     return invoke_codex(prompt, cwd, paths.schemas / schema_name, sandbox, paths.logs, role, int(config["agentTimeoutMinutes"]), int(config["agentCleanupGraceSeconds"]))
 
 

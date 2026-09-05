@@ -5,6 +5,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from brace import common, project_manager
 from support import RepositoryTestCase
@@ -33,6 +34,16 @@ class CoreTests(RepositoryTestCase):
         self.assertTrue(project_manager.is_semantic_blocker(semantic))
         with self.assertRaisesRegex(common.BraceError, "evidence"):
             project_manager.structured_blocker(dict(semantic, evidence=""), "build", "TASK-0001")
+
+    def test_role_prompt_recommends_optional_ponytail(self) -> None:
+        root, _, _ = self.make_repository()
+        (root / ".codex" / "prompts" / "builder.md").write_text("builder role", encoding="utf-8")
+        with patch.object(common, "invoke_codex", return_value={}) as invoke:
+            common.invoke_role(root, root, "builder", "task", "builder-result.schema.json", "workspace-write")
+        prompt = invoke.call_args.args[0]
+        self.assertIn("load and use it at full level", prompt)
+        self.assertIn("optional and its absence is not a blocker", prompt)
+        self.assertIn("required JSON output schema overrides", prompt)
 
     def test_pm_analysis_rejects_unknown_task(self) -> None:
         analysis = {

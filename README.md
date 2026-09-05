@@ -65,6 +65,15 @@ Agents never communicate directly. Brace gives each agent one immutable assignme
 - Authenticated GitHub CLI (`gh`), or Azure CLI (`az`) with the Azure DevOps extension
 - Configured Git `user.name` and `user.email`
 
+**Recommended optional dependency:** [Ponytail](https://github.com/DietrichGebert/ponytail) for smaller, simpler agent implementations and reviews.
+
+```bash
+codex plugin marketplace add DietrichGebert/ponytail
+codex plugin add ponytail@ponytail
+```
+
+Brace does not install or require Ponytail. When the skill is available, Brace asks applicable agents to load it at full level; otherwise the workflow continues normally. Ponytail never overrides Brace's structured output contract or required validation, security, accessibility, error handling, or tests.
+
 Install Brace as an isolated command-line tool:
 
 ```bash
