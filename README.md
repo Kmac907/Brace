@@ -1,394 +1,230 @@
 # Worktree Ralph
 
-Worktree Ralph is a portable, repository-local workflow for taking a software project from written requirements to an audited merge with Codex coding agents.
+Worktree Ralph is a portable, repository-local workflow for taking a project from requirements to a merged implementation with isolated Codex agents.
 
-It uses three PowerShell scripts:
+It has three scripts:
 
-1. **Planning** turns `requirements.md` into an implementation plan and dependency-aware task queue.
-2. **Build** assigns ready tasks to parallel agents in isolated Git worktrees and integrates each result through a provider pull request.
-3. **Audit** performs one deep review, records the complete finding set, fixes independent bugs in parallel, validates the finished project, and merges it to `main`.
+1. `planning_loop.py` turns `requirements.md` into `plan.md` and `.codex/tasks.json`.
+2. `build_loop.py` runs dependency-ready tasks in parallel Git worktrees and integrates each through a provider pull request.
+3. `audit_loop.py` performs one whole-project audit, fixes the resulting bug ledger in parallel worktrees, validates the result, and merges the project pull request.
 
-There is no application, service, installer, or global module. The bootstrapper copies the workflow into the project, and the project carries everything required to continue.
+The Python coordinator is deterministic. It owns state, scheduling, Git, pull requests, retries, reconciliation, and cleanup. Codex agents perform semantic planning, implementation, review, auditing, fixes, and project-management decisions.
 
 ## Requirements
 
-- PowerShell 7 (`pwsh`)
-- Git with worktree support
-- [Codex CLI](https://github.com/openai/codex), authenticated
-- One supported Git provider:
-  - GitHub CLI (`gh`), authenticated with `gh auth login`
-  - Azure CLI (`az`), authenticated, with the `azure-devops` extension installed
-- A configured Git author name and email
+- Python 3.11 or newer
+- Git
+- Codex CLI
+- The `jsonschema` package
+- GitHub CLI (`gh`) for GitHub projects, or Azure CLI (`az`) with the Azure DevOps extension
+- Authenticated Git and provider CLI access
+- A configured Git `user.name` and `user.email`
 
-The provider account must be allowed to create repositories, branches, and pull requests in the selected GitHub owner or Azure DevOps project.
+Install the Python dependency:
+
+```text
+python -m pip install -r requirements.txt
+```
+
+A generated project carries the same dependency declaration at `.codex/requirements.txt`.
 
 ## Quick start
 
-### 1. Bootstrap the project
+### Bootstrap a project
 
-The shortest bootstrap runs directly from this repository. It first asks whether you are installing into an existing Git repository:
-
-```powershell
-irm https://raw.githubusercontent.com/Kmac907/worktree-ralph/main/New-WorktreeRalphProject.ps1 | iex
-```
+Download and review the bootstrapper, then run it:
 
 ```text
-Is this an existing Git repository? [y/N]
+curl -fsSLO https://raw.githubusercontent.com/Kmac907/worktree-ralph/main/new_worktree_ralph_project.py
+python new_worktree_ralph_project.py
 ```
 
-Answer `N` to create a new local project and remote repository. Answer `Y` to install the workflow into an existing clean repository. The existing-repository path defaults to the current directory.
+The bootstrapper asks whether the project already exists.
 
-This executes code downloaded from `Kmac907/worktree-ralph` with your current PowerShell permissions. Review the script first if you do not trust the repository or its maintainers. For reproducible automation, replace `main` in the URL with a release tag or exact commit.
-
-To create a new project without prompts:
-
-```powershell
-$bootstrap = irm https://raw.githubusercontent.com/Kmac907/worktree-ralph/main/New-WorktreeRalphProject.ps1
-
-& ([scriptblock]::Create([string]$bootstrap)) `
-    -ProjectName MyProject `
-    -ParentDirectory C:\Code\Projects `
-    -Provider github `
-    -Visibility private `
-    -MaximumConcurrentBuilders 3 `
-    -MaximumConcurrentFixers 3
-```
-
-To install into an existing repository without prompts:
-
-```powershell
-$bootstrap = irm https://raw.githubusercontent.com/Kmac907/worktree-ralph/main/New-WorktreeRalphProject.ps1
-
-& ([scriptblock]::Create([string]$bootstrap)) `
-    -ExistingRepositoryPath C:\Code\Projects\MyExistingProject `
-    -MaximumConcurrentBuilders 3 `
-    -MaximumConcurrentFixers 3
-```
-
-For a new project, the bootstrapper:
-
-- creates an empty local project directory;
-- copies the repository-local workflow template;
-- initializes `main` and creates the initial commit;
-- creates the GitHub or Azure DevOps repository;
-- pushes and verifies `main`;
-- initializes ignored workflow state; and
-- removes its temporary clone after successful setup.
-
-It refuses to overwrite a non-empty destination or reuse an existing remote repository.
-
-For an existing project, the bootstrapper:
-
-- requires a clean Git worktree on the provider's target branch;
-- requires local `HEAD` to exactly match the corresponding `origin` branch;
-- detects GitHub or Azure DevOps identity from `origin`;
-- refuses an existing `.codex` directory instead of overwriting it;
-- installs the repository-local `.codex` workflow;
-- preserves existing source files, `requirements.md`, and `REQUIREMENTS-PROMPT.md`;
-- appends bounded Worktree Ralph sections to existing `.gitignore`, `.gitattributes`, and `AGENTS.md` files;
-- creates missing requirement and instruction templates;
-- validates the copied scripts and stages only workflow-owned paths;
-- creates and pushes one focused installation commit; and
-- initializes ignored local workflow state using the detected repository identity.
-
-It never initializes another Git repository, creates another remote, rewrites history, force-pushes, or overwrites an existing workflow installation. If the remote, branch, provider, or repository identity cannot be determined safely, it stops with an exact error before installation.
-
-### 2. Write the requirements
-
-Open the generated `requirements.md` and replace every `TODO`. Requirements use stable `REQ-*` identifiers so planning can prove that every applicable requirement belongs to at least one task.
-
-Describe the expected behavior, constraints, integrations, security boundaries, failure handling, testing, delivery, and acceptance criteria. Mark intentionally excluded work as a non-goal instead of leaving it ambiguous.
-
-To turn an existing project idea into the template efficiently, copy the reusable instructions from [`REQUIREMENTS-PROMPT.md`](template/REQUIREMENTS-PROMPT.md) into your coding-agent session and paste the idea where indicated. The idea may be a short paragraph, rough notes, an existing specification, or a detailed proposal. The prompt asks one concise batch of questions only when blocking ambiguity exists and never invents requirements.
-
-### 3. Run planning
-
-From the generated project root:
-
-```powershell
-& .\.codex\scripts\planning-loop.ps1
-```
-
-Planning reads the complete requirements and existing repository. It asks an interactive question only when an answer is necessary to produce a safe, internally consistent plan. Answers are incorporated into `requirements.md`, and planning continues automatically.
-
-When planning finishes, it:
-
-- normalizes `requirements.md`;
-- creates or updates `plan.md`;
-- validates requirement coverage and the task dependency graph;
-- writes the local `tasks.json` queue;
-- commits and pushes the planning documents to `main`; and
-- prints `PLANNING COMPLETE` with a project summary.
-
-Implementation tasks must fit one bounded agent session and produce one focused commit. Tasks that change user-visible behavior include executable UI or browser verification when the project provides suitable tooling; otherwise they use the best available project-specific verification.
-
-### 4. Run the build
-
-```powershell
-& .\.codex\scripts\build-loop.ps1
-```
-
-The build loop runs without a command per task. It repeatedly finds dependency-ready, non-conflicting tasks, creates one external worktree and branch per task, launches builders in parallel, verifies their focused results, and integrates them into `ralph/integration` through real provider pull requests.
-
-It stops after every task is integrated and lightweight integration validation passes. The final message is `BUILD COMPLETE`.
-
-### 5. Run the audit and bug-fix stage
-
-```powershell
-& .\.codex\scripts\audit-loop.ps1
-```
-
-The audit loop performs one fresh, whole-project audit and freezes its findings in `bugs.json`. It then assigns independent bugs to isolated worktrees, verifies each fix, and integrates each fix through a pull request.
-
-After every finding is resolved, it runs final project validation, merges the `ralph/integration` project pull request into `main`, removes owned worktrees and branches, and prints `PROJECT COMPLETE`.
-
-## Workflow at a glance
+For an existing repository:
 
 ```text
-requirements.md
-      |
-      v
-planning-loop.ps1 -> plan.md + tasks.json
-      |
-      v
-build-loop.ps1 -> TASK worktrees -> task PRs -> ralph/integration
-      |
-      v
-audit-loop.ps1 -> bugs.json -> BUG worktrees -> bug PRs
-      |
-      v
-final validation -> project PR -> main -> cleanup
+python new_worktree_ralph_project.py --existing-repository-path /path/to/repository
 ```
 
-The three stage scripts are the only normal workflow entry points. Task selection, retries, verification, pull requests, reconciliation, and cleanup are coordinator responsibilities. The PM is an internal Codex role invoked by the build or audit loop only when a semantic decision is necessary; there is no separate PM command.
+The existing repository must be clean, checked out on its remote default branch, exactly synchronized with `origin`, and must not already contain `.codex`. Existing project documentation is preserved.
 
-## Ownership and agent communication
-
-The PowerShell coordinator and the Codex agents have deliberately different responsibilities:
-
-| Component | Owns | Must not do |
-| --- | --- | --- |
-| Coordinator scripts | state.json, tasks.json, bugs.json, attempt records, worktrees, branches, retries, provider PRs, merges, reconciliation, and cleanup | Invent requirements, choose product behavior, or make semantic scope decisions |
-| Planner agent | Analyze requirements, ask essential planning questions, normalize requirements, produce plan.md, and propose the initial task graph | Edit ledgers, publish branches, or integrate work |
-| Builder agents | Implement one assigned task and create one focused commit | Edit shared ledgers or contract files, select more work, or contact another agent |
-| Auditor agent | Produce one fresh, bounded whole-project finding set | Edit the repository or run an endless review loop |
-| Bug-fixer agents | Correct one assigned frozen bug and create one focused commit | Add unrelated findings or edit shared ledgers |
-| Verifier agents | Independently verify one assignment or final integration state | Expand a focused review into a new audit |
-| PM agent | Analyze semantic blockers, recommend options, and implement a user-approved requirements/plan amendment | Handle ordinary tool failures, edit source code, edit ledgers, or merge its own work |
-
-Agents do not communicate directly with each other. A builder, fixer, auditor, or verifier returns a schema-validated result to the coordinator. For an operational failure, the coordinator retries or stops under the configured limits. For a semantic blocker, the coordinator passes the exact evidence to the PM, presents the PM's recommendation and alternatives interactively to the user, and records the selected option.
-
-## Parallel agents
-
-Concurrency is chosen during bootstrap:
-
-- `MaximumConcurrentBuilders` defaults to `3`.
-- `MaximumConcurrentFixers` defaults to `3`.
-- Both accept values from `1` through `32`.
-
-The coordinator may run fewer agents when dependencies, overlapping allowed paths, or exclusive resources make assignments unsafe to execute together. Planning and the deep audit each use one agent.
-
-The selected values are stored in `.codex/workflow.json`, and the bootstrapper immediately freezes that configuration in workflow state. Choose concurrency and the optional worktree root during bootstrap. Editing the configuration afterward is treated as drift.
-
-## Git and worktree model
-
-The coordinator owns all Git integration:
+For a new repository, supply values interactively or with arguments:
 
 ```text
-main
-  `-- ralph/integration
-        |-- worktree/TASK-0001
-        |-- worktree/TASK-0002
-        `-- worktree/BUG-0001
+python new_worktree_ralph_project.py --project-name example --parent-directory /projects --provider github
 ```
 
-- Each task or bug receives its own external worktree and branch.
-- Agents edit and commit only inside their assigned worktree.
-- Agents do not push, create pull requests, merge, or modify shared ledgers.
-- The coordinator verifies the exact commit before publishing it.
-- Task and bug pull requests target `ralph/integration`.
-- The final project pull request targets `main`.
-- Squash-merged assignment branches and owned worktrees are removed after their merge is verified.
+The bootstrapper copies the workflow, configures `.codex/workflow.json`, commits it, creates or updates the remote repository, verifies the remote SHA, and initializes local workflow state.
 
-Unless `worktreeRoot` is configured, external worktrees are placed below the operating system temporary directory under `worktree-ralph/<repository-id>/`.
+The downloaded script runs with your account's permissions and can create repositories and push commits. Pin its URL to a reviewed tag or commit when reproducibility matters.
+
+### Write requirements
+
+Use `REQUIREMENTS-PROMPT.md` to turn the project idea into the structured `requirements.md` template. Review the result before planning.
+
+### Plan
+
+```text
+python .codex/scripts/planning_loop.py
+```
+
+Planning reads the repository and `requirements.md`. When essential information is missing, it asks in the same terminal, appends the answers, and retries. It then normalizes requirements, writes `plan.md`, validates the dependency graph and requirement coverage, commits and pushes the contract, and writes the task ledger and planning summary.
+
+Planning stops before implementation. Review:
+
+- `plan.md`
+- `.codex/tasks.json`
+- `.codex/planning-summary.json`
+
+### Build
+
+```text
+python .codex/scripts/build_loop.py
+```
+
+The build loop resumes from persisted state, reconciles existing branches, worktrees, commits, and pull requests, then runs dependency-ready non-conflicting tasks up to `maximumConcurrentBuilders`. Each task receives its own worktree and `worktree/TASK-NNNN` branch. A verifier checks the focused result before the coordinator creates and merges its pull request into `ralph/integration`.
+
+The build stage ends after all active tasks are integrated and lightweight integration verification passes. It writes `.codex/build-summary.json`.
+
+### Audit and finish
+
+```text
+python .codex/scripts/audit_loop.py
+```
+
+The audit loop performs one fresh audit of the exact integration commit and freezes its findings in `.codex/bugs.json`. Dependency-ready non-conflicting fixes run up to `maximumConcurrentFixers`, each in its own `worktree/BUG-NNNN` branch and pull request. After every bug is verified, final validation runs against the exact integration SHA. The coordinator then merges the project pull request into the target branch and removes owned worktrees and branches.
+
+It writes `.codex/audit-summary.json` and leaves the flat `.codex` ledgers as the completed record.
+
+## Ownership
+
+| Component | Responsibility |
+| --- | --- |
+| Python coordinator | Sole writer of live state and ledgers; schedules work; validates outputs; manages Git, pull requests, recovery, and cleanup |
+| Planning agent | Proposes normalized requirements, the implementation plan, and the initial task graph |
+| Project-manager agent | Analyzes semantic blockers and proposes user-approved contract amendments and follow-up tasks |
+| Builder agents | Implement one assigned task in one isolated worktree and commit |
+| Verifier | Checks a focused task, bug fix, amendment, build integration, or final result |
+| Auditor | Produces one complete bounded whole-project bug set without editing |
+| Bug-fixer agents | Fix or disprove one assigned bug in one isolated worktree |
+| User | Decides changes to requirements, scope, policy, or project direction |
+
+Agents do not communicate directly. The coordinator provides immutable assignments and carries structured results between roles. Agents never edit live `.codex/state.json`, `.codex/tasks.json`, or `.codex/bugs.json`, and never perform provider operations.
 
 ## Files in a generated project
 
-Tracked workflow files travel with the project:
+```text
+.codex/
+├── AGENTS.md
+├── workflow.json
+├── requirements.txt
+├── prompts/
+├── schemas/
+├── scripts/
+├── state.json
+├── tasks.json
+├── bugs.json
+├── planning-summary.json
+├── build-summary.json
+├── audit-summary.json
+├── assignments/
+├── results/
+└── logs/
+```
 
-| Path | Purpose |
-| --- | --- |
-| `requirements.md` | User-authored project contract and confirmed planning clarifications |
-| `plan.md` | Planner-generated implementation plan consumed by builders and reviewers |
-| `.codex/workflow.json` | Provider, concurrency, retry, timeout, branch, and worktree settings |
-| `.codex/AGENTS.md` | Coordinator-wide agent rules |
-| `.codex/scripts/` | Planning, build, audit, and shared coordinator scripts |
-| `.codex/prompts/` | Planner, PM, builder, verifier, auditor, and bug-fixer role instructions |
-| `.codex/schemas/` | Strict JSON contracts for state and agent results |
+Mutable state, summaries, attempt records, logs, and the lock are ignored by Git. Prompts, schemas, scripts, configuration, and dependency declarations are tracked.
 
-Mutable workflow records are local and ignored by Git:
+External worktrees use:
 
-| Path | Purpose |
-| --- | --- |
-| `.codex/state.json` | Current stage, frozen identities and hashes, integration SHA, accepted integration merges, blocker, and resumable PM amendment state |
-| `.codex/tasks.json` | Frozen task definitions plus assignment and integration status |
-| `.codex/bugs.json` | Frozen audit findings plus fix and verification status |
-| `.codex/assignments/` | Immutable assignment record for every attempt |
-| `.codex/results/` | Immutable agent result for every attempt |
-| `.codex/*-summary.json` | Planning, build, and final audit summaries |
-| `.codex/logs/` | Bounded agent logs and archived completed-attempt records |
-| `.codex/workflow.lock` | Prevents two local coordinators from running simultaneously |
+```text
+<worktree-root>/<repository-id>/
+├── TASK-0001/
+├── BUG-0001/
+└── AMEND-0001/
+```
 
-Do not manually edit `state.json`, `tasks.json`, `bugs.json`, assignment records, or result records. They are coordinator-owned recovery data.
+Owned branches use `ralph/integration`, `worktree/TASK-NNNN`, `worktree/BUG-NNNN`, and `worktree/AMEND-NNNN`.
 
 ## Drift detection and recovery
 
-Worktree Ralph freezes and validates:
+Before waves, verification, publication, audit, and final merge, the coordinator verifies:
 
-- repository and provider identity;
-- remote URL and branch names;
-- target-branch planning baseline;
-- `requirements.md`, `plan.md`, and workflow configuration hashes;
-- task and bug definition hashes;
-- worktree path, branch, base commit, and result commit;
-- pull-request repository, ID, source SHA, base SHA, and merge SHA; and
-- every accepted commit on `ralph/integration`.
+- repository path, provider identity, remote URL, target branch, and workflow configuration;
+- exact requirements, plan, task-definition, and bug-definition hashes;
+- target-branch baseline;
+- integration history against verified task, bug, or amendment merge SHAs;
+- exact worktree branch, base, HEAD, cleanliness, and result identity;
+- exact pull-request repository, ID, head SHA, base SHA, and merge SHA.
 
-Checks run at stage startup, between assignment waves, after agent work, and before verification, publishing, or merging. Unknown commits, target advancement, stale pull requests, dirty worktrees, and identity mismatches stop the workflow instead of being silently accepted.
+State and ledgers use atomic replacement. Each attempt has immutable assignment and result files. Restart the same script after a recoverable interruption; it reconciles durable work before retrying.
 
-If a script is interrupted, run the same stage script again. It reconciles durable attempt records, worktrees, branches, pull requests, and provider merge results before scheduling replacement work.
+A completed workflow can be replaced only with:
 
-Blockers are handled by type:
-
-- Operational blockers include tool failures, authentication, provider outages, timeouts, missing executable dependencies, and exhausted retries. The deterministic coordinator retries when safe and otherwise records the exact correction needed.
-- Semantic blockers include missing project information, a requirements/plan conflict, a scope gap, invalid task decomposition, or a bug-disposition decision. The coordinator invokes the PM agent instead of trying to amend documentation itself.
-
-For a semantic blocker, the PM works read-only first and returns a recommendation, alternatives, consequences, affected task or bug IDs, and one clear question. The same running script prompts the user immediately. It does not write questions to a JSON inbox or require a separate resume command.
-
-If the user approves an amendment, the PM edits only requirements.md and plan.md in worktree/AMEND-NNNN. Integrated work stays immutable. New work is appended as monotonically numbered tasks, and only untouched pending tasks may be superseded. The coordinator validates coverage and dependency integrity, integrates the amendment through a real provider PR, updates the ledgers, and resumes automatically.
-
-If an audit-stage amendment changes scope, the previous audit ledger is archived, new implementation tasks run first, and a fresh whole-project audit is required afterward. Interrupted PM analysis, user selection, amendment work, PR creation, or merge is recovered from state.activeAmendment by rerunning the same build or audit script.
-
-### Interactive blocker example
-
-Suppose a builder proves that a required behavior is missing from both `requirements.md` and `plan.md`. The builder returns a `scope_gap` blocker and does not choose the missing behavior itself. The coordinator pauses new scheduling, preserves every result already produced by the wave, and asks the PM to analyze the evidence. The terminal then shows the PM's recommended option, legitimate alternatives, and the effect of each option.
-
-If the user approves the recommendation, the coordinator records that exact answer. The PM creates one documentation-only commit in `worktree/AMEND-NNNN`; the coordinator verifies the authorized files and decision identity, merges the amendment through a provider pull request, appends any follow-up tasks, supersedes only invalidated untouched tasks, and resumes the build in the same script invocation. If the user selects `stop`, no amendment is made and the workflow remains blocked with the decision preserved.
-
-### Amendment recovery states
-
-`state.json` contains at most one active amendment. Rerunning the same stage script reconciles the recorded state before doing more work:
-
-| State | Durable fact | Resume behavior |
-| --- | --- | --- |
-| `analyzing` | Blocker identity and PM analysis path are reserved | Reuse a valid immutable analysis result, or rerun only the missing analysis |
-| `awaiting_user` | PM options are validated | Ask interactively; if an answer was already persisted, do not ask again |
-| `approved` | Exact option, response, decision hash, and authorized files are recorded | Reconcile or create the amendment worktree and assignment |
-| `agent_active` | PM assignment exists | Reuse a durable result; if a commit exists without a result, recover its structured result without editing |
-| `result_ready` | PM result exists | Verify decision identity, exact commit, changed paths, task graph, and requirement coverage |
-| `submitted` | Exact provider pull-request identity is recorded | Reconcile its repository, head SHA, base SHA, and merge result; do not create a duplicate PR |
-| `integrated` | Provider merge SHA is accepted on the integration branch | Apply validated task and bug ledger changes once |
-| `applied` | Contract hashes and ledgers reflect the amendment | Clean owned resources, clear the active amendment, and resume the recorded stage |
-
-Assignment-specific failures and attempt counts remain attached to their task or bug. Do not reset ledgers or delete worktrees to force progress.
-
-Agent execution is bounded by `agentTimeoutMinutes`. A timed-out Codex process tree is terminated and given `agentCleanupGraceSeconds` to stop before the assignment is retried or blocked.
-
-## Starting another project update
-
-After a workflow reaches `PROJECT COMPLETE`:
-
-1. Update `requirements.md` for the next body of work.
-2. Commit and push that requirements change to `main`, leaving the repository clean.
-3. Run:
-
-```powershell
-& .\.codex\scripts\planning-loop.ps1 -StartNewWorkflow
+```text
+python .codex/scripts/planning_loop.py --start-new-workflow
 ```
 
-A new workflow is allowed only after the prior final merge and cleanup are verified. Completed attempt records are archived under `.codex/logs/`, and each new flat state, task, and bug ledger is written using atomic file replacement.
+The previous workflow must be complete and owned worktrees and branches must already be cleanly resolved.
 
-## Configuration reference
+## Semantic blockers
 
-The bootstrapper writes `.codex/workflow.json`. Important settings are:
+Operational failures such as authentication, timeouts, dirty worktrees, malformed results, or provider outages use bounded retries or stop with a concrete diagnostic.
 
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `provider` | `github` template default | `github` or `azure_devops`; bootstrap sets the selected provider |
-| `remote` | `origin` | Git remote owned by the workflow |
-| `targetBranch` | `main` | Final project pull-request target |
-| `integrationBranch` | `ralph/integration` | Coordinator integration branch |
-| `maximumConcurrentBuilders` | `3` | Maximum builders in one task wave |
-| `maximumConcurrentFixers` | `3` | Maximum bug fixers in one bug wave |
-| `maximumTaskAttempts` | `3` | Attempt limit per task |
-| `maximumBugAttempts` | `3` | Attempt limit per bug |
-| `maximumPlanningQuestionRounds` | `5` | Maximum interactive clarification rounds |
-| `maximumAmendmentRounds` | `3` | Maximum user-approved semantic amendment cycles per workflow |
-| `agentTimeoutMinutes` | `90` | Deadline for one Codex role invocation |
-| `agentCleanupGraceSeconds` | `10` | Process-tree teardown grace period |
-| `worktreeRoot` | `null` | Optional external worktree parent; system temporary storage when unset |
-| `deleteMergedBranches` | `true` | Delete verified assignment and integration branches after merge |
+A semantic blocker can invoke the project-manager agent. The coordinator:
 
-Provider-specific repository identity is written under `github` or `azureDevOps` during bootstrap.
+1. stops scheduling new work and preserves completed agent results;
+2. asks the user an interactive question with a recommendation and effects;
+3. creates an isolated amendment worktree after approval;
+4. limits edits to approved Markdown contract files;
+5. verifies one focused commit and its exact decision identity;
+6. integrates it through a provider pull request;
+7. appends validated follow-up tasks or records an approved bug disposition;
+8. resumes build or audit automatically.
 
-## Bootstrap parameters
+If an audit amendment expands implementation scope, the workflow returns to build and requires a fresh whole-project audit afterward. Amendment rounds are bounded by `maximumAmendmentRounds`.
 
-`New-WorktreeRalphProject.ps1` accepts:
+## Configuration
 
-| Parameter | Behavior |
-| --- | --- |
-| `ExistingRepositoryPath` | Installs into this existing clean repository and skips the interactive existing/new question |
-| `ProjectName` | New local directory and remote repository name; prompted when omitted |
-| `ParentDirectory` | Existing local parent directory; prompted when omitted |
-| `Provider` | `github` or `azure_devops`; prompted when omitted |
-| `Visibility` | GitHub repository visibility; defaults to `private` |
-| `GitHubOwner` | GitHub user or organization; current authenticated user when omitted |
-| `AzureOrganization` | Azure DevOps organization URL; prompted for Azure DevOps |
-| `AzureProject` | Azure DevOps project; prompted for Azure DevOps |
-| `MaximumConcurrentBuilders` | Builder limit from 1–32; defaults to 3 |
-| `MaximumConcurrentFixers` | Bug-fixer limit from 1–32; defaults to 3 |
-| `WorktreeRoot` | Optional external worktree parent |
-| `GitUserName` | Repository-local Git author override |
-| `GitUserEmail` | Repository-local Git author override |
-| `SourceRepository` | Workflow source; defaults to this GitHub repository |
+Edit `.codex/workflow.json` before planning begins.
 
-`ExistingRepositoryPath` cannot be combined with `ProjectName` or `ParentDirectory`. Supplying the new-project parameters selects the original new-project flow for unattended use. With neither mode supplied, the bootstrapper asks the single existing-repository question.
+- `provider`: `github` or `azure_devops`
+- `remote`: Git remote name
+- `targetBranch`: final merge target
+- `integrationBranch`: coordinator integration branch
+- `maximumConcurrentBuilders`: parallel task agents
+- `maximumConcurrentFixers`: parallel bug-fix agents
+- `maximumTaskAttempts`: attempts per task
+- `maximumBugAttempts`: attempts per bug
+- `maximumPlanningQuestionRounds`: interactive planning rounds
+- `maximumAmendmentRounds`: semantic amendment limit
+- `agentTimeoutMinutes`: Codex deadline
+- `agentCleanupGraceSeconds`: process-tree cleanup grace
+- `worktreeRoot`: optional external worktree root
+- `deleteMergedBranches`: delete verified merged branches
+- provider repository fields under `github` or `azureDevOps`
 
-## Security model
-
-- The scripts do not write provider or Codex credentials into the project.
-- Provider operations use the currently authenticated `gh` or `az` session.
-- Agents are instructed not to push, merge, create pull requests, or edit coordinator state.
-- The coordinator validates agent paths and exact commits before publishing them.
-- Read-only planner, auditor, and verifier roles cannot intentionally modify production worktrees through the workflow.
-- Destructive cleanup is restricted to verified workflow-owned worktree paths and branches.
-
-Running a remote script with `irm | iex` is convenient but trusts the referenced repository revision. Pin a reviewed release tag or commit when reproducibility is more important than automatically receiving the latest bootstrapper.
+Configuration is frozen into workflow state. Changing it after workflow creation is treated as drift.
 
 ## Troubleshooting
 
-- **Existing repository is dirty:** Commit or preserve every tracked and untracked change, then rerun the bootstrapper. It intentionally makes no installation changes in this condition.
-- **Existing `.codex` directory:** The bootstrapper does not guess whether an existing `.codex` tree is compatible. Inspect or remove it deliberately before retrying; an installed Worktree Ralph project should continue with its repository-local stage scripts instead of being bootstrapped again.
-- **Branch or remote mismatch:** Check out the remote's target branch and make it exactly match `origin`. The bootstrapper will not install on a feature branch, adopt an unpushed commit, or infer an unsupported provider URL.
-- **Authentication or provider outage:** This is operational, so the PM is not invoked. Restore the `gh`, `az`, Git, or network session and rerun the same stage script. The coordinator reuses matching resources and rejects conflicting ones.
-- **Rejected amendment:** Selecting the stop option preserves the blocker and decision. It does not amend project documentation, mutate task or bug definitions, or create a provider pull request. Any reserved amendment worktree and branch remain recoverable coordinator resources. Change project direction only through a new explicit user decision; do not hand-edit coordinator ledgers.
-- **Stale or wrong-head pull request:** The coordinator requires the recorded provider repository, PR ID, source branch, target branch, head SHA, base SHA, and merge SHA. Close or correct the conflicting provider resource, then rerun; it is never accepted by branch name alone.
-- **Scope or task conflict:** The PM must propose monotonically numbered follow-up tasks. The coordinator rejects unknown or cyclic dependencies, uncovered requirements, unsafe paths, forbidden scope, mutation of integrated tasks, and superseding a task whose work is not safely preserved.
-- **Amendment attempts exhausted:** After `maximumAmendmentRounds`, the workflow stops without claiming completion. Existing decisions, immutable agent results, worktrees, and the unresolved blocker remain available for inspection and recovery.
-- **Interrupted amendment:** Do not delete its worktree or state. Rerun the same build or audit script; the recovery table above describes the exact reconciliation behavior.
+- **Missing Python package**: run `python -m pip install -r .codex/requirements.txt`.
+- **Authentication failure**: repair `gh`, `az`, Git, or Codex authentication, then rerun the same stage.
+- **Dirty repository or worktree**: preserve or commit the reported files; the coordinator will not discard them.
+- **Unknown integration commit**: reconcile the exact unowned commit or pull request before resuming.
+- **Stale pull request**: close or reconcile the PR whose head/base identity differs from the persisted assignment.
+- **Semantic question**: answer in the active terminal. No JSON inbox is required.
+- **Attempts exhausted**: inspect the persisted result and blocker; the workflow does not fabricate completion.
 
 ## Development and tests
 
-Clone this workflow repository and run:
-
-```powershell
-& .\tests\Run-Tests.ps1
+```text
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
 ```
 
-The suite covers common state behavior, Git worktree isolation, drift and reconciliation, process-tree timeout cleanup, bootstrap behavior, PM-driven scope amendment and resumption, and the complete planning-to-merge workflow. Tests use disposable local Git repositories and deterministic provider and agent fixtures; they do not create real remote repositories.
-
-When changing workflow behavior, preserve the planning → build → audit design and add deterministic coverage for the affected state transition, recovery path, or cleanup rule.
+The tests use temporary local Git repositories and mocked provider/agent boundaries. They do not create remote pull requests.
 
 ## License
 
-Copyright (c) 2026 Kmac907. All rights reserved. See [LICENSE](LICENSE).
+See [LICENSE](LICENSE).

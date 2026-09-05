@@ -1,0 +1,300 @@
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from urllib.parse import unquote
+from uuid import uuid4
+
+SOURCE_REPOSITORY = "https://github.com/Kmac907/worktree-ralph.git"
+
+
+class BootstrapError(RuntimeError):
+    pass
+
+
+def probe(command: str, arguments: list[str], cwd: str | Path = ".") -> tuple[int, str]:
+    source = shutil.which(command)
+    if not source:
+        raise BootstrapError(f"Required command is unavailable: {command}")
+    process = subprocess.run([source, *arguments], cwd=str(Path(cwd).resolve()), capture_output=True, text=True, encoding="utf-8", errors="strict", check=False)
+    return process.returncode, (process.stdout + process.stderr).rstrip()
+
+
+def run(command: str, arguments: list[str], cwd: str | Path = ".", allowed: tuple[int, ...] = (0,)) -> str:
+    code, output = probe(command, arguments, cwd)
+    if code not in allowed:
+        raise BootstrapError(f"Command failed with exit code {code}: {command} {' '.join(arguments)}\n{output}")
+    return output
+
+
+def required(value: str | None, prompt: str) -> str:
+    result = (value or input(f"{prompt}: ")).strip()
+    if not result:
+        raise BootstrapError(f"{prompt} is required.")
+    return result
+
+
+def existing_choice() -> bool:
+    answer = input("Is this an existing Git repository? [y/N]: ").strip().lower()
+    if answer in {"", "n", "no"}:
+        return False
+    if answer in {"y", "yes"}:
+        return True
+    raise BootstrapError("Answer y or n.")
+
+
+def add_section(path: Path, name: str, content: str) -> None:
+    begin, end = f"# BEGIN {name}", f"# END {name}"
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if begin in existing or end in existing:
+        raise BootstrapError(f"The existing file contains an incomplete or duplicate {name} section: {path}")
+    prefix = existing.rstrip() + "\n\n" if existing.strip() else ""
+    path.write_text(f"{prefix}{begin}\n{content.strip()}\n{end}\n", encoding="utf-8", newline="\n")
+
+
+def existing_details(path: str) -> dict[str, str]:
+    requested = Path(path).resolve()
+    if not requested.is_dir():
+        raise BootstrapError(f"Existing repository directory does not exist: {requested}")
+    root_code, root_result = probe("git", ["-C", str(requested), "rev-parse", "--show-toplevel"])
+    if root_code:
+        raise BootstrapError(f"Path is not a Git repository: {requested}")
+    root = Path(root_result).resolve()
+    if root != requested:
+        print(f"Using repository root: {root}")
+    if run("git", ["-C", str(root), "status", "--porcelain", "--untracked-files=all"]).strip():
+        raise BootstrapError(f"Existing repository worktree is not clean: {root}")
+    if (root / ".codex").is_dir():
+        raise BootstrapError(f"Existing repository already contains .codex; refusing to overwrite or duplicate a workflow installation: {root}")
+    branch = run("git", ["-C", str(root), "branch", "--show-current"]).strip()
+    if not branch:
+        raise BootstrapError("Existing repository must be checked out on a branch, not a detached HEAD.")
+    remote_url = run("git", ["-C", str(root), "config", "--get", "remote.origin.url"], allowed=(0, 1)).strip()
+    if not remote_url:
+        raise BootstrapError("Existing repository must have an origin remote.")
+    run("git", ["-C", str(root), "fetch", "origin", "--prune"])
+    remote_head_code, remote_head = probe("git", ["-C", str(root), "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+    if remote_head_code not in {0, 1}:
+        raise BootstrapError("Unable to determine the origin default branch.")
+    target = re.sub(r"^origin/", "", remote_head.strip()) if remote_head_code == 0 and remote_head.strip() else branch
+    if branch != target:
+        raise BootstrapError(f"Existing repository must be checked out on its target branch '{target}'; current branch is '{branch}'.")
+    local_sha = run("git", ["-C", str(root), "rev-parse", "HEAD"]).strip()
+    remote_sha_code, remote_sha = probe("git", ["-C", str(root), "rev-parse", f"refs/remotes/origin/{target}"])
+    if remote_sha_code:
+        raise BootstrapError(f"Origin does not contain target branch '{target}'.")
+    remote_sha = remote_sha.strip()
+    if local_sha != remote_sha:
+        raise BootstrapError(f"Local {target} must exactly match origin/{target} before installation.")
+
+    normalized = re.sub(r"\.git$", "", remote_url.strip())
+    github = re.search(r"github\.com[:/]([^/:\s]+)/([^/\s]+)$", normalized, re.IGNORECASE)
+    if github:
+        owner, repository = github.groups()
+        return {"root": str(root), "provider": "github", "target": target, "identity": f"{owner}/{repository}", "repository": repository, "github_owner": owner}
+    azure = re.search(r"dev\.azure\.com/([^/]+)/([^/]+)/_git/([^/]+)$", normalized, re.IGNORECASE) or re.search(r"dev\.azure\.com:v3/([^/]+)/([^/]+)/([^/]+)$", normalized, re.IGNORECASE)
+    if azure:
+        organization, project, repository = map(unquote, azure.groups())
+        organization_url = f"https://dev.azure.com/{organization}"
+        return {"root": str(root), "provider": "azure_devops", "target": target, "identity": f"{organization_url}|{project}|{repository}", "repository": repository, "azure_organization": organization_url, "azure_project": project}
+    raise BootstrapError(f"Unable to determine GitHub or Azure DevOps repository identity from origin: {remote_url}")
+
+
+def copy_template(template: Path, target: Path, existing: bool) -> None:
+    if not existing:
+        shutil.copytree(template, target, dirs_exist_ok=True)
+        return
+    shutil.copytree(template / ".codex", target / ".codex")
+    for name in ("requirements.md", "REQUIREMENTS-PROMPT.md"):
+        destination = target / name
+        if destination.exists():
+            print(f"Preserved existing {name}")
+        else:
+            shutil.copy2(template / name, destination)
+    add_section(target / ".gitignore", "WORKTREE RALPH", (template / ".gitignore").read_text(encoding="utf-8"))
+    add_section(target / ".gitattributes", "WORKTREE RALPH", (template / ".gitattributes").read_text(encoding="utf-8"))
+    agents = target / "AGENTS.md"
+    if agents.exists():
+        add_section(agents, "WORKTREE RALPH", (template / "AGENTS.md").read_text(encoding="utf-8"))
+    else:
+        shutil.copy2(template / "AGENTS.md", agents)
+
+
+def bootstrap(args: argparse.Namespace) -> None:
+    try:
+        import jsonschema  # noqa: F401
+    except ImportError as error:
+        raise BootstrapError("Install the required dependency first: python -m pip install \"jsonschema>=4.18,<5\"") from error
+
+    use_existing = bool(args.existing_repository_path)
+    if use_existing and (args.project_name or args.parent_directory):
+        raise BootstrapError("Existing repository path cannot be combined with project name or parent directory.")
+    if not use_existing and not args.project_name and not args.parent_directory and existing_choice():
+        use_existing = True
+        args.existing_repository_path = input(f"Existing repository path [{Path.cwd()}]: ").strip() or str(Path.cwd())
+
+    for command in ("git", "codex"):
+        if not shutil.which(command):
+            raise BootstrapError(f"Required command is unavailable: {command}")
+
+    target_branch, identity = "main", None
+    if use_existing:
+        details = existing_details(args.existing_repository_path)
+        target = Path(details["root"])
+        target_branch = details["target"]
+        if args.provider and args.provider != details["provider"]:
+            raise BootstrapError(f"Configured provider '{args.provider}' does not match the origin remote provider '{details['provider']}'.")
+        args.provider, args.project_name, identity = details["provider"], details["repository"], details["identity"]
+        if args.provider == "github":
+            if args.github_owner and args.github_owner != details["github_owner"]:
+                raise BootstrapError("GitHub owner does not match origin.")
+            args.github_owner = details["github_owner"]
+        else:
+            if args.azure_organization and args.azure_organization.rstrip("/") != details["azure_organization"]:
+                raise BootstrapError("Azure organization does not match origin.")
+            if args.azure_project and args.azure_project != details["azure_project"]:
+                raise BootstrapError("Azure project does not match origin.")
+            args.azure_organization, args.azure_project = details["azure_organization"], details["azure_project"]
+    else:
+        args.project_name = required(args.project_name, "Project name")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", args.project_name):
+            raise BootstrapError("Project name contains unsupported characters.")
+        args.parent_directory = required(args.parent_directory, "Local parent directory")
+        args.provider = (args.provider or input("Provider (github or azure_devops): ")).strip().lower()
+        if args.provider not in {"github", "azure_devops"}:
+            raise BootstrapError("Provider must be github or azure_devops.")
+        target = (Path(args.parent_directory).resolve() / args.project_name).resolve()
+        if target.is_dir() and any(target.iterdir()):
+            raise BootstrapError(f"Destination is not empty: {target}")
+        target.mkdir(parents=True, exist_ok=True)
+
+    if args.provider == "github":
+        run("gh", ["auth", "status"])
+        if not use_existing:
+            args.github_owner = args.github_owner or run("gh", ["api", "user", "--jq", ".login"]).strip()
+            identity = f"{args.github_owner}/{args.project_name}"
+            code, _ = probe("gh", ["repo", "view", identity, "--json", "nameWithOwner"])
+            if code == 0:
+                raise BootstrapError(f"GitHub repository already exists: {identity}")
+            if code != 1:
+                raise BootstrapError("Unable to check whether the GitHub repository already exists.")
+    else:
+        run("az", ["account", "show", "--output", "none"])
+        run("az", ["extension", "show", "--name", "azure-devops", "--output", "none"])
+        if not use_existing:
+            args.azure_organization = required(args.azure_organization, "Azure DevOps organization URL")
+            args.azure_project = required(args.azure_project, "Azure DevOps project")
+            identity = f"{args.azure_organization}|{args.azure_project}|{args.project_name}"
+            code, _ = probe("az", ["repos", "show", "--organization", args.azure_organization, "--project", args.azure_project, "--repository", args.project_name, "--output", "none"])
+            if code == 0:
+                raise BootstrapError(f"Azure DevOps repository already exists: {args.project_name}")
+
+    temporary = Path(tempfile.gettempdir()) / f"worktree-ralph-bootstrap-{uuid4().hex}"
+    source = temporary / "source"
+    succeeded = False
+    temporary.mkdir()
+    try:
+        run("git", ["clone", "--depth", "1", "--", args.source_repository, str(source)])
+        template = source / "template"
+        if not template.is_dir():
+            raise BootstrapError(f"Source repository has no template directory: {args.source_repository}")
+        copy_template(template, target, use_existing)
+        workflow_path = target / ".codex" / "workflow.json"
+        workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+        workflow.update(provider=args.provider, targetBranch=target_branch, maximumConcurrentBuilders=args.maximum_concurrent_builders, maximumConcurrentFixers=args.maximum_concurrent_fixers, worktreeRoot=str(Path(args.worktree_root).resolve()) if args.worktree_root else None)
+        if args.provider == "github":
+            workflow["github"]["repository"] = identity
+        else:
+            workflow["azureDevOps"].update(organization=args.azure_organization, project=args.azure_project, repository=args.project_name)
+        workflow_path.write_text(json.dumps(workflow, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+        if not use_existing:
+            run("git", ["init", "-b", target_branch], target)
+        if args.git_user_name:
+            run("git", ["config", "user.name", args.git_user_name.strip()], target)
+        if args.git_user_email:
+            run("git", ["config", "user.email", args.git_user_email.strip()], target)
+        if not run("git", ["config", "user.name"], target, (0, 1)).strip() or not run("git", ["config", "user.email"], target, (0, 1)).strip():
+            raise BootstrapError("Git user.name and user.email must be configured before bootstrap.")
+
+        scripts = list((target / ".codex" / "scripts").glob("*.py"))
+        if not scripts:
+            raise BootstrapError("Copied workflow has no Python scripts.")
+        compile_result = subprocess.run([sys.executable, "-m", "py_compile", *map(str, scripts)], capture_output=True, text=True, check=False)
+        if compile_result.returncode:
+            raise BootstrapError("Copied workflow scripts are invalid:\n" + compile_result.stderr)
+
+        run("git", ["add", "--force", "--", ".codex"], target)
+        run("git", ["add", "--", ".gitignore", ".gitattributes", "AGENTS.md", "requirements.md", "REQUIREMENTS-PROMPT.md"], target)
+        staged = [line for line in run("git", ["diff", "--cached", "--name-only"], target).splitlines() if line]
+        unexpected = [path for path in staged if not re.match(r"^(\.codex/|\.gitignore$|\.gitattributes$|AGENTS\.md$|requirements\.md$|REQUIREMENTS-PROMPT\.md$)", path)]
+        if unexpected:
+            raise BootstrapError("Bootstrap staged unexpected paths: " + ", ".join(unexpected))
+        if not staged or ".codex/workflow.json" not in staged:
+            raise BootstrapError("Bootstrap did not stage the required workflow payload.")
+        print("FILES TO COMMIT:\n  " + "\n  ".join(staged))
+        run("git", ["commit", "-m", "Install Worktree Ralph workflow" if use_existing else "Initialize Worktree Ralph project"], target)
+
+        if use_existing:
+            run("git", ["push", "origin", target_branch], target)
+        elif args.provider == "github":
+            run("gh", ["repo", "create", identity, f"--{args.visibility}", "--source", str(target), "--remote", "origin", "--push"], target)
+        else:
+            created = json.loads(run("az", ["repos", "create", "--organization", args.azure_organization, "--project", args.azure_project, "--name", args.project_name, "--output", "json"]))
+            if not created.get("remoteUrl"):
+                raise BootstrapError("Azure DevOps did not return a repository remote URL.")
+            run("git", ["remote", "add", "origin", created["remoteUrl"]], target)
+            run("git", ["push", "--set-upstream", "origin", target_branch], target)
+
+        run("git", ["fetch", "origin"], target)
+        local_sha = run("git", ["rev-parse", "HEAD"], target).strip()
+        if local_sha != run("git", ["rev-parse", f"origin/{target_branch}"], target).strip():
+            raise BootstrapError(f"Remote {target_branch} does not match the bootstrap commit.")
+        sys.path.insert(0, str(target / ".codex" / "scripts"))
+        from common import get_configuration, initialize_state_files, read_json
+
+        paths = initialize_state_files(target, get_configuration(target))
+        state = read_json(paths.state, paths.schemas / "state.schema.json")
+        if state["repository"] != identity:
+            raise BootstrapError("Initialized state does not match the remote repository.")
+        succeeded = True
+        print(f"\n{'WORKTREE RALPH INSTALLED' if use_existing else 'WORKTREE RALPH PROJECT CREATED'}\nPROJECT:      {target}\nREMOTE:       {identity}\nTARGET:       {target_branch}\nINITIAL SHA:  {local_sha}\nNEXT:         Complete requirements.md, then run python .codex/scripts/planning_loop.py.")
+    finally:
+        if succeeded:
+            expected_parent = Path(tempfile.gettempdir()).resolve()
+            resolved = temporary.resolve()
+            if resolved.parent != expected_parent or not re.fullmatch(r"worktree-ralph-bootstrap-[0-9a-f]{32}", resolved.name):
+                raise BootstrapError(f"Refusing to remove unexpected temporary directory: {resolved}")
+            shutil.rmtree(resolved)
+        else:
+            print(f"Bootstrap failed. The destination was preserved: {target}", file=sys.stderr)
+            print(f"Temporary source clone was preserved for diagnosis: {temporary}", file=sys.stderr)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description="Create or install a portable Worktree Ralph project.")
+    result.add_argument("--source-repository", default=SOURCE_REPOSITORY)
+    result.add_argument("--existing-repository-path")
+    result.add_argument("--project-name")
+    result.add_argument("--parent-directory")
+    result.add_argument("--provider", choices=("github", "azure_devops"))
+    result.add_argument("--visibility", choices=("private", "internal", "public"), default="private")
+    result.add_argument("--github-owner")
+    result.add_argument("--azure-organization")
+    result.add_argument("--azure-project")
+    result.add_argument("--maximum-concurrent-builders", type=int, choices=range(1, 33), default=3)
+    result.add_argument("--maximum-concurrent-fixers", type=int, choices=range(1, 33), default=3)
+    result.add_argument("--worktree-root")
+    result.add_argument("--git-user-name")
+    result.add_argument("--git-user-email")
+    return result
+
+
+if __name__ == "__main__":
+    bootstrap(parser().parse_args())
