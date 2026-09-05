@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import io
 import unittest
+from importlib.metadata import version
+from pathlib import Path
 from unittest.mock import patch
 
 from rich.console import Console
 
-from brace import bootstrap, cli, ui
+from brace import __version__, bootstrap, cli, ui
 from brace.common import BraceError
 
 
@@ -89,6 +91,19 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("\x1b", rendered)
         self.assertIn("1/2 integrated", rendered)
         self.assertIn("1/1 verified", rendered)
+
+    def test_runtime_version_uses_package_metadata(self) -> None:
+        self.assertEqual(__version__, version("brace"))
+
+    def test_release_workflow_versions_tests_tags_and_publishes(self) -> None:
+        workflow = (
+            Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml"
+        ).read_text(encoding="utf-8")
+        for required in (
+            "workflow_dispatch:", "uv version --bump", "uv run --locked", "uv build",
+            "git tag -a", "git push --atomic", "gh release create", "--verify-tag",
+        ):
+            self.assertIn(required, workflow)
 
     def test_bundled_template_is_complete_and_has_no_scripts(self) -> None:
         template = bootstrap.bundled_template()

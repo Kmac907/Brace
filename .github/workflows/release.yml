@@ -1,0 +1,71 @@
+name: Release Brace
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semantic version component to increment
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+concurrency:
+  group: brace-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.9"
+      - name: Install Python
+        run: uv python install 3.11
+      - name: Increment version
+        id: version
+        run: |
+          uv version --bump "${{ inputs.bump }}"
+          echo "version=$(uv version --short)" >> "$GITHUB_OUTPUT"
+      - name: Test
+        run: uv run --locked python -m unittest discover -s tests -v
+      - name: Build wheel and source distribution
+        run: uv build
+      - name: Verify distributions
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          test "$(uv run --isolated --no-project --with dist/*.whl brace --version)" = "brace ${VERSION}"
+          test "$(uv run --isolated --no-project --with dist/*.tar.gz brace --version)" = "brace ${VERSION}"
+      - name: Commit and tag version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+            echo "Tag v${VERSION} already exists." >&2
+            exit 1
+          fi
+          git add pyproject.toml uv.lock
+          git commit -m "Release v${VERSION}"
+          git tag -a "v${VERSION}" -m "Brace v${VERSION}"
+          git push --atomic origin HEAD:main "refs/tags/v${VERSION}"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release create "v${VERSION}" dist/* --verify-tag --generate-notes --title "Brace v${VERSION}"

@@ -236,6 +236,14 @@ uv build --no-sources
 
 Tests use temporary local Git repositories and mocked provider and agent boundaries. They do not create remote pull requests.
 
+## Releases
+
+Run **Release Brace** from GitHub Actions and choose `patch`, `minor`, or `major`. The release workflow uses `uv version` to update `pyproject.toml` and `uv.lock`, runs the full test and package checks, commits the version, creates an annotated `vX.Y.Z` tag, and publishes a GitHub Release containing the wheel and source distribution.
+
+Ordinary pushes to `main` continue to run the **Build Python package** workflow and retain its distributions as a workflow artifact.
+
+The installed package metadata is the single runtime version source used by `brace --version`.
+
 ## License
 
 Copyright © 2026 Kmac907. Brace is licensed under the [GNU General Public License version 3](LICENSE).
