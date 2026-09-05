@@ -1,127 +1,159 @@
-# Brace
+<p align="center">
+  <img src="assets/brace-banner.png" width="900" alt="Brace: isolated Git branches converging safely inside code braces">
+</p>
 
-Branch-Safe Repository Agent Coordination Engine. Controlled agent workflows, from plan to merge.
+<h1 align="center">Brace</h1>
 
-It has three scripts:
+<p align="center">
+  <strong>Branch-Safe Repository Agent Coordination Engine.</strong><br>
+  <em>Controlled agent workflows, from plan to merge.</em>
+</p>
 
-1. `planning_loop.py` turns `requirements.md` into `plan.md` and `.codex/tasks.json`.
-2. `build_loop.py` runs dependency-ready tasks in parallel Git worktrees and integrates each through a provider pull request.
-3. `audit_loop.py` performs one whole-project audit, fixes the resulting bug ledger in parallel worktrees, validates the result, and merges the project pull request.
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square" alt="Python 3.11 or newer">
+  <img src="https://img.shields.io/badge/agents-Codex-111827?style=flat-square" alt="Codex agents">
+  <img src="https://img.shields.io/badge/providers-GitHub%20%7C%20Azure%20DevOps-2563EB?style=flat-square" alt="GitHub and Azure DevOps">
+  <img src="https://img.shields.io/badge/license-all%20rights%20reserved-4B5563?style=flat-square" alt="All rights reserved">
+</p>
 
-The Python coordinator is deterministic. It owns state, scheduling, Git, pull requests, retries, reconciliation, and cleanup. Codex agents perform semantic planning, implementation, review, auditing, fixes, and project-management decisions.
+---
 
-## Requirements
+Brace turns a structured project description into coordinated agent work. It plans the project, runs independent tasks in isolated Git worktrees, integrates each result through a pull request, audits the completed implementation, fixes the frozen bug set, validates the final branch, and merges it.
 
-- Python 3.11 or newer
-- Git
-- Codex CLI
-- The `jsonschema` package
-- GitHub CLI (`gh`) for GitHub projects, or Azure CLI (`az`) with the Azure DevOps extension
-- Authenticated Git and provider CLI access
-- A configured Git `user.name` and `user.email`
+The coordinator is deterministic: agents propose and implement; Brace owns state, scheduling, Git, pull requests, retries, reconciliation, and cleanup.
 
-Install the Python dependency:
+## Why Brace
+
+- **Branch-safe parallelism** — every task, bug, and approved amendment gets its own worktree and branch.
+- **Provider-backed integration** — changes reach the integration branch through verified GitHub or Azure DevOps pull requests.
+- **Durable recovery** — exact commits, pull requests, hashes, assignments, and results are persisted for restart.
+- **Bounded autonomy** — operational failures retry within limits; semantic scope decisions return to the user.
+
+## How it works
 
 ```text
-python -m pip install -r requirements.txt
+requirements.md
+      │
+      ▼
+ planning ───────► plan.md + tasks.json
+      │
+      ▼
+   build ────────► TASK worktrees ─► task PRs ─► brace/integration
+      │
+      ▼
+   audit ────────► bugs.json ──────► BUG worktrees ─► bug PRs
+      │
+      ▼
+final validation ─► project PR ─► main ─► cleanup
 ```
 
-A generated project carries the same dependency declaration at `.codex/requirements.txt`.
+| Stage | Agents | Durable output | Completion condition |
+| --- | --- | --- | --- |
+| Planning | Planner | `plan.md`, `tasks.json`, planning summary | Every active requirement has a valid task |
+| Build | Builders and verifier | Task commits, PR identities, build summary | Every active task is verified and integrated |
+| Audit | Auditor, bug fixers, and verifier | `bugs.json`, fix commits, audit summary | Every finding is resolved and final validation passes |
+
+Agents never communicate directly. Brace gives each agent one immutable assignment and carries its schema-validated result to the next role.
 
 ## Quick start
 
-### Bootstrap a project
+### Requirements
 
-Download and review the bootstrapper, then run it:
+- Python 3.11 or newer
+- Git
+- Authenticated [Codex CLI](https://github.com/openai/codex)
+- `jsonschema`
+- Authenticated GitHub CLI (`gh`), or Azure CLI (`az`) with the Azure DevOps extension
+- Configured Git `user.name` and `user.email`
 
-```text
-curl -fsSLO https://raw.githubusercontent.com/Kmac907/brace/main/new_brace_project.py
+Install the Python dependency:
+
+```bash
+python -m pip install "jsonschema>=4.18,<5"
+```
+
+### 1. Add Brace to a project
+
+Download and review the bootstrapper:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/Kmac907/Brace/main/new_brace_project.py
 python new_brace_project.py
 ```
 
-The bootstrapper asks whether the project already exists.
+It asks whether the project is new or already exists. For unattended setup:
 
-For an existing repository:
-
-```text
+```bash
+# Existing repository
 python new_brace_project.py --existing-repository-path /path/to/repository
+
+# New GitHub repository
+python new_brace_project.py \
+  --project-name example \
+  --parent-directory /projects \
+  --provider github
 ```
 
-The existing repository must be clean, checked out on its remote default branch, exactly synchronized with `origin`, and must not already contain `.codex`. Existing project documentation is preserved.
+An existing repository must be clean, checked out on its remote default branch, exactly synchronized with `origin`, and must not already contain `.codex`. Existing project documentation is preserved.
 
-For a new repository, supply values interactively or with arguments:
+The bootstrapper runs with your account permissions and can create repositories and push commits. Pin the download URL to a reviewed tag or commit when reproducibility matters.
 
-```text
-python new_brace_project.py --project-name example --parent-directory /projects --provider github
-```
+### 2. Write the requirements
 
-The bootstrapper copies the workflow, configures `.codex/workflow.json`, commits it, creates or updates the remote repository, verifies the remote SHA, and initializes local workflow state.
+Use `REQUIREMENTS-PROMPT.md` to turn the project idea into the generated `requirements.md` template. Review the result before planning.
 
-The downloaded script runs with your account's permissions and can create repositories and push commits. Pin its URL to a reviewed tag or commit when reproducibility matters.
+### 3. Plan
 
-### Write requirements
-
-Use `REQUIREMENTS-PROMPT.md` to turn the project idea into the structured `requirements.md` template. Review the result before planning.
-
-### Plan
-
-```text
+```bash
 python .codex/scripts/planning_loop.py
 ```
 
-Planning reads the repository and `requirements.md`. When essential information is missing, it asks in the same terminal, appends the answers, and retries. It then normalizes requirements, writes `plan.md`, validates the dependency graph and requirement coverage, commits and pushes the contract, and writes the task ledger and planning summary.
+Planning reads the repository and `requirements.md`. If essential information is missing, it asks in the same terminal, incorporates the answers, and retries. It then writes and validates `plan.md`, the dependency graph, requirement coverage, and `.codex/tasks.json`.
 
-Planning stops before implementation. Review:
+Planning stops before implementation so you can review `plan.md`, `.codex/tasks.json`, and `.codex/planning-summary.json`.
 
-- `plan.md`
-- `.codex/tasks.json`
-- `.codex/planning-summary.json`
+### 4. Build
 
-### Build
-
-```text
+```bash
 python .codex/scripts/build_loop.py
 ```
 
-The build loop resumes from persisted state, reconciles existing branches, worktrees, commits, and pull requests, then runs dependency-ready non-conflicting tasks up to `maximumConcurrentBuilders`. Each task receives its own worktree and `worktree/TASK-NNNN` branch. A verifier checks the focused result before the coordinator creates and merges its pull request into `brace/integration`.
+The build loop reconciles persisted work, selects dependency-ready non-conflicting tasks, and runs up to `maximumConcurrentBuilders` agents. Each verified task is integrated into `brace/integration` through a provider pull request. No command is required per task.
 
-The build stage ends after all active tasks are integrated and lightweight integration verification passes. It writes `.codex/build-summary.json`.
+### 5. Audit and finish
 
-### Audit and finish
-
-```text
+```bash
 python .codex/scripts/audit_loop.py
 ```
 
-The audit loop performs one fresh audit of the exact integration commit and freezes its findings in `.codex/bugs.json`. Dependency-ready non-conflicting fixes run up to `maximumConcurrentFixers`, each in its own `worktree/BUG-NNNN` branch and pull request. After every bug is verified, final validation runs against the exact integration SHA. The coordinator then merges the project pull request into the target branch and removes owned worktrees and branches.
+The audit loop reviews the exact integration commit once, freezes its findings in `.codex/bugs.json`, and runs up to `maximumConcurrentFixers` independent fixes. After all findings are verified, Brace validates the final integration branch, merges the project pull request, and removes owned worktrees and branches.
 
-It writes `.codex/audit-summary.json` and leaves the flat `.codex` ledgers as the completed record.
+## Git model
 
-## Ownership
+```text
+main
+└── brace/integration
+    ├── worktree/TASK-0001
+    ├── worktree/TASK-0002
+    ├── worktree/BUG-0001
+    └── worktree/AMEND-0001
+```
 
-| Component | Responsibility |
-| --- | --- |
-| Python coordinator | Sole writer of live state and ledgers; schedules work; validates outputs; manages Git, pull requests, recovery, and cleanup |
-| Planning agent | Proposes normalized requirements, the implementation plan, and the initial task graph |
-| Project-manager agent | Analyzes semantic blockers and proposes user-approved contract amendments and follow-up tasks |
-| Builder agents | Implement one assigned task in one isolated worktree and commit |
-| Verifier | Checks a focused task, bug fix, amendment, build integration, or final result |
-| Auditor | Produces one complete bounded whole-project bug set without editing |
-| Bug-fixer agents | Fix or disprove one assigned bug in one isolated worktree |
-| User | Decides changes to requirements, scope, policy, or project direction |
+Worktrees live outside the project by default:
 
-Agents do not communicate directly. The coordinator provides immutable assignments and carries structured results between roles. Agents never edit live `.codex/state.json`, `.codex/tasks.json`, or `.codex/bugs.json`, and never perform provider operations.
+```text
+<system-temp>/brace/<repository-id>/
+├── TASK-0001/
+├── BUG-0001/
+└── AMEND-0001/
+```
 
-## Files in a generated project
+Before publishing or accepting work, Brace verifies the repository, branch, base commit, result commit, changed paths, provider repository, pull-request head and base, and merge result.
+
+## State and recovery
 
 ```text
 .codex/
-├── AGENTS.md
-├── workflow.json
-├── requirements.txt
-├── prompts/
-├── schemas/
-├── scripts/
 ├── state.json
 ├── tasks.json
 ├── bugs.json
@@ -133,98 +165,77 @@ Agents do not communicate directly. The coordinator provides immutable assignmen
 └── logs/
 ```
 
-Mutable state, summaries, attempt records, logs, and the lock are ignored by Git. Prompts, schemas, scripts, configuration, and dependency declarations are tracked.
+Only the coordinator writes live state and ledgers. State uses atomic replacement; assignment and result records are immutable. Rerun the same stage after a recoverable interruption. Brace reconciles recorded worktrees, branches, commits, and pull requests before retrying.
 
-External worktrees use:
+Before each critical transition, Brace also checks:
 
-```text
-<worktree-root>/<repository-id>/
-├── TASK-0001/
-├── BUG-0001/
-└── AMEND-0001/
-```
+- repository and provider identity;
+- workflow configuration and target-branch baseline;
+- requirements, plan, task, and bug hashes;
+- integration history against accepted pull-request merge commits;
+- exact assignment and result identities.
 
-Owned branches use `brace/integration`, `worktree/TASK-NNNN`, `worktree/BUG-NNNN`, and `worktree/AMEND-NNNN`.
+Unknown drift stops the workflow instead of being adopted silently.
 
-## Drift detection and recovery
+## Semantic decisions
 
-Before waves, verification, publication, audit, and final merge, the coordinator verifies:
+Authentication, provider outages, timeouts, dirty worktrees, and malformed results are operational failures. Brace retries them within configured limits or stops with a concrete diagnostic.
 
-- repository path, provider identity, remote URL, target branch, and workflow configuration;
-- exact requirements, plan, task-definition, and bug-definition hashes;
-- target-branch baseline;
-- integration history against verified task, bug, or amendment merge SHAs;
-- exact worktree branch, base, HEAD, cleanliness, and result identity;
-- exact pull-request repository, ID, head SHA, base SHA, and merge SHA.
+Missing requirements, contract conflicts, scope gaps, task decomposition, and bug disposition are semantic decisions. Brace pauses new scheduling, asks the project-manager agent for evidence-backed options, presents the recommendation to the user interactively, and proceeds only from the selected response.
 
-State and ledgers use atomic replacement. Each attempt has immutable assignment and result files. Restart the same script after a recoverable interruption; it reconciles durable work before retrying.
-
-A completed workflow can be replaced only with:
-
-```text
-python .codex/scripts/planning_loop.py --start-new-workflow
-```
-
-The previous workflow must be complete and owned worktrees and branches must already be cleanly resolved.
-
-## Semantic blockers
-
-Operational failures such as authentication, timeouts, dirty worktrees, malformed results, or provider outages use bounded retries or stop with a concrete diagnostic.
-
-A semantic blocker can invoke the project-manager agent. The coordinator:
-
-1. stops scheduling new work and preserves completed agent results;
-2. asks the user an interactive question with a recommendation and effects;
-3. creates an isolated amendment worktree after approval;
-4. limits edits to approved Markdown contract files;
-5. verifies one focused commit and its exact decision identity;
-6. integrates it through a provider pull request;
-7. appends validated follow-up tasks or records an approved bug disposition;
-8. resumes build or audit automatically.
-
-If an audit amendment expands implementation scope, the workflow returns to build and requires a fresh whole-project audit afterward. Amendment rounds are bounded by `maximumAmendmentRounds`.
+An approved contract amendment receives its own `worktree/AMEND-NNNN` branch and provider pull request. Integrated tasks stay immutable; new scope becomes new follow-up tasks. Scope added during audit returns the workflow to build and requires a fresh audit.
 
 ## Configuration
 
-Edit `.codex/workflow.json` before planning begins.
+Edit `.codex/workflow.json` before planning begins. Brace freezes it when workflow state is created.
 
-- `provider`: `github` or `azure_devops`
-- `remote`: Git remote name
-- `targetBranch`: final merge target
-- `integrationBranch`: coordinator integration branch
-- `maximumConcurrentBuilders`: parallel task agents
-- `maximumConcurrentFixers`: parallel bug-fix agents
-- `maximumTaskAttempts`: attempts per task
-- `maximumBugAttempts`: attempts per bug
-- `maximumPlanningQuestionRounds`: interactive planning rounds
-- `maximumAmendmentRounds`: semantic amendment limit
-- `agentTimeoutMinutes`: Codex deadline
-- `agentCleanupGraceSeconds`: process-tree cleanup grace
-- `worktreeRoot`: optional external worktree root
-- `deleteMergedBranches`: delete verified merged branches
-- provider repository fields under `github` or `azureDevOps`
+| Setting | Purpose |
+| --- | --- |
+| `provider` | `github` or `azure_devops` |
+| `targetBranch` | Final project pull-request target |
+| `integrationBranch` | Coordinator-owned integration branch |
+| `maximumConcurrentBuilders` | Parallel task limit |
+| `maximumConcurrentFixers` | Parallel bug-fix limit |
+| `maximumTaskAttempts` | Retry limit per task |
+| `maximumBugAttempts` | Retry limit per bug |
+| `maximumPlanningQuestionRounds` | Interactive planning limit |
+| `maximumAmendmentRounds` | Semantic amendment limit |
+| `agentTimeoutMinutes` | Deadline for one Codex role |
+| `agentCleanupGraceSeconds` | Process-tree cleanup grace |
+| `worktreeRoot` | Optional external worktree root |
+| `deleteMergedBranches` | Delete verified merged branches |
 
-Configuration is frozen into workflow state. Changing it after workflow creation is treated as drift.
+Changing frozen configuration is treated as drift.
+
+## Start another workflow
+
+After a workflow reaches completion, update and commit `requirements.md`, then run:
+
+```bash
+python .codex/scripts/planning_loop.py --start-new-workflow
+```
+
+Brace replaces completed ledgers only after verifying the previous final merge and cleanup.
 
 ## Troubleshooting
 
-- **Missing Python package**: run `python -m pip install -r .codex/requirements.txt`.
-- **Authentication failure**: repair `gh`, `az`, Git, or Codex authentication, then rerun the same stage.
-- **Dirty repository or worktree**: preserve or commit the reported files; the coordinator will not discard them.
-- **Unknown integration commit**: reconcile the exact unowned commit or pull request before resuming.
-- **Stale pull request**: close or reconcile the PR whose head/base identity differs from the persisted assignment.
-- **Semantic question**: answer in the active terminal. No JSON inbox is required.
-- **Attempts exhausted**: inspect the persisted result and blocker; the workflow does not fabricate completion.
+- **Missing dependency** — run `python -m pip install -r .codex/requirements.txt`.
+- **Authentication failure** — repair the Codex, Git, `gh`, or `az` session and rerun the same stage.
+- **Dirty worktree** — preserve or commit the reported files; Brace never discards them.
+- **Unknown integration commit** — reconcile the unowned commit or pull request before resuming.
+- **Stale pull request** — close or correct the PR whose head or base differs from the persisted assignment.
+- **Attempts exhausted** — inspect the persisted result and blocker; Brace does not fabricate completion.
 
-## Development and tests
+## Development
 
-```text
+```bash
 python -m pip install -r requirements.txt
+python -m compileall -q new_brace_project.py template/.codex/scripts tests
 python -m unittest discover -s tests -v
 ```
 
-The tests use temporary local Git repositories and mocked provider/agent boundaries. They do not create remote pull requests.
+Tests use temporary local Git repositories and mocked provider and agent boundaries. They do not create remote pull requests.
 
 ## License
 
-See [LICENSE](LICENSE).
+Copyright © 2026 Kmac907. All rights reserved. See [LICENSE](LICENSE).
