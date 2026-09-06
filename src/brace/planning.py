@@ -78,6 +78,7 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
             state.update(stage="planning", stageStatus="running", blocker=None)
             save_state(state, paths)
             completed = None
+            validation_error = None
             for round_number in range(1, config["maximumPlanningQuestionRounds"] + 1):
                 context = (
                     f"Repository root: {root}\nQuestion round: {round_number} of {config['maximumPlanningQuestionRounds']}\n\n"
@@ -85,6 +86,8 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
                     "treat them as authoritative. If the requirements are sufficient, return the normalized requirements, "
                     "complete plan, and complete task graph now."
                 )
+                if validation_error:
+                    context += f"\n\nThe previous completed result was rejected by coordinator validation: {validation_error}\nReturn a corrected complete result."
                 with status(f"Planning project (round {round_number})"):
                     result = invoke_role(root, root, "planner", context, "planning-result.schema.json", "read-only")
                 if result["status"] == "questions":
@@ -105,12 +108,19 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
                     raise BraceError("Planner completed without plan.md content.")
                 if not result["tasks"]:
                     raise BraceError("Planner completed without implementation tasks.")
-                assert_graph(result["tasks"], "task")
-                assert_task_coverage(result["tasks"], result["normalizedRequirementsMarkdown"], result["summary"]["deferredRequirementIds"])
+                try:
+                    assert_graph(result["tasks"], "task")
+                    assert_task_coverage(result["tasks"], result["normalizedRequirementsMarkdown"], result["summary"]["deferredRequirementIds"])
+                except BraceError as error:
+                    validation_error = str(error)
+                    continue
                 completed = result
                 break
             if completed is None:
-                raise BraceError(f"Planning did not complete within {config['maximumPlanningQuestionRounds']} clarification rounds.")
+                message = f"Planning did not complete within {config['maximumPlanningQuestionRounds']} rounds."
+                if validation_error:
+                    message += f" Last validation error: {validation_error}"
+                raise BraceError(message)
 
             write_text_atomic(requirements_path, completed["normalizedRequirementsMarkdown"].rstrip())
             write_text_atomic(root / "plan.md", completed["planMarkdown"].rstrip())

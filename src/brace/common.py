@@ -36,6 +36,13 @@ The role's required JSON output schema overrides Ponytail's response-format guid
 Do not use it for work that is only prose, status reporting, or a semantic user decision.
 """
 
+COORDINATOR_IDENTITY_GUIDANCE = """# Coordinator identity guidance
+
+For a complete planner result, number tasks exactly `TASK-0001`, `TASK-0002`, ... in returned-array order; use those exact four-digit IDs in every task dependency and throughout `planMarkdown`.
+For an auditor result, number bugs exactly `BUG-0001`, `BUG-0002`, ... in returned-array order; use those exact four-digit IDs in every bug dependency.
+For a project-manager amendment result, number appended tasks consecutively after the highest existing task ID supplied in the assignment; use those exact four-digit IDs in every dependency and throughout any updated plan Markdown.
+"""
+
 
 class BraceError(RuntimeError):
     pass
@@ -1057,7 +1064,7 @@ def invoke_codex(prompt: str, cwd: str | Path, schema_path: str | Path, sandbox:
 
 def invoke_role(root: str | Path, cwd: str | Path, role: str, context: str, schema_name: str, sandbox: str) -> dict[str, Any]:
     paths, config = Paths(root), get_configuration(root)
-    prompt = f"{read_text(paths.codex / 'AGENTS.md')}\n\n{PONYTAIL_GUIDANCE}\n{read_text(paths.prompts / f'{role}.md')}\n\n# Assignment context\n\n{context}"
+    prompt = f"{read_text(paths.codex / 'AGENTS.md')}\n\n{PONYTAIL_GUIDANCE}\n{COORDINATOR_IDENTITY_GUIDANCE}\n{read_text(paths.prompts / f'{role}.md')}\n\n# Assignment context\n\n{context}"
     return invoke_codex(prompt, cwd, paths.schemas / schema_name, sandbox, paths.logs, role, int(config["agentTimeoutMinutes"]), int(config["agentCleanupGraceSeconds"]))
 
 
