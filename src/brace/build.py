@@ -28,6 +28,7 @@ from .common import (
     read_attempt_result,
     read_json,
     recover_committed_attempt,
+    reset_rejected_assignment,
     remove_audit_worktree,
     remove_merged_assignment,
     remove_worktree,
@@ -195,13 +196,17 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                                 save_ledger(tasks, paths)
                                 amendment_handled = True
                                 break
-                            task.update(status="pending", resultSha=None, lastError="Focused verification failed: " + "; ".join(verification["findings"]))
+                            message = "Focused verification failed: " + "; ".join(verification["findings"])
+                            reset_rejected_assignment(root, config, task, "task")
+                            task.update(status="pending", resultSha=None, lastError=message)
                             continue
                         task.update(status="verified_ready", lastError=None)
                         save_ledger(tasks, paths)
                     except Exception as error:
                         if state.get("activeAmendment"):
                             raise
+                        if task.get("resultSha"):
+                            reset_rejected_assignment(root, config, task, "task")
                         task.update(status="pending", resultSha=None, lastError=str(error))
                         warning(f"{task['taskId']} attempt {task['attemptCount']} failed verification: {error}")
                 if amendment_handled:
@@ -246,7 +251,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     task["baseSha"] = task.get("baseSha") or base_sha
                     task["worktree"] = str(new_worktree(root, config, task["taskId"], task["branch"], task["baseSha"], task.get("resultSha")))
                     task["attemptCount"] += 1
-                    task.update(status="active", lastError=None)
+                    task["status"] = "active"
                     write_immutable_json(attempt_path(paths, "assignment", task["taskId"], task["attemptCount"]), {
                         "schemaVersion": "1.0", "identity": task["taskId"], "attempt": task["attemptCount"],
                         "baseSha": task["baseSha"], "startingHead": run_native("git", ["-C", task["worktree"], "rev-parse", "HEAD"]).output.strip(),

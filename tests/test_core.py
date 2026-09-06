@@ -81,6 +81,13 @@ class CoreTests(RepositoryTestCase):
         })
         common.write_json_atomic(paths.state.with_name("referenced.json"), state, paths.schemas / "state.schema.json")
 
+    def test_verifier_rejection_allows_findings_without_blocker(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        common.write_json_atomic(paths.logs / "rejected.json", {
+            "approved": False, "summary": "changes required", "findings": ["fix it"], "checks": [], "blocker": None,
+        }, paths.schemas / "verifier-result.schema.json")
+
     def test_worktree_commit_scope_and_amendment_identity(self) -> None:
         root, _, config = self.make_repository()
         base = self.git(root, "rev-parse", "HEAD")
@@ -92,6 +99,10 @@ class CoreTests(RepositoryTestCase):
         self.git(path, "commit", "-m", "task")
         result = common.assert_assignment_commit(path, base, task)
         self.assertRegex(result["Head"], r"^[0-9a-f]{40,64}$")
+        task.update(branch="worktree/TASK-0001", baseSha=base, resultSha=result["Head"])
+        common.reset_rejected_assignment(root, config, task, "task")
+        common.reset_rejected_assignment(root, config, task, "task")
+        self.assertEqual(self.git(path, "rev-parse", "HEAD"), base)
         common.remove_worktree(root, config, "TASK-0001", "worktree/TASK-0001")
         amendment = common.new_worktree(root, config, "AMEND-0001", "worktree/AMEND-0001", base)
         self.assertEqual(self.git(amendment, "branch", "--show-current"), "worktree/AMEND-0001")
