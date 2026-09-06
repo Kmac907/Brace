@@ -11,7 +11,6 @@ import signal
 import subprocess
 import tempfile
 import uuid
-from collections import Counter
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,10 +42,6 @@ class BraceError(RuntimeError):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def compact_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def pretty_json(value: Any) -> str:
@@ -462,7 +457,7 @@ def assert_state_identity(state: dict[str, Any], root: str | Path, config: dict[
 
 
 def object_hash(value: Any) -> str:
-    return "sha256:" + hashlib.sha256(compact_json(value).encode("utf-8")).hexdigest()
+    return "sha256:" + hashlib.sha256(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def definition_hash(items: list[dict[str, Any]], kind: str) -> str:
@@ -683,7 +678,7 @@ def remove_empty_worktree_containers(root: str | Path, config: dict[str, Any]) -
 
 
 def new_worktree(root: str | Path, config: dict[str, Any], identity: str, branch: str, base_reference: str, expected_head: str | None = None) -> Path:
-    if not re.fullmatch(r"(?:TASK|BUG)-\d{4}", identity):
+    if not re.fullmatch(r"(?:TASK|BUG|AMEND)-\d{4}", identity):
         raise BraceError(f"Invalid worktree identity: {identity}")
     if branch != f"worktree/{identity}":
         raise BraceError(f"Unexpected branch for {identity}: {branch}")
@@ -978,7 +973,3 @@ def run_assignment(root: str | Path, worktree: str | Path, item: dict[str, Any],
         record = {"schemaVersion": "1.0", "identity": identity, "attempt": int(item["attemptCount"]), "succeeded": False, "result": None, "error": str(exc), "completedAt": utc_now()}
     write_immutable_json(attempt_path(paths, "result", identity, int(item["attemptCount"])), record)
     return record
-
-
-def counts_by(values: Iterable[str], name: str) -> list[dict[str, Any]]:
-    return [{name: key, "count": value} for key, value in Counter(values).items()]

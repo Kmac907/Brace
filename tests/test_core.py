@@ -80,7 +80,7 @@ class CoreTests(RepositoryTestCase):
         })
         common.write_json_atomic(paths.state.with_name("referenced.json"), state, paths.schemas / "state.schema.json")
 
-    def test_worktree_commit_scope(self) -> None:
+    def test_worktree_commit_scope_and_amendment_identity(self) -> None:
         root, _, config = self.make_repository()
         base = self.git(root, "rev-parse", "HEAD")
         task = self.task(paths=["src/**"])
@@ -92,6 +92,9 @@ class CoreTests(RepositoryTestCase):
         result = common.assert_assignment_commit(path, base, task)
         self.assertRegex(result["Head"], r"^[0-9a-f]{40,64}$")
         common.remove_worktree(root, config, "TASK-0001", "worktree/TASK-0001")
+        amendment = common.new_worktree(root, config, "AMEND-0001", "worktree/AMEND-0001", base)
+        self.assertEqual(self.git(amendment, "branch", "--show-current"), "worktree/AMEND-0001")
+        common.remove_worktree(root, config, "AMEND-0001", "worktree/AMEND-0001")
 
     def test_unknown_integration_commit_is_rejected(self) -> None:
         root, remote, config = self.make_repository()
