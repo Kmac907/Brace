@@ -162,12 +162,25 @@ class CoreTests(RepositoryTestCase):
     def test_pm_follow_up_recovery_is_idempotent_for_canonical_result(self) -> None:
         self.assert_pm_follow_up_recovery("TASK-0003")
 
-    def test_pm_plan_references_use_canonical_mapping_on_fresh_and_replay(self) -> None:
+    def pm_result_ready_fixture(self, plan: str) -> tuple:
         root, _, config = self.make_repository()
         paths = common.initialize_state_files(root, config)
+        base = self.git(root, "rev-parse", "HEAD")
         identity = "AMEND-0001"
+        worktree = common.new_worktree(root, config, identity, f"worktree/{identity}", base)
+        (worktree / "plan.md").write_text(plan, encoding="utf-8")
+        self.git(worktree, "add", "plan.md")
+        self.git(worktree, "commit", "-m", "amend plan")
+        result_sha = self.git(worktree, "rev-parse", "HEAD")
+
+        initial = [self.task(), self.task("TASK-0002")]
+        plan_hash = common.git_blob_identity(root, base, "plan.md")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        tasks.update(revision=1, planHash=plan_hash, definitionHash=common.definition_hash(initial, "task"), status="active", tasks=initial)
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+
         analysis_path = paths.results / f"{identity}-analysis.json"
-        common.write_immutable_json(analysis_path, {
+        analysis = {
             "summary": "append follow-up", "recommendation": "amend", "question": "Proceed?", "amendmentRequired": True,
             "effects": {name: "updated" for name in ("requirements", "plan", "tasks", "bugs", "completedWork", "schedule")},
             "options": [{
@@ -176,54 +189,79 @@ class CoreTests(RepositoryTestCase):
                 "authorizedDocumentationPaths": [], "bugDispositions": [],
             }],
             "affectedTaskIds": ["TASK-0001"], "affectedBugIds": [],
-        })
-        amendment = {
-            "amendmentId": identity, "status": "result_ready", "analysisResultPath": str(analysis_path),
-            "selectedOptionId": "OPTION-0001", "decisionIdentity": "decision", "worktree": str(root),
-            "baseSha": "a" * 40, "authorizedDocumentationPaths": ["plan.md"], "resultSha": None,
         }
-        state = {"activeAmendment": amendment}
-        tasks = {"tasks": [self.task(), self.task("TASK-0002")]}
+        common.write_immutable_json(analysis_path, analysis)
+        decision = project_manager.decision_identity(identity, "OPTION-0001", "OPTION-0001", analysis["question"])
+        blocker = dict(project_manager.structured_blocker("scope changed", "build", "TASK-0001"), kind="scope_gap", requiresUserDecision=True, scopeChangePossible=True)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        state.update(
+            stage="build", stageStatus="amending", targetBaseSha=base, integrationSha=base, planHash=plan_hash,
+            requirementsHash=common.git_blob_identity(root, base, "requirements.md"), taskDefinitionHash=tasks["definitionHash"],
+            amendmentSequence=1, activeAmendment={
+                "amendmentId": identity, "sourceStage": "build", "sourceKind": "task", "sourceIdentity": "TASK-0001",
+                "status": "result_ready", "blocker": blocker, "analysisResultPath": str(analysis_path),
+                "selectedOptionId": "OPTION-0001", "userResponse": "OPTION-0001", "decisionIdentity": decision,
+                "authorizedDocumentationPaths": ["requirements.md", "plan.md"], "branch": f"worktree/{identity}",
+                "worktree": str(worktree), "baseSha": base, "resultSha": None, "pullRequest": None,
+                "affectedTaskIds": ["TASK-0001"], "affectedBugIds": [], "resumeStage": "build", "attemptCount": 1,
+            },
+        )
+        common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
         definition = {
             key: value for key, value in self.task("TASK-0018", ["TASK-0002"]).items()
             if key in {"taskId", "title", "description", "requirementIds", "planSections", "dependencies", "allowedPaths", "exclusiveResources", "acceptanceCriteria", "checks"}
         }
         result_path = common.attempt_path(paths, "result", identity, 1)
         common.write_immutable_json(result_path, {
+            "schemaVersion": "1.0", "identity": identity, "attempt": 1, "succeeded": True,
             "result": {
-                "summary": "amended", "decisionIdentity": "decision", "selectedOptionId": "OPTION-0001",
-                "commitSha": "b" * 40, "changedFiles": ["plan.md"], "newTasks": [definition],
-                "supersededTaskIds": [],
-            },
+                "status": "completed", "summary": "amended", "decisionIdentity": decision,
+                "selectedOptionId": "OPTION-0001", "commitSha": result_sha, "changedFiles": ["plan.md"],
+                "newTasks": [definition], "supersededTaskIds": [], "resumeStage": "build", "blocker": None,
+            }, "error": None, "completedAt": common.utc_now(),
         })
-        committed_plan = ["# Plan\n\nImplement TASK-0018. Preserve X-TASK-0018-extra."]
+        return root, config, paths, state, tasks, blocker, worktree, base, result_sha, result_path
 
-        def git_text(_root: str, _reference: str, path: str) -> str:
-            return committed_plan[0] if path == "plan.md" else "REQ-ONE"
+    def test_pm_plan_normalization_is_durable_and_replay_safe(self) -> None:
+        raw_plan = "# Plan\n\nImplement TASK-0018, then TASK-003. Preserve X-TASK-0018-extra.\n"
+        root, config, paths, state, tasks, blocker, worktree, base, result_sha, result_path = self.pm_result_ready_fixture(raw_plan)
 
-        with (
-            patch.object(project_manager, "assert_pm_analysis"),
-            patch.object(project_manager, "assert_amendment_commit", return_value={"Head": "b" * 40, "ChangedFiles": ["plan.md"]}),
-            patch.object(project_manager, "assert_pm_result_identity"),
-            patch.object(project_manager, "read_git_text", side_effect=git_text),
-            patch.object(project_manager, "normalize_task_references", wraps=common.normalize_task_references) as normalize,
-            patch.object(project_manager, "invoke_role", side_effect=RuntimeError("verifier reached")) as verifier,
-        ):
-            for _ in range(2):
+        with patch.object(project_manager, "save_state", side_effect=RuntimeError("interrupted after normalization")):
+            with self.assertRaisesRegex(RuntimeError, "interrupted after normalization"):
+                project_manager.invoke_pm_resolution(root, config, state, paths, tasks, None, "build", "task", "TASK-0001", blocker)
+
+        normalized_sha = self.git(worktree, "rev-parse", "HEAD")
+        self.assertNotEqual(normalized_sha, result_sha)
+        self.assertEqual(self.git(worktree, "rev-list", "--count", f"{base}..{normalized_sha}"), "2")
+        self.assertEqual(self.git(worktree, "show", f"{result_sha}:plan.md"), raw_plan.strip())
+        self.assertEqual(
+            self.git(worktree, "show", f"{normalized_sha}:plan.md"),
+            "# Plan\n\nImplement TASK-0003, then TASK-0003. Preserve X-TASK-0018-extra.",
+        )
+        self.assertIsNone(common.read_json(paths.state, paths.schemas / "state.schema.json")["activeAmendment"]["resultSha"])
+
+        for _ in range(2):
+            recovered_state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+            recovered_tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+            with patch.object(project_manager, "invoke_role", side_effect=RuntimeError("verifier reached")):
                 with self.assertRaisesRegex(RuntimeError, "verifier reached"):
                     project_manager.invoke_pm_resolution(
-                        root, config, state, paths, tasks, None, "build", "task", "TASK-0001", None,
+                        root, config, recovered_state, paths, recovered_tasks, None, "build", "task", "TASK-0001", blocker,
                     )
-            self.assertEqual(normalize.call_args.args[1], {"TASK-0018": "TASK-0003"})
-            self.assertEqual(verifier.call_count, 2)
+            self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), normalized_sha)
+            self.assertEqual(common.read_json(paths.state, paths.schemas / "state.schema.json")["activeAmendment"]["resultSha"], normalized_sha)
 
-            committed_plan[0] = "# Plan\n\nImplement TASK-9999."
-            with self.assertRaisesRegex(common.BraceError, "Plan references unknown tasks: TASK-9999"):
-                project_manager.invoke_pm_resolution(
-                    root, config, state, paths, tasks, None, "build", "task", "TASK-0001", None,
-                )
-            self.assertEqual(verifier.call_count, 2)
+        self.assertEqual(common.read_json(result_path)["result"]["newTasks"][0]["taskId"], "TASK-0018")
 
+    def test_pm_plan_normalization_rejects_unknown_references_before_commit(self) -> None:
+        root, config, paths, state, tasks, blocker, worktree, base, result_sha, result_path = self.pm_result_ready_fixture(
+            "# Plan\n\nImplement TASK-9999.\n"
+        )
+        with self.assertRaisesRegex(common.BraceError, "Plan references unknown tasks: TASK-9999"):
+            project_manager.invoke_pm_resolution(root, config, state, paths, tasks, None, "build", "task", "TASK-0001", blocker)
+        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), result_sha)
+        self.assertEqual(self.git(worktree, "rev-list", "--count", f"{base}..{result_sha}"), "1")
+        self.assertIsNone(common.read_json(paths.state, paths.schemas / "state.schema.json")["activeAmendment"]["resultSha"])
         self.assertEqual(common.read_json(result_path)["result"]["newTasks"][0]["taskId"], "TASK-0018")
 
     def test_conflict_scheduling(self) -> None:
