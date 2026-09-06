@@ -162,6 +162,70 @@ class CoreTests(RepositoryTestCase):
     def test_pm_follow_up_recovery_is_idempotent_for_canonical_result(self) -> None:
         self.assert_pm_follow_up_recovery("TASK-0003")
 
+    def test_pm_plan_references_use_canonical_mapping_on_fresh_and_replay(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        identity = "AMEND-0001"
+        analysis_path = paths.results / f"{identity}-analysis.json"
+        common.write_immutable_json(analysis_path, {
+            "summary": "append follow-up", "recommendation": "amend", "question": "Proceed?", "amendmentRequired": True,
+            "effects": {name: "updated" for name in ("requirements", "plan", "tasks", "bugs", "completedWork", "schedule")},
+            "options": [{
+                "optionId": "OPTION-0001", "label": "Amend", "description": "Append work", "recommended": True,
+                "action": "amend", "requiresInput": False, "inputPrompt": None,
+                "authorizedDocumentationPaths": [], "bugDispositions": [],
+            }],
+            "affectedTaskIds": ["TASK-0001"], "affectedBugIds": [],
+        })
+        amendment = {
+            "amendmentId": identity, "status": "result_ready", "analysisResultPath": str(analysis_path),
+            "selectedOptionId": "OPTION-0001", "decisionIdentity": "decision", "worktree": str(root),
+            "baseSha": "a" * 40, "authorizedDocumentationPaths": ["plan.md"], "resultSha": None,
+        }
+        state = {"activeAmendment": amendment}
+        tasks = {"tasks": [self.task(), self.task("TASK-0002")]}
+        definition = {
+            key: value for key, value in self.task("TASK-0018", ["TASK-0002"]).items()
+            if key in {"taskId", "title", "description", "requirementIds", "planSections", "dependencies", "allowedPaths", "exclusiveResources", "acceptanceCriteria", "checks"}
+        }
+        result_path = common.attempt_path(paths, "result", identity, 1)
+        common.write_immutable_json(result_path, {
+            "result": {
+                "summary": "amended", "decisionIdentity": "decision", "selectedOptionId": "OPTION-0001",
+                "commitSha": "b" * 40, "changedFiles": ["plan.md"], "newTasks": [definition],
+                "supersededTaskIds": [],
+            },
+        })
+        committed_plan = ["# Plan\n\nImplement TASK-0018. Preserve X-TASK-0018-extra."]
+
+        def git_text(_root: str, _reference: str, path: str) -> str:
+            return committed_plan[0] if path == "plan.md" else "REQ-ONE"
+
+        with (
+            patch.object(project_manager, "assert_pm_analysis"),
+            patch.object(project_manager, "assert_amendment_commit", return_value={"Head": "b" * 40, "ChangedFiles": ["plan.md"]}),
+            patch.object(project_manager, "assert_pm_result_identity"),
+            patch.object(project_manager, "read_git_text", side_effect=git_text),
+            patch.object(project_manager, "normalize_task_references", wraps=common.normalize_task_references) as normalize,
+            patch.object(project_manager, "invoke_role", side_effect=RuntimeError("verifier reached")) as verifier,
+        ):
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, "verifier reached"):
+                    project_manager.invoke_pm_resolution(
+                        root, config, state, paths, tasks, None, "build", "task", "TASK-0001", None,
+                    )
+            self.assertEqual(normalize.call_args.args[1], {"TASK-0018": "TASK-0003"})
+            self.assertEqual(verifier.call_count, 2)
+
+            committed_plan[0] = "# Plan\n\nImplement TASK-9999."
+            with self.assertRaisesRegex(common.BraceError, "Plan references unknown tasks: TASK-9999"):
+                project_manager.invoke_pm_resolution(
+                    root, config, state, paths, tasks, None, "build", "task", "TASK-0001", None,
+                )
+            self.assertEqual(verifier.call_count, 2)
+
+        self.assertEqual(common.read_json(result_path)["result"]["newTasks"][0]["taskId"], "TASK-0018")
+
     def test_conflict_scheduling(self) -> None:
         first, second = self.task(paths=["src/a/**"]), self.task("TASK-0002", paths=["src/b/**"])
         self.assertEqual([item["taskId"] for item in common.select_ready_items([first, second], "task", 2)], ["TASK-0001", "TASK-0002"])
