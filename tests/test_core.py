@@ -84,6 +84,7 @@ class CoreTests(RepositoryTestCase):
             self.assertTrue(self.schema_keys(projected[name]).isdisjoint({"allOf", "if", "then", "else"}))
         blocker = projected["builder-result.schema.json"]["properties"]["blocker"]
         self.assertIn("anyOf", blocker)
+        self.assertTrue(self.schema_keys(blocker).isdisjoint({"$schema", "$defs"}))
         self.assertNotIn("oneOf", self.schema_keys(blocker))
         self.assertNotIn("blocker.schema.json", json.dumps(projected["builder-result.schema.json"]))
         self.assertEqual(projected["pm-amendment-result.schema.json"]["properties"]["newTasks"]["items"]["$ref"], "#/$defs/task")

@@ -965,7 +965,7 @@ def _project_output_schema(schema_path: str | Path) -> dict[str, Any]:
                 return project(target, target_path, False, resolving | {key})
         result = {}
         for key, item in value.items():
-            if key in unsupported:
+            if key in unsupported or not preserve_internal and key in {"$schema", "$defs"}:
                 continue
             projected_key = "anyOf" if key == "oneOf" else key
             if key in {"properties", "$defs", "patternProperties"} and isinstance(item, dict):
