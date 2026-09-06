@@ -114,7 +114,3 @@ class CliTests(unittest.TestCase):
         ):
             self.assertTrue((template / relative).is_file(), relative)
         self.assertFalse((template / ".codex" / "scripts").exists())
-
-
-if __name__ == "__main__":
-    unittest.main()

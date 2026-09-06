@@ -118,8 +118,3 @@ class WorkflowTests(RepositoryTestCase):
         self.assertTrue(paths.build_summary.is_file())
         self.assertTrue(paths.audit_summary.is_file())
         self.assertFalse(Path(config["worktreeRoot"]).exists())
-
-
-if __name__ == "__main__":
-    import unittest
-    unittest.main()

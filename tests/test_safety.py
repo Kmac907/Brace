@@ -79,7 +79,3 @@ class SafetyTests(unittest.TestCase):
                 "TASK-0001",
                 "provider unavailable",
             )
-
-
-if __name__ == "__main__":
-    unittest.main()

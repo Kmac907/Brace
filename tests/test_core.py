@@ -114,7 +114,3 @@ class CoreTests(RepositoryTestCase):
         self.git(clone, "push", "origin", "brace/integration")
         with self.assertRaisesRegex(common.BraceError, "unowned commits"):
             common.ensure_integration_branch(root, config, state)
-
-
-if __name__ == "__main__":
-    unittest.main()
