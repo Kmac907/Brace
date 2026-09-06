@@ -27,20 +27,39 @@ SEMANTIC_BLOCKERS = {
     "bug_disposition",
 }
 
-PONYTAIL_GUIDANCE = """# Optional Ponytail efficiency guidance
+PONYTAIL_GUIDANCE = """# Mandatory Ponytail compliance
 
 When the `ponytail:ponytail` skill is available and this assignment involves implementation, implementation design, refactoring, debugging, or code review, load and use it at full level.
 If it is unavailable, continue without it; Ponytail is optional and its absence is not a blocker.
 Never use it to weaken explicit requirements, input validation, security, accessibility, error handling, or required tests.
 The role's required JSON output schema overrides Ponytail's response-format guidance.
 Do not use it for work that is only prose, status reporting, or a semantic user decision.
-"""
 
-COORDINATOR_IDENTITY_GUIDANCE = """# Coordinator identity guidance
+Loading or mentioning Ponytail does not count as using it.
 
-For a complete planner result, number tasks exactly `TASK-0001`, `TASK-0002`, ... in returned-array order; use those exact four-digit IDs in every task dependency and throughout `planMarkdown`.
-For an auditor result, number bugs exactly `BUG-0001`, `BUG-0002`, ... in returned-array order; use those exact four-digit IDs in every bug dependency.
-For a project-manager amendment result, number appended tasks consecutively after the highest existing task ID supplied in the assignment; use those exact four-digit IDs in every dependency and throughout any updated plan Markdown.
+Before finalizing the solution:
+
+1. Identify the root cause and the component that owns the affected invariant.
+2. Check whether the requested behavior is unnecessary, already implemented, available in the standard library or platform, or solvable with a smaller existing mechanism.
+3. Prefer enforcing deterministic behavior in deterministic code. Do not compensate with model prompting, retries, or validation when the owning code can produce the correct value directly.
+4. Recheck the proposed solution against every applicable Ponytail rule.
+5. Do not claim Ponytail was used unless it materially changed or confirmed the solution.
+
+Report concise observable evidence:
+
+`Ponytail impact: chose [solution] at [owning layer] instead of [rejected alternative] because [reason].`
+
+If the required output is schema-constrained, place this evidence in the existing string summary field. The planner must place it in `summary.assumptions`. Do not add undeclared fields.
+
+Reviewers and verifiers must verify Ponytail compliance independently. Reject a claimed application when:
+
+- the change treats a symptom instead of the shared root cause;
+- deterministic state remains model-owned when code can own it;
+- prompt instructions or retries replace a direct deterministic implementation;
+- an existing helper, standard-library feature, or smaller solution was overlooked;
+- the claimed Ponytail impact is not supported by the design or diff.
+
+Do not accept "the skill was loaded" as evidence that it was applied.
 """
 
 
@@ -584,6 +603,8 @@ PROTECTED_PATHS = (
     ".codex/audit-summary.json", ".codex/logs", ".codex/logs/**",
 )
 
+TASK_REFERENCE = re.compile(r"(?<![A-Za-z0-9_-])TASK-([0-9]+)(?![A-Za-z0-9_-])")
+
 
 def assert_assignment_paths(item: dict[str, Any]) -> None:
     identity = item.get("taskId") or item.get("bugId")
@@ -598,6 +619,39 @@ def assert_assignment_paths(item: dict[str, Any]) -> None:
             blocked_base = blocked.replace("/**", "")
             if normalized == blocked or pattern_base == blocked_base or blocked_base.startswith(f"{pattern_base}/"):
                 raise BraceError(f"Assignment path may include coordinator-owned content: {pattern}")
+
+
+def canonicalize_graph_identities(items: list[dict[str, Any]], kind: str, starting_ordinal: int = 1) -> dict[str, str]:
+    key, prefix = ("taskId", "TASK") if kind == "task" else ("bugId", "BUG")
+    provisional = [str(item[key]) for item in items]
+    seen: set[str] = set()
+    for identity in provisional:
+        if identity in seen:
+            raise BraceError(f"Duplicate provisional {kind} identity: {identity}")
+        seen.add(identity)
+    mapping = {identity: f"{prefix}-{starting_ordinal + index:04d}" for index, identity in enumerate(provisional)}
+    for item, identity in zip(items, mapping.values(), strict=True):
+        item[key] = identity
+        item["dependencies"] = [mapping.get(str(dependency), str(dependency)) for dependency in item["dependencies"]]
+    return mapping
+
+
+def normalize_task_references(markdown: str, mapping: dict[str, str], task_ids: Iterable[str]) -> str:
+    valid = set(task_ids)
+    unresolved: set[str] = set()
+
+    def replacement(match: re.Match[str]) -> str:
+        reference = match.group(0)
+        canonical = mapping.get(reference, f"TASK-{int(match.group(1)):04d}")
+        if canonical not in valid:
+            unresolved.add(reference)
+            return reference
+        return canonical
+
+    normalized = TASK_REFERENCE.sub(replacement, markdown)
+    if unresolved:
+        raise BraceError("Plan references unknown tasks: " + ", ".join(sorted(unresolved)))
+    return normalized
 
 
 def assert_graph(items: list[dict[str, Any]], kind: str) -> None:
@@ -1064,7 +1118,7 @@ def invoke_codex(prompt: str, cwd: str | Path, schema_path: str | Path, sandbox:
 
 def invoke_role(root: str | Path, cwd: str | Path, role: str, context: str, schema_name: str, sandbox: str) -> dict[str, Any]:
     paths, config = Paths(root), get_configuration(root)
-    prompt = f"{read_text(paths.codex / 'AGENTS.md')}\n\n{PONYTAIL_GUIDANCE}\n{COORDINATOR_IDENTITY_GUIDANCE}\n{read_text(paths.prompts / f'{role}.md')}\n\n# Assignment context\n\n{context}"
+    prompt = f"{read_text(paths.codex / 'AGENTS.md')}\n\n{PONYTAIL_GUIDANCE}\n{read_text(paths.prompts / f'{role}.md')}\n\n# Assignment context\n\n{context}"
     return invoke_codex(prompt, cwd, paths.schemas / schema_name, sandbox, paths.logs, role, int(config["agentTimeoutMinutes"]), int(config["agentCleanupGraceSeconds"]))
 
 

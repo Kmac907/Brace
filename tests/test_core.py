@@ -31,6 +31,35 @@ class CoreTests(RepositoryTestCase):
         with self.assertRaisesRegex(common.BraceError, "REQ-TWO"):
             common.assert_task_coverage([first], "REQ-ONE REQ-TWO")
 
+    def test_coordinator_canonicalizes_graph_identities_and_references(self) -> None:
+        first = self.task("TASK-0018")
+        second = self.task("TASK-0028", ["TASK-0018"])
+        mapping = common.canonicalize_graph_identities([first, second], "task")
+        self.assertEqual(mapping, {"TASK-0018": "TASK-0001", "TASK-0028": "TASK-0002"})
+        self.assertEqual((first["taskId"], second["taskId"], second["dependencies"]), ("TASK-0001", "TASK-0002", ["TASK-0001"]))
+        plan = "Implement TASK-001, then TASK-0028; leave X-TASK-0018-extra unchanged."
+        self.assertEqual(
+            common.normalize_task_references(plan, mapping, (first["taskId"], second["taskId"])),
+            "Implement TASK-0001, then TASK-0002; leave X-TASK-0018-extra unchanged.",
+        )
+
+        bug = {"bugId": "BUG-0018", "dependencies": [], "allowedPaths": ["src/**"]}
+        common.canonicalize_graph_identities([bug], "bug")
+        self.assertEqual(bug["bugId"], "BUG-0001")
+        follow_up = self.task("TASK-0018", ["TASK-0002"])
+        common.canonicalize_graph_identities([follow_up], "task", 3)
+        self.assertEqual((follow_up["taskId"], follow_up["dependencies"]), ("TASK-0003", ["TASK-0002"]))
+
+    def test_coordinator_rejects_ambiguous_or_unknown_identities(self) -> None:
+        with self.assertRaisesRegex(common.BraceError, "Duplicate provisional task identity"):
+            common.canonicalize_graph_identities([self.task("TASK-0018"), self.task("TASK-0018")], "task")
+        task = self.task("TASK-0018", ["TASK-9999"])
+        common.canonicalize_graph_identities([task], "task")
+        with self.assertRaisesRegex(common.BraceError, "unknown task TASK-9999"):
+            common.assert_graph([task], "task")
+        with self.assertRaisesRegex(common.BraceError, "Plan references unknown tasks: TASK-9999"):
+            common.normalize_task_references("Implement TASK-9999.", {}, ["TASK-0001"])
+
     def test_conflict_scheduling(self) -> None:
         first, second = self.task(paths=["src/a/**"]), self.task("TASK-0002", paths=["src/b/**"])
         self.assertEqual([item["taskId"] for item in common.select_ready_items([first, second], "task", 2)], ["TASK-0001", "TASK-0002"])
@@ -45,7 +74,7 @@ class CoreTests(RepositoryTestCase):
         with self.assertRaisesRegex(common.BraceError, "evidence"):
             project_manager.structured_blocker(dict(semantic, evidence=""), "build", "TASK-0001")
 
-    def test_role_prompt_recommends_optional_ponytail(self) -> None:
+    def test_role_prompt_requires_empirical_ponytail_compliance(self) -> None:
         root, _, _ = self.make_repository()
         (root / ".codex" / "prompts" / "builder.md").write_text("builder role", encoding="utf-8")
         with patch.object(common, "invoke_codex", return_value={}) as invoke:
@@ -54,6 +83,12 @@ class CoreTests(RepositoryTestCase):
         self.assertIn("load and use it at full level", prompt)
         self.assertIn("optional and its absence is not a blocker", prompt)
         self.assertIn("required JSON output schema overrides", prompt)
+        self.assertIn("Identify the root cause and the component that owns the affected invariant", prompt)
+        self.assertIn("Prefer enforcing deterministic behavior in deterministic code", prompt)
+        self.assertIn("Recheck the proposed solution against every applicable Ponytail rule", prompt)
+        self.assertIn("Ponytail impact: chose [solution] at [owning layer] instead of [rejected alternative] because [reason].", prompt)
+        self.assertIn("Reviewers and verifiers must verify Ponytail compliance independently", prompt)
+        self.assertNotIn("Coordinator identity guidance", prompt)
 
     def test_pm_analysis_rejects_unknown_task(self) -> None:
         analysis = {
@@ -110,8 +145,12 @@ class CoreTests(RepositoryTestCase):
         schema_path = paths.schemas / "planning-result.schema.json"
         result = {
             "status": "complete", "questions": [], "normalizedRequirementsMarkdown": "requirements",
-            "planMarkdown": "plan", "tasks": [],
-            "summary": {"requirementsCount": 1, "taskCount": 0, "parallelizableTaskCount": 0,
+            "planMarkdown": "plan", "tasks": [{
+                "taskId": "TASK-0018", "title": "task", "description": "description", "requirementIds": ["REQ-ONE"],
+                "planSections": ["plan"], "dependencies": [], "allowedPaths": ["src/**"], "exclusiveResources": [],
+                "acceptanceCriteria": ["works"], "checks": ["check"],
+            }],
+            "summary": {"requirementsCount": 1, "taskCount": 1, "parallelizableTaskCount": 1,
                         "assumptions": [], "deferredScope": [], "deferredRequirementIds": []},
         }
         outcomes = [result, result | {"summary": result["summary"] | {"deferredRequirementIds": ["REQ-ONE", "REQ-ONE"]}}]
@@ -138,7 +177,12 @@ class CoreTests(RepositoryTestCase):
         executable.chmod(0o755)
         environment = {"PATH": str(executable_directory) + os.pathsep + os.environ.get("PATH", "")}
         with patch.dict(os.environ, environment), patch.object(common.subprocess, "Popen", Process):
-            self.assertEqual(common.invoke_codex("prompt", root, schema_path, "read-only", paths.logs), result)
+            returned = common.invoke_codex("prompt", root, schema_path, "read-only", paths.logs)
+            self.assertEqual(returned, result)
+            common.canonicalize_graph_identities(returned["tasks"], "task")
+            raw_result = common.read_json(next(paths.logs.glob("agent-*.result.json")))
+            self.assertEqual(raw_result["tasks"][0]["taskId"], "TASK-0018")
+            self.assertEqual(returned["tasks"][0]["taskId"], "TASK-0001")
             self.assertFalse(captured[0][0].exists())
             self.assertNotEqual(captured[0][0], schema_path.resolve())
             self.assertNotIn("uniqueItems", self.schema_keys(captured[0][1]))

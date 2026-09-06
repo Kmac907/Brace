@@ -11,6 +11,7 @@ from .common import (
     assert_graph,
     assert_task_coverage,
     attempt_path,
+    canonicalize_graph_identities,
     complete_pull_request,
     definition_hash,
     ensure_integration_branch,
@@ -19,6 +20,7 @@ from .common import (
     invoke_role,
     new_worktree,
     new_pull_request,
+    normalize_task_references,
     object_hash,
     pretty_json,
     read_attempt_result,
@@ -307,11 +309,13 @@ def invoke_pm_resolution(
         else:
             head = run_native("git", ["-C", amendment["worktree"], "rev-parse", "HEAD"]).output.strip()
             mode = "recover_result" if head != amendment["baseSha"] else "amend"
+            first_task_id = max((int(task["taskId"][5:]) for task in tasks["tasks"]), default=0) + 1
             context = "\n".join((
                 f"Mode: {mode}", f"Amendment: {identity}", f"Approved option: {amendment['selectedOptionId']}",
                 f"User response: {amendment['userResponse']}", f"Decision identity: {amendment['decisionIdentity']}",
                 f"Authorized documentation paths: {', '.join(amendment['authorizedDocumentationPaths'])}",
-                f"Base SHA: {amendment['baseSha']}", f"Analysis:\n{pretty_json(analysis)}", f"Current tasks:\n{pretty_json(tasks)}",
+                f"Base SHA: {amendment['baseSha']}", f"First available follow-up task ID: TASK-{first_task_id:04d}",
+                f"Analysis:\n{pretty_json(analysis)}", f"Current tasks:\n{pretty_json(tasks)}",
             ))
             result = invoke_role(root, amendment["worktree"], "project-manager", context, "pm-amendment-result.schema.json", "read-only" if mode == "recover_result" else "workspace-write")
             if result["status"] != "completed":
@@ -323,14 +327,12 @@ def invoke_pm_resolution(
 
     record = read_json(result_path)
     result = record["result"]
+    expected = max((int(task["taskId"][5:]) for task in tasks["tasks"]), default=0) + 1
+    canonicalize_graph_identities(result["newTasks"], "task", expected)
     if amendment["status"] == "result_ready":
         commit = assert_amendment_commit(amendment["worktree"], amendment["baseSha"], amendment["authorizedDocumentationPaths"])
         assert_pm_result_identity(result, amendment, commit)
         amendment["resultSha"] = commit["Head"]
-        expected = max((int(task["taskId"][5:]) for task in tasks["tasks"]), default=0) + 1
-        for index, task in enumerate(result["newTasks"]):
-            if task["taskId"] != f"TASK-{expected + index:04d}":
-                raise BraceError("PM follow-up task IDs must append monotonically.")
         if result["supersededTaskIds"] and not result["newTasks"]:
             raise BraceError("A superseded task requires at least one replacement follow-up task.")
         for task_id in result["supersededTaskIds"]:
@@ -351,6 +353,9 @@ def invoke_pm_resolution(
                     raise BraceError(f"PM cannot supersede task {task_id} because its worktree contains unrecorded work.")
         candidate = tasks["tasks"] + [persisted_task(task, identity) for task in result["newTasks"]]
         assert_graph(candidate, "task")
+        plan = read_git_text(amendment["worktree"], commit["Head"], "plan.md")
+        if normalize_task_references(plan, {}, (task["taskId"] for task in candidate)) != plan:
+            raise BraceError("Committed plan.md contains noncanonical task references.")
         superseded = set(result["supersededTaskIds"])
         for task in candidate:
             if task["taskId"] not in superseded and superseded.intersection(task["dependencies"]):

@@ -42,6 +42,92 @@ class WorkflowTests(RepositoryTestCase):
         with patch.object(planning_loop, "assert_prerequisites"), patch.object(planning_loop, "invoke_role", return_value=self.planner_result()):
             planning_loop.run(root)
 
+    def test_planning_canonicalizes_model_identities_without_retry(self) -> None:
+        root, _, _ = self.prepare()
+        result = self.planner_result()
+        result["tasks"][0]["taskId"] = "TASK-0018"
+        result["tasks"].append({
+            **result["tasks"][0], "taskId": "TASK-0028", "title": "Finish feature",
+            "dependencies": ["TASK-0018"],
+        })
+        result["planMarkdown"] = "# Plan\n\nImplement TASK-001, then TASK-0028. Preserve X-TASK-0018-extra.\n"
+        result["summary"].update(taskCount=2, parallelizableTaskCount=1)
+        with patch.object(planning_loop, "assert_prerequisites"), patch.object(planning_loop, "invoke_role", return_value=result) as invoke:
+            planning_loop.run(root)
+        paths = common.Paths(root)
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")["tasks"]
+        self.assertEqual([task["taskId"] for task in tasks], ["TASK-0001", "TASK-0002"])
+        self.assertEqual(tasks[1]["dependencies"], ["TASK-0001"])
+        self.assertEqual((root / "plan.md").read_text(encoding="utf-8"), "# Plan\n\nImplement TASK-0001, then TASK-0002. Preserve X-TASK-0018-extra.")
+        self.assertEqual(invoke.call_count, 1)
+
+    def test_planning_validation_failures_do_not_retry_or_persist_tasks(self) -> None:
+        root, _, _ = self.prepare()
+        result = self.planner_result()
+        result["tasks"][0].update(taskId="TASK-0018", dependencies=["TASK-9999"])
+        with (
+            patch.object(planning_loop, "assert_prerequisites"),
+            patch.object(planning_loop, "invoke_role", return_value=result) as invoke,
+            self.assertRaisesRegex(common.BraceError, "unknown task TASK-9999"),
+        ):
+            planning_loop.run(root)
+        paths = common.Paths(root)
+        self.assertEqual(common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")["tasks"], [])
+        self.assertEqual(invoke.call_count, 1)
+
+    def test_planning_duplicate_ids_fail_before_persistence(self) -> None:
+        root, _, _ = self.prepare()
+        result = self.planner_result()
+        result["tasks"][0]["taskId"] = "TASK-0018"
+        result["tasks"].append(dict(result["tasks"][0]))
+        with (
+            patch.object(planning_loop, "assert_prerequisites"),
+            patch.object(planning_loop, "invoke_role", return_value=result),
+            self.assertRaisesRegex(common.BraceError, "Duplicate provisional task identity"),
+        ):
+            planning_loop.run(root)
+        paths = common.Paths(root)
+        self.assertEqual(common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")["tasks"], [])
+
+    def test_planning_unknown_plan_reference_fails_before_persistence(self) -> None:
+        root, _, _ = self.prepare()
+        result = self.planner_result()
+        result["tasks"][0]["taskId"] = "TASK-0018"
+        result["planMarkdown"] = "Implement TASK-9999."
+        with (
+            patch.object(planning_loop, "assert_prerequisites"),
+            patch.object(planning_loop, "invoke_role", return_value=result),
+            self.assertRaisesRegex(common.BraceError, "Plan references unknown tasks"),
+        ):
+            planning_loop.run(root)
+        paths = common.Paths(root)
+        self.assertEqual(common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")["tasks"], [])
+
+    def test_planning_still_retries_for_clarification(self) -> None:
+        root, _, _ = self.prepare()
+        question = {
+            "status": "questions", "questions": [{"questionId": "QUESTION-0001", "question": "Which behavior?", "reason": "Required"}],
+            "normalizedRequirementsMarkdown": None, "planMarkdown": None, "tasks": [],
+            "summary": {"requirementsCount": 0, "taskCount": 0, "parallelizableTaskCount": 0, "assumptions": [], "deferredScope": [], "deferredRequirementIds": []},
+        }
+        calls = 0
+
+        def answer_then_complete(*_: object) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return question
+            self.assertIn("Use the existing behavior.", (root / "requirements.md").read_text(encoding="utf-8"))
+            return self.planner_result()
+
+        with (
+            patch.object(planning_loop, "assert_prerequisites"),
+            patch.object(planning_loop, "invoke_role", side_effect=answer_then_complete) as invoke,
+            patch.object(planning_loop, "ask", return_value="Use the existing behavior."),
+        ):
+            planning_loop.run(root)
+        self.assertEqual(invoke.call_count, 2)
+
     def test_planning_build_and_audit_complete(self) -> None:
         root, _, config = self.prepare()
         self.plan(root)
@@ -189,7 +275,7 @@ class WorkflowTests(RepositoryTestCase):
         audit_result = {
             "status": "completed", "summary": "one bug", "checks": [], "missingEvidence": [], "blocker": None,
             "bugs": [{
-                "bugId": "BUG-0001", "title": "Correct output", "severity": "medium", "category": "correctness",
+                "bugId": "BUG-0018", "title": "Correct output", "severity": "medium", "category": "correctness",
                 "requirementIds": ["REQ-ONE"], "description": "Output is wrong", "evidence": "Focused check failed",
                 "actualBehavior": "wrong", "requiredBehavior": "correct", "impact": "incorrect result",
                 "requiredCorrection": "correct the output", "acceptanceTest": "output is correct", "dependencies": [],
