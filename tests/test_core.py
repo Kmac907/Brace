@@ -53,6 +53,14 @@ class CoreTests(RepositoryTestCase):
     def test_coordinator_rejects_ambiguous_or_unknown_identities(self) -> None:
         with self.assertRaisesRegex(common.BraceError, "Duplicate provisional task identity"):
             common.canonicalize_graph_identities([self.task("TASK-0018"), self.task("TASK-0018")], "task")
+        with self.assertRaisesRegex(common.BraceError, "Unresolved task dependency collides with canonical identity: TASK-0001"):
+            common.canonicalize_graph_identities([self.task("TASK-0018"), self.task("TASK-0028", ["TASK-0001"])], "task")
+        bugs = [
+            {"bugId": "BUG-0018", "dependencies": [], "allowedPaths": ["src/**"]},
+            {"bugId": "BUG-0028", "dependencies": ["BUG-0001"], "allowedPaths": ["src/**"]},
+        ]
+        with self.assertRaisesRegex(common.BraceError, "Unresolved bug dependency collides with canonical identity: BUG-0001"):
+            common.canonicalize_graph_identities(bugs, "bug")
         task = self.task("TASK-0018", ["TASK-9999"])
         common.canonicalize_graph_identities([task], "task")
         with self.assertRaisesRegex(common.BraceError, "unknown task TASK-9999"):
