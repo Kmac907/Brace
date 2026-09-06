@@ -26,6 +26,7 @@ from .common import (
     read_attempt_result,
     read_git_text,
     read_json,
+    read_text,
     remove_worktree,
     run_native,
     safe_relative_pattern,
@@ -129,7 +130,7 @@ def decision_identity(amendment_id: str, option_id: str, response: str, question
 def assert_amendment_commit(
     worktree: str | Path, base_sha: str, authorized_paths: list[str], head_sha: str | None = None
 ) -> dict[str, Any]:
-    if run_native("git", ["-C", worktree, "status", "--porcelain", "--untracked-files=all"]).output.strip():
+    if head_sha is None and run_native("git", ["-C", worktree, "status", "--porcelain", "--untracked-files=all"]).output.strip():
         raise BraceError("PM amendment worktree is not clean.")
     current = run_native("git", ["-C", worktree, "rev-parse", "HEAD"]).output.strip()
     head = head_sha or current
@@ -370,16 +371,26 @@ def invoke_pm_resolution(
         requirements = read_git_text(amendment["worktree"], commit["Head"], "requirements.md")
         assert_task_coverage([task for task in candidate if task["taskId"] not in superseded], requirements)
         head = run_native("git", ["-C", amendment["worktree"], "rev-parse", "HEAD"]).output.strip()
+        dirty = run_native("git", ["-C", amendment["worktree"], "status", "--porcelain", "--untracked-files=all"]).output
         if normalized_plan != plan and head == commit["Head"]:
-            write_text_atomic(Path(amendment["worktree"]) / "plan.md", normalized_plan)
+            plan_path = Path(amendment["worktree"]) / "plan.md"
+            if dirty:
+                if dirty not in {" M plan.md", "M  plan.md", "MM plan.md"}:
+                    raise BraceError(f"Amendment worktree contains unexpected uncommitted changes: {dirty}")
+                if read_text(plan_path) != normalized_plan:
+                    raise BraceError("Amendment worktree contains a mismatched plan normalization.")
+            else:
+                write_text_atomic(plan_path, normalized_plan)
             run_native("git", ["-C", amendment["worktree"], "add", "--", "plan.md"])
             run_native("git", ["-C", amendment["worktree"], "commit", "-m", "Normalize PM task references"])
             head = run_native("git", ["-C", amendment["worktree"], "rev-parse", "HEAD"]).output.strip()
         elif head != commit["Head"]:
             count = int(run_native("git", ["-C", amendment["worktree"], "rev-list", "--count", f"{commit['Head']}..{head}"]).output.strip())
             changed = run_native("git", ["-C", amendment["worktree"], "diff", "--name-only", f"{commit['Head']}..{head}"]).lines
-            if normalized_plan == plan or count != 1 or changed != ["plan.md"] or read_git_text(amendment["worktree"], head, "plan.md") != normalized_plan:
+            if dirty or normalized_plan == plan or count != 1 or changed != ["plan.md"] or read_git_text(amendment["worktree"], head, "plan.md") != normalized_plan:
                 raise BraceError("Amendment worktree contains an unexpected post-result commit.")
+        elif dirty:
+            raise BraceError("Amendment worktree contains unexpected uncommitted changes.")
         if amendment.get("resultSha") not in {None, head}:
             raise BraceError("Recorded amendment result SHA does not match the normalized plan commit.")
         amendment["resultSha"] = head

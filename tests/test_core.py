@@ -253,6 +253,53 @@ class CoreTests(RepositoryTestCase):
 
         self.assertEqual(common.read_json(result_path)["result"]["newTasks"][0]["taskId"], "TASK-0018")
 
+    def test_pm_plan_normalization_recovers_exact_unstaged_plan(self) -> None:
+        raw_plan = "# Plan\n\nImplement TASK-0018.\n"
+        root, config, paths, state, tasks, blocker, worktree, base, result_sha, _ = self.pm_result_ready_fixture(raw_plan)
+        normalized = "# Plan\n\nImplement TASK-0003."
+        (worktree / "plan.md").write_text(normalized, encoding="utf-8")
+
+        with patch.object(project_manager, "invoke_role", side_effect=RuntimeError("verifier reached")):
+            with self.assertRaisesRegex(RuntimeError, "verifier reached"):
+                project_manager.invoke_pm_resolution(root, config, state, paths, tasks, None, "build", "task", "TASK-0001", blocker)
+
+        head = self.git(worktree, "rev-parse", "HEAD")
+        self.assertEqual(self.git(worktree, "rev-list", "--count", f"{base}..{head}"), "2")
+        self.assertEqual(self.git(worktree, "show", f"{head}:plan.md"), normalized.strip())
+        self.assertEqual(self.git(worktree, "status", "--porcelain", "--untracked-files=all"), "")
+        self.assertNotEqual(head, result_sha)
+
+    def test_pm_plan_normalization_recovers_exact_staged_plan(self) -> None:
+        raw_plan = "# Plan\n\nImplement TASK-0018.\n"
+        root, config, paths, state, tasks, blocker, worktree, base, result_sha, _ = self.pm_result_ready_fixture(raw_plan)
+        normalized = "# Plan\n\nImplement TASK-0003."
+        (worktree / "plan.md").write_text(normalized, encoding="utf-8")
+        self.git(worktree, "add", "plan.md")
+
+        with patch.object(project_manager, "invoke_role", side_effect=RuntimeError("verifier reached")):
+            with self.assertRaisesRegex(RuntimeError, "verifier reached"):
+                project_manager.invoke_pm_resolution(root, config, state, paths, tasks, None, "build", "task", "TASK-0001", blocker)
+
+        head = self.git(worktree, "rev-parse", "HEAD")
+        self.assertEqual(self.git(worktree, "rev-list", "--count", f"{base}..{head}"), "2")
+        self.assertEqual(self.git(worktree, "show", f"{head}:plan.md"), normalized.strip())
+        self.assertEqual(self.git(worktree, "status", "--porcelain", "--untracked-files=all"), "")
+        self.assertNotEqual(head, result_sha)
+
+    def test_pm_plan_normalization_rejects_mismatched_and_unrelated_dirt(self) -> None:
+        raw_plan = "# Plan\n\nImplement TASK-0018.\n"
+        root, config, paths, state, tasks, blocker, worktree, _, result_sha, _ = self.pm_result_ready_fixture(raw_plan)
+        (worktree / "plan.md").write_text("# Plan\n\nImplement TASK-0004.\n", encoding="utf-8")
+        with self.assertRaisesRegex(common.BraceError, "mismatched plan normalization"):
+            project_manager.invoke_pm_resolution(root, config, state, paths, tasks, None, "build", "task", "TASK-0001", blocker)
+        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), result_sha)
+
+        (worktree / "plan.md").write_text(raw_plan, encoding="utf-8")
+        (worktree / "unrelated.txt").write_text("unrelated", encoding="utf-8")
+        with self.assertRaisesRegex(common.BraceError, "unexpected uncommitted changes"):
+            project_manager.invoke_pm_resolution(root, config, state, paths, tasks, None, "build", "task", "TASK-0001", blocker)
+        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), result_sha)
+
     def test_pm_plan_normalization_rejects_unknown_references_before_commit(self) -> None:
         root, config, paths, state, tasks, blocker, worktree, base, result_sha, result_path = self.pm_result_ready_fixture(
             "# Plan\n\nImplement TASK-9999.\n"
