@@ -54,6 +54,7 @@ class CoreTests(RepositoryTestCase):
             project_manager.assert_pm_analysis(analysis, {"tasks": [self.task()]}, None, "build")
 
     def test_native_timeout_is_bounded(self) -> None:
+        self.assertEqual(common.run_native(sys.executable, ["-c", "raise SystemExit(7)"], allowed_exit_codes=None).returncode, 7)
         started = time.monotonic()
         with self.assertRaisesRegex(common.BraceError, "deadline"):
             common.run_native(sys.executable, ["-c", "import time; time.sleep(30)"], timeout_seconds=1)

@@ -131,7 +131,7 @@ def run_native(
     command: str,
     arguments: Iterable[Any] = (),
     cwd: str | Path = ".",
-    allowed_exit_codes: Iterable[int] = (0,),
+    allowed_exit_codes: Iterable[int] | None = (0,),
     timeout_seconds: int = 600,
 ) -> NativeResult:
     args = [str(value) for value in arguments]
@@ -152,7 +152,7 @@ def run_native(
         _terminate_tree(process, 10)
         raise BraceError(f"Command exceeded the {timeout_seconds}-second deadline: {command}") from exc
     output = (stdout + os.linesep + stderr).rstrip()
-    if process.returncode not in set(allowed_exit_codes):
+    if allowed_exit_codes is not None and process.returncode not in set(allowed_exit_codes):
         rendered = " ".join(args)
         raise BraceError(f"Command failed with exit code {process.returncode}: {command} {rendered}\n{output}")
     return NativeResult(process.returncode, output)
