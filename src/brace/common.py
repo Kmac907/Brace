@@ -621,13 +621,18 @@ def assert_assignment_paths(item: dict[str, Any]) -> None:
                 raise BraceError(f"Assignment path may include coordinator-owned content: {pattern}")
 
 
-def canonicalize_graph_identities(items: list[dict[str, Any]], kind: str, starting_ordinal: int = 1) -> dict[str, str]:
+def canonicalize_graph_identities(
+    items: list[dict[str, Any]], kind: str, starting_ordinal: int = 1, existing_identities: Iterable[str] = ()
+) -> dict[str, str]:
     key, prefix = ("taskId", "TASK") if kind == "task" else ("bugId", "BUG")
     provisional = [str(item[key]) for item in items]
+    existing = set(existing_identities)
     seen: set[str] = set()
     for identity in provisional:
         if identity in seen:
             raise BraceError(f"Duplicate provisional {kind} identity: {identity}")
+        if identity in existing:
+            raise BraceError(f"Provisional {kind} identity conflicts with existing identity: {identity}")
         seen.add(identity)
     mapping = {identity: f"{prefix}-{starting_ordinal + index:04d}" for index, identity in enumerate(provisional)}
     canonical = set(mapping.values())
