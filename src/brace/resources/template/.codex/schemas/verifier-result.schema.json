@@ -70,22 +70,6 @@
           }
         }
       }
-    },
-    {
-      "if": {
-        "properties": {
-          "approved": {
-            "const": false
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "blocker": {
-            "type": "object"
-          }
-        }
-      }
     }
   ]
 }

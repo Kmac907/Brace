@@ -721,6 +721,12 @@ def remove_worktree(root: str | Path, config: dict[str, Any], identity: str, bra
     remove_empty_worktree_containers(root, config)
 
 
+def reset_rejected_assignment(root: str | Path, config: dict[str, Any], item: dict[str, Any], kind: str) -> None:
+    identity = item["taskId" if kind == "task" else "bugId"]
+    path = new_worktree(root, config, identity, item["branch"], item["baseSha"], item["resultSha"])
+    run_native("git", ["-C", path, "reset", "--hard", item["baseSha"]])
+
+
 def _matches_path(path: str, pattern: str) -> bool:
     return fnmatch.fnmatchcase(path.lower(), pattern.replace("\\", "/").lower())
 

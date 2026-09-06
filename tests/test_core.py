@@ -81,6 +81,13 @@ class CoreTests(RepositoryTestCase):
         })
         common.write_json_atomic(paths.state.with_name("referenced.json"), state, paths.schemas / "state.schema.json")
 
+    def test_verifier_rejection_allows_findings_without_blocker(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        common.write_json_atomic(paths.logs / "rejected.json", {
+            "approved": False, "summary": "changes required", "findings": ["fix it"], "checks": [], "blocker": None,
+        }, paths.schemas / "verifier-result.schema.json")
+
     def test_worktree_commit_scope_and_amendment_identity(self) -> None:
         root, _, config = self.make_repository()
         base = self.git(root, "rev-parse", "HEAD")

@@ -32,6 +32,7 @@ from .common import (
     read_attempt_result,
     read_json,
     recover_committed_attempt,
+    reset_rejected_assignment,
     remove_audit_worktree,
     remove_empty_worktree_containers,
     remove_merged_assignment,
@@ -279,7 +280,12 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                             blocker = structured_blocker(verification["blocker"], "audit", bug["bugId"])
                             if is_semantic_blocker(blocker):
                                 return _handle_semantic(root, config, state, paths, tasks, bugs, "verification", bug["bugId"], blocker, input_reader)
-                            raise BraceError(f"{context_label.capitalize()} was rejected: " + "; ".join(verification["findings"]))
+                            message = f"{context_label.capitalize()} was rejected: " + "; ".join(verification["findings"])
+                            if bug.get("resultSha"):
+                                reset_rejected_assignment(root, config, bug, "bug")
+                                bug["resultSha"] = None
+                            bug.update(status="open", lastError=message)
+                            continue
                         _checks(root, config, state, tasks, bugs)
                         if result["status"] == "not_reproducible":
                             bug.update(disposition="not_reproducible", status="verified", lastError=None)
@@ -290,6 +296,9 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     except Exception as error:
                         if state.get("activeAmendment"):
                             raise
+                        if bug.get("resultSha") and bug.get("disposition") != "fixed":
+                            reset_rejected_assignment(root, config, bug, "bug")
+                            bug["resultSha"] = None
                         bug["status"] = "ready_to_publish" if bug.get("disposition") == "fixed" and bug.get("resultSha") else "open"
                         bug["lastError"] = str(error)
                 save_ledger(bugs, paths)
@@ -324,7 +333,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     bug["baseSha"] = bug.get("baseSha") or base_sha
                     bug["worktree"] = str(new_worktree(root, config, bug["bugId"], bug["branch"], bug["baseSha"], bug.get("resultSha")))
                     bug["attemptCount"] += 1
-                    bug.update(status="active", lastError=None)
+                    bug["status"] = "active"
                     write_immutable_json(attempt_path(paths, "assignment", bug["bugId"], bug["attemptCount"]), {
                         "schemaVersion": "1.0", "identity": bug["bugId"], "attempt": bug["attemptCount"],
                         "baseSha": bug["baseSha"], "startingHead": run_native("git", ["-C", bug["worktree"], "rev-parse", "HEAD"]).output.strip(),
