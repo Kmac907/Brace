@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "brace"
-version = "0.2.2"
+version = "0.2.3"
 description = "Branch-Safe Repository Agent Coordination Engine. Controlled agent workflows, from plan to merge."
 readme = "README.md"
 requires-python = ">=3.11"
