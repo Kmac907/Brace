@@ -254,63 +254,7 @@
               ]
             },
             "blocker": {
-              "type": "object",
-              "required": [
-                "kind",
-                "message",
-                "evidence",
-                "affectedIdentity",
-                "requiresUserDecision",
-                "scopeChangePossible",
-                "smallestResolution",
-                "prohibitedDecisions"
-              ],
-              "properties": {
-                "kind": {
-                  "enum": [
-                    "operational",
-                    "missing_information",
-                    "contract_conflict",
-                    "scope_gap",
-                    "task_decomposition",
-                    "bug_disposition"
-                  ]
-                },
-                "message": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "evidence": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "requiresUserDecision": {
-                  "type": "boolean"
-                },
-                "scopeChangePossible": {
-                  "type": "boolean"
-                },
-                "affectedIdentity": {
-                  "type": [
-                    "string",
-                    "null"
-                  ],
-                  "pattern": "^(TASK|BUG)-[0-9]{4}$"
-                },
-                "smallestResolution": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "prohibitedDecisions": {
-                  "type": "array",
-                  "items": {
-                    "type": "string",
-                    "minLength": 1
-                  },
-                  "uniqueItems": true
-                }
-              },
-              "additionalProperties": false
+              "$ref": "blocker.schema.json#/$defs/blocker"
             },
             "analysisResultPath": {
               "type": [
@@ -363,60 +307,7 @@
                   "type": "null"
                 },
                 {
-                  "type": "object",
-                  "required": [
-                    "id",
-                    "url",
-                    "state",
-                    "repository",
-                    "head",
-                    "headSha",
-                    "base",
-                    "baseSha",
-                    "mergeSha"
-                  ],
-                  "properties": {
-                    "id": {
-                      "type": "string",
-                      "minLength": 1
-                    },
-                    "url": {
-                      "type": "string",
-                      "minLength": 1
-                    },
-                    "state": {
-                      "type": "string",
-                      "minLength": 1
-                    },
-                    "repository": {
-                      "type": "string",
-                      "minLength": 1
-                    },
-                    "head": {
-                      "type": "string",
-                      "minLength": 1
-                    },
-                    "headSha": {
-                      "type": "string",
-                      "pattern": "^[0-9a-f]{40}$"
-                    },
-                    "base": {
-                      "type": "string",
-                      "minLength": 1
-                    },
-                    "baseSha": {
-                      "type": "string",
-                      "pattern": "^[0-9a-f]{40}$"
-                    },
-                    "mergeSha": {
-                      "type": [
-                        "string",
-                        "null"
-                      ],
-                      "pattern": "^[0-9a-f]{40}$"
-                    }
-                  },
-                  "additionalProperties": false
+                  "$ref": "pull-request.schema.json"
                 }
               ]
             },

@@ -110,7 +110,7 @@ class CliTests(unittest.TestCase):
         for relative in (
             "requirements.md", "REQUIREMENTS-PROMPT.md", "AGENTS.md", ".gitignore", ".gitattributes",
             ".codex/AGENTS.md", ".codex/config.toml", ".codex/workflow.json",
-            ".codex/prompts/planner.md", ".codex/schemas/state.schema.json",
+            ".codex/prompts/planner.md", ".codex/schemas/state.schema.json", ".codex/schemas/pull-request.schema.json",
         ):
             self.assertTrue((template / relative).is_file(), relative)
         self.assertFalse((template / ".codex" / "scripts").exists())
