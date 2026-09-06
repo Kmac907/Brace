@@ -630,6 +630,14 @@ def canonicalize_graph_identities(items: list[dict[str, Any]], kind: str, starti
             raise BraceError(f"Duplicate provisional {kind} identity: {identity}")
         seen.add(identity)
     mapping = {identity: f"{prefix}-{starting_ordinal + index:04d}" for index, identity in enumerate(provisional)}
+    canonical = set(mapping.values())
+    for item in items:
+        collision = next(
+            (str(dependency) for dependency in item["dependencies"] if dependency not in mapping and dependency in canonical),
+            None,
+        )
+        if collision:
+            raise BraceError(f"Unresolved {kind} dependency collides with canonical identity: {collision}")
     for item, identity in zip(items, mapping.values(), strict=True):
         item[key] = identity
         item["dependencies"] = [mapping.get(str(dependency), str(dependency)) for dependency in item["dependencies"]]

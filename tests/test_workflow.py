@@ -64,11 +64,11 @@ class WorkflowTests(RepositoryTestCase):
     def test_planning_validation_failures_do_not_retry_or_persist_tasks(self) -> None:
         root, _, _ = self.prepare()
         result = self.planner_result()
-        result["tasks"][0].update(taskId="TASK-0018", dependencies=["TASK-9999"])
+        result["tasks"][0].update(taskId="TASK-0018", dependencies=["TASK-0001"])
         with (
             patch.object(planning_loop, "assert_prerequisites"),
             patch.object(planning_loop, "invoke_role", return_value=result) as invoke,
-            self.assertRaisesRegex(common.BraceError, "unknown task TASK-9999"),
+            self.assertRaisesRegex(common.BraceError, "Unresolved task dependency collides with canonical identity: TASK-0001"),
         ):
             planning_loop.run(root)
         paths = common.Paths(root)
