@@ -33,6 +33,7 @@ from .common import (
     utc_now,
     write_immutable_json,
     write_json_atomic,
+    write_text_atomic,
 )
 from .ui import ask, info
 
@@ -125,10 +126,15 @@ def decision_identity(amendment_id: str, option_id: str, response: str, question
     return object_hash({"amendmentId": amendment_id, "optionId": option_id, "response": response, "question": question})
 
 
-def assert_amendment_commit(worktree: str | Path, base_sha: str, authorized_paths: list[str]) -> dict[str, Any]:
+def assert_amendment_commit(
+    worktree: str | Path, base_sha: str, authorized_paths: list[str], head_sha: str | None = None
+) -> dict[str, Any]:
     if run_native("git", ["-C", worktree, "status", "--porcelain", "--untracked-files=all"]).output.strip():
         raise BraceError("PM amendment worktree is not clean.")
-    head = run_native("git", ["-C", worktree, "rev-parse", "HEAD"]).output.strip()
+    current = run_native("git", ["-C", worktree, "rev-parse", "HEAD"]).output.strip()
+    head = head_sha or current
+    if head_sha and run_native("git", ["-C", worktree, "merge-base", "--is-ancestor", head, current], allowed_exit_codes=(0, 1)).returncode != 0:
+        raise BraceError("PM result commit is not in the amendment worktree history.")
     if head == base_sha or run_native("git", ["-C", worktree, "merge-base", "--is-ancestor", base_sha, head], allowed_exit_codes=(0, 1)).returncode != 0:
         raise BraceError("PM did not create a descendant amendment commit.")
     count = int(run_native("git", ["-C", worktree, "rev-list", "--count", f"{base_sha}..{head}"]).output.strip())
@@ -332,9 +338,10 @@ def invoke_pm_resolution(
     expected = max((int(task["taskId"][5:]) for task in prior_tasks), default=0) + 1
     mapping = canonicalize_graph_identities(result["newTasks"], "task", expected, (task["taskId"] for task in prior_tasks))
     if amendment["status"] == "result_ready":
-        commit = assert_amendment_commit(amendment["worktree"], amendment["baseSha"], amendment["authorizedDocumentationPaths"])
+        commit = assert_amendment_commit(
+            amendment["worktree"], amendment["baseSha"], amendment["authorizedDocumentationPaths"], result["commitSha"]
+        )
         assert_pm_result_identity(result, amendment, commit)
-        amendment["resultSha"] = commit["Head"]
         if result["supersededTaskIds"] and not result["newTasks"]:
             raise BraceError("A superseded task requires at least one replacement follow-up task.")
         for task_id in result["supersededTaskIds"]:
@@ -356,12 +363,27 @@ def invoke_pm_resolution(
         candidate = tasks["tasks"] + [persisted_task(task, identity) for task in result["newTasks"]]
         assert_graph(candidate, "task")
         plan = read_git_text(amendment["worktree"], commit["Head"], "plan.md")
-        normalize_task_references(plan, mapping, (task["taskId"] for task in candidate))
+        normalized_plan = normalize_task_references(plan, mapping, (task["taskId"] for task in candidate))
         for task in candidate:
             if task["taskId"] not in superseded and superseded.intersection(task["dependencies"]):
                 raise BraceError(f"{task['taskId']} depends on a superseded task.")
         requirements = read_git_text(amendment["worktree"], commit["Head"], "requirements.md")
         assert_task_coverage([task for task in candidate if task["taskId"] not in superseded], requirements)
+        head = run_native("git", ["-C", amendment["worktree"], "rev-parse", "HEAD"]).output.strip()
+        if normalized_plan != plan and head == commit["Head"]:
+            write_text_atomic(Path(amendment["worktree"]) / "plan.md", normalized_plan)
+            run_native("git", ["-C", amendment["worktree"], "add", "--", "plan.md"])
+            run_native("git", ["-C", amendment["worktree"], "commit", "-m", "Normalize PM task references"])
+            head = run_native("git", ["-C", amendment["worktree"], "rev-parse", "HEAD"]).output.strip()
+        elif head != commit["Head"]:
+            count = int(run_native("git", ["-C", amendment["worktree"], "rev-list", "--count", f"{commit['Head']}..{head}"]).output.strip())
+            changed = run_native("git", ["-C", amendment["worktree"], "diff", "--name-only", f"{commit['Head']}..{head}"]).lines
+            if normalized_plan == plan or count != 1 or changed != ["plan.md"] or read_git_text(amendment["worktree"], head, "plan.md") != normalized_plan:
+                raise BraceError("Amendment worktree contains an unexpected post-result commit.")
+        if amendment.get("resultSha") not in {None, head}:
+            raise BraceError("Recorded amendment result SHA does not match the normalized plan commit.")
+        amendment["resultSha"] = head
+        save_state(state, paths)
         verification = invoke_role(root, amendment["worktree"], "verifier", "Verify this approved project amendment against the exact user decision.\n" + pretty_json(result), "verifier-result.schema.json", "read-only")
         if not verification["approved"]:
             raise BraceError("PM amendment semantic verification failed: " + "; ".join(verification["findings"]))
