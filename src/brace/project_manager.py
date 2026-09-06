@@ -328,7 +328,7 @@ def invoke_pm_resolution(
     record = read_json(result_path)
     result = record["result"]
     expected = max((int(task["taskId"][5:]) for task in tasks["tasks"]), default=0) + 1
-    canonicalize_graph_identities(result["newTasks"], "task", expected)
+    canonicalize_graph_identities(result["newTasks"], "task", expected, (task["taskId"] for task in tasks["tasks"]))
     if amendment["status"] == "result_ready":
         commit = assert_amendment_commit(amendment["worktree"], amendment["baseSha"], amendment["authorizedDocumentationPaths"])
         assert_pm_result_identity(result, amendment, commit)
