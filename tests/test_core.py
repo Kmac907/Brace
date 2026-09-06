@@ -75,6 +75,93 @@ class CoreTests(RepositoryTestCase):
         with self.assertRaisesRegex(common.BraceError, "Plan references unknown tasks: TASK-9999"):
             common.normalize_task_references("Implement TASK-9999.", {}, ["TASK-0001"])
 
+    def assert_pm_follow_up_recovery(self, provisional_id: str) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        head = self.git(root, "rev-parse", "HEAD")
+        identity = "AMEND-0001"
+        initial = [self.task(), self.task("TASK-0002")]
+        plan_hash = common.git_blob_identity(root, head, "plan.md")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        tasks.update(revision=1, planHash=plan_hash, definitionHash=common.definition_hash(initial, "task"), status="active", tasks=initial)
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+
+        analysis = {
+            "summary": "append follow-up", "recommendation": "amend", "question": "Proceed?", "amendmentRequired": True,
+            "effects": {name: "updated" for name in ("requirements", "plan", "tasks", "bugs", "completedWork", "schedule")},
+            "options": [{
+                "optionId": "OPTION-0001", "label": "Amend", "description": "Append work", "recommended": True,
+                "action": "amend", "requiresInput": False, "inputPrompt": None,
+                "authorizedDocumentationPaths": [], "bugDispositions": [],
+            }],
+            "affectedTaskIds": ["TASK-0001"], "affectedBugIds": [],
+        }
+        analysis_path = paths.results / f"{identity}-analysis.json"
+        common.write_immutable_json(analysis_path, analysis)
+        decision = project_manager.decision_identity(identity, "OPTION-0001", "OPTION-0001", analysis["question"])
+        pull_request = {
+            "id": "1", "url": "https://example.invalid/1", "state": "merged", "repository": "owner/repo",
+            "head": f"worktree/{identity}", "headSha": head, "base": config["integrationBranch"], "baseSha": head, "mergeSha": head,
+        }
+        blocker = dict(project_manager.structured_blocker("scope changed", "build", "TASK-0001"), kind="scope_gap", requiresUserDecision=True, scopeChangePossible=True)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        state.update(
+            stage="build", stageStatus="amending", targetBaseSha=head, integrationSha=head, planHash=plan_hash,
+            requirementsHash=common.git_blob_identity(root, head, "requirements.md"), taskDefinitionHash=tasks["definitionHash"],
+            amendmentSequence=1, activeAmendment={
+                "amendmentId": identity, "sourceStage": "build", "sourceKind": "task", "sourceIdentity": "TASK-0001",
+                "status": "integrated", "blocker": blocker, "analysisResultPath": str(analysis_path),
+                "selectedOptionId": "OPTION-0001", "userResponse": "OPTION-0001", "decisionIdentity": decision,
+                "authorizedDocumentationPaths": ["requirements.md", "plan.md"], "branch": f"worktree/{identity}",
+                "worktree": None, "baseSha": head, "resultSha": head, "pullRequest": pull_request,
+                "affectedTaskIds": ["TASK-0001"], "affectedBugIds": [], "resumeStage": "build", "attemptCount": 1,
+            },
+        )
+        common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
+        definition = {
+            key: value for key, value in self.task(provisional_id, ["TASK-0002"]).items()
+            if key in {"taskId", "title", "description", "requirementIds", "planSections", "dependencies", "allowedPaths", "exclusiveResources", "acceptanceCriteria", "checks"}
+        }
+        result = {
+            "status": "completed", "summary": "amended", "decisionIdentity": decision, "selectedOptionId": "OPTION-0001",
+            "commitSha": head, "changedFiles": ["plan.md"], "newTasks": [definition], "supersededTaskIds": [],
+            "resumeStage": "build", "blocker": None,
+        }
+        result_path = common.attempt_path(paths, "result", identity, 1)
+        common.write_immutable_json(result_path, {
+            "schemaVersion": "1.0", "identity": identity, "attempt": 1, "succeeded": True,
+            "result": result, "error": None, "completedAt": common.utc_now(),
+        })
+
+        with patch.object(project_manager, "save_state", side_effect=RuntimeError("interrupted after task ledger")):
+            with self.assertRaisesRegex(RuntimeError, "interrupted after task ledger"):
+                project_manager.invoke_pm_resolution(root, config, state, paths, tasks, common.read_json(paths.bugs), "build", "task", "TASK-0001", blocker)
+
+        interrupted_tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        interrupted_revision = interrupted_tasks["revision"]
+        persisted_state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        self.assertEqual(persisted_state["activeAmendment"]["status"], "integrated")
+        self.assertEqual([task["taskId"] for task in interrupted_tasks["tasks"]], ["TASK-0001", "TASK-0002", "TASK-0003"])
+
+        resolution = project_manager.invoke_pm_resolution(
+            root, config, persisted_state, paths, interrupted_tasks, common.read_json(paths.bugs),
+            "build", "task", "TASK-0001", blocker,
+        )
+        recovered_tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        recovered_state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        self.assertEqual(resolution["action"], "amended")
+        self.assertEqual(recovered_tasks["revision"], interrupted_revision)
+        self.assertEqual([task["taskId"] for task in recovered_tasks["tasks"]], ["TASK-0001", "TASK-0002", "TASK-0003"])
+        self.assertIsNone(recovered_state["activeAmendment"])
+        common.assert_ledger_identity(recovered_state, recovered_tasks, "task")
+        self.assertEqual(common.read_json(result_path)["result"]["newTasks"][0]["taskId"], provisional_id)
+
+    def test_pm_follow_up_recovery_is_idempotent_for_provisional_result(self) -> None:
+        self.assert_pm_follow_up_recovery("TASK-0018")
+
+    def test_pm_follow_up_recovery_is_idempotent_for_canonical_result(self) -> None:
+        self.assert_pm_follow_up_recovery("TASK-0003")
+
     def test_conflict_scheduling(self) -> None:
         first, second = self.task(paths=["src/a/**"]), self.task("TASK-0002", paths=["src/b/**"])
         self.assertEqual([item["taskId"] for item in common.select_ready_items([first, second], "task", 2)], ["TASK-0001", "TASK-0002"])

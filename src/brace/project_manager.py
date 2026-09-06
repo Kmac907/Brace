@@ -327,8 +327,10 @@ def invoke_pm_resolution(
 
     record = read_json(result_path)
     result = record["result"]
-    expected = max((int(task["taskId"][5:]) for task in tasks["tasks"]), default=0) + 1
-    canonicalize_graph_identities(result["newTasks"], "task", expected, (task["taskId"] for task in tasks["tasks"]))
+    superseded = set(result["supersededTaskIds"])
+    prior_tasks = [task for task in tasks["tasks"] if task.get("amendmentId") != identity or task["taskId"] in superseded]
+    expected = max((int(task["taskId"][5:]) for task in prior_tasks), default=0) + 1
+    canonicalize_graph_identities(result["newTasks"], "task", expected, (task["taskId"] for task in prior_tasks))
     if amendment["status"] == "result_ready":
         commit = assert_amendment_commit(amendment["worktree"], amendment["baseSha"], amendment["authorizedDocumentationPaths"])
         assert_pm_result_identity(result, amendment, commit)
@@ -356,7 +358,6 @@ def invoke_pm_resolution(
         plan = read_git_text(amendment["worktree"], commit["Head"], "plan.md")
         if normalize_task_references(plan, {}, (task["taskId"] for task in candidate)) != plan:
             raise BraceError("Committed plan.md contains noncanonical task references.")
-        superseded = set(result["supersededTaskIds"])
         for task in candidate:
             if task["taskId"] not in superseded and superseded.intersection(task["dependencies"]):
                 raise BraceError(f"{task['taskId']} depends on a superseded task.")
@@ -384,23 +385,33 @@ def invoke_pm_resolution(
 
     if amendment["status"] == "integrated":
         new_ids = [task["taskId"] for task in result["newTasks"]]
+        previous_tasks = object_hash(tasks)
         for task in tasks["tasks"]:
             if task["taskId"] in result["supersededTaskIds"]:
                 task.update(status="superseded", amendmentId=identity, supersededBy=new_ids)
-        existing = {task["taskId"] for task in tasks["tasks"]}
-        tasks["tasks"].extend(persisted_task(task, identity) for task in result["newTasks"] if task["taskId"] not in existing)
+        existing = {task["taskId"]: task for task in tasks["tasks"]}
+        for definition in result["newTasks"]:
+            follow_up = persisted_task(definition, identity)
+            current = existing.get(follow_up["taskId"])
+            if current is None:
+                tasks["tasks"].append(follow_up)
+            elif current.get("amendmentId") != identity or definition_hash([current], "task") != definition_hash([follow_up], "task"):
+                raise BraceError(f"Persisted follow-up task conflicts with {identity}: {follow_up['taskId']}")
         state["requirementsHash"] = git_blob_identity(root, state["integrationSha"], "requirements.md")
         state["planHash"] = git_blob_identity(root, state["integrationSha"], "plan.md")
         tasks.update(planHash=state["planHash"], definitionHash=definition_hash(tasks["tasks"], "task"), status="active")
         state["taskDefinitionHash"] = tasks["definitionHash"]
-        save_pm_task_ledger(tasks, paths)
+        if object_hash(tasks) != previous_tasks:
+            save_pm_task_ledger(tasks, paths)
         resume = "build" if source_stage == "build" or result["newTasks"] or result["supersededTaskIds"] else result["resumeStage"]
         if source_stage == "audit" and bugs is not None:
             history = paths.results / f"{identity}-pre-expansion-audit.json"
-            if not history.exists():
-                write_immutable_json(history, bugs)
-            bugs.update(schemaVersion="1.2", revision=bugs["revision"] + 1, auditSha=None, definitionHash=None, status="not_audited", bugs=[])
-            write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
+            bugs_changed = bugs["auditSha"] is not None or bugs["definitionHash"] is not None or bugs["status"] != "not_audited" or bool(bugs["bugs"])
+            if bugs_changed:
+                if not history.exists():
+                    write_immutable_json(history, bugs)
+                bugs.update(schemaVersion="1.2", revision=bugs["revision"] + 1, auditSha=None, definitionHash=None, status="not_audited", bugs=[])
+                write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
             state["bugDefinitionHash"] = None
         amendment.update(resumeStage=resume, status="applied")
         state.update(stage=resume, stageStatus="amending")
