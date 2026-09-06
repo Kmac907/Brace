@@ -1,10 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "oneOf": [
-    {
-      "type": "null"
-    },
-    {
+  "$defs": {
+    "blocker": {
       "type": "object",
       "required": [
         "kind",
@@ -62,6 +59,14 @@
         }
       },
       "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    {
+      "type": "null"
+    },
+    {
+      "$ref": "#/$defs/blocker"
     }
   ]
 }

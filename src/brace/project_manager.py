@@ -17,6 +17,7 @@ from .common import (
     get_pull_request,
     git_blob_identity,
     invoke_role,
+    new_worktree,
     new_pull_request,
     object_hash,
     pretty_json,
@@ -66,13 +67,6 @@ def structured_blocker(blocker: Any, scope: str, identity: str | None) -> dict[s
 
 def is_semantic_blocker(blocker: dict[str, Any] | None) -> bool:
     return bool(blocker and blocker["kind"] != "operational" and blocker["requiresUserDecision"])
-
-
-def maximum_amendment_rounds(config: dict[str, Any]) -> int:
-    value = int(config.get("maximumAmendmentRounds", 3))
-    if not 1 <= value <= 32:
-        raise BraceError("maximumAmendmentRounds must be between 1 and 32.")
-    return value
 
 
 def persisted_task(definition: dict[str, Any], amendment_id: str | None = None) -> dict[str, Any]:
@@ -127,32 +121,6 @@ def authorized_documentation_paths(option: dict[str, Any]) -> list[str]:
 
 def decision_identity(amendment_id: str, option_id: str, response: str, question: str) -> str:
     return object_hash({"amendmentId": amendment_id, "optionId": option_id, "response": response, "question": question})
-
-
-def new_amendment_worktree(root: str | Path, config: dict[str, Any], identity: str, base_reference: str, expected_head: str | None = None) -> Path:
-    from .common import worktree_base
-
-    if not re.fullmatch(r"AMEND-\d{4}", identity):
-        raise BraceError(f"Invalid amendment identity: {identity}")
-    branch = f"worktree/{identity}"
-    base = worktree_base(root, config)
-    base.mkdir(parents=True, exist_ok=True)
-    path = (base / identity).resolve()
-    if path.is_dir():
-        actual = run_native("git", ["-C", path, "branch", "--show-current"]).output.strip()
-        if actual != branch:
-            raise BraceError(f"Existing amendment worktree has branch {actual}.")
-        if run_native("git", ["-C", path, "status", "--porcelain", "--untracked-files=all"]).output.strip():
-            raise BraceError("Amendment worktree contains uncommitted changes.")
-        head = run_native("git", ["-C", path, "rev-parse", "HEAD"]).output.strip()
-        if expected_head and head != expected_head:
-            raise BraceError("Amendment worktree HEAD differs from its recorded result.")
-        if run_native("git", ["-C", path, "merge-base", "--is-ancestor", base_reference, head], allowed_exit_codes=(0, 1)).returncode != 0:
-            raise BraceError("Amendment branch does not descend from its recorded base.")
-        return path
-    exists = run_native("git", ["-C", root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], allowed_exit_codes=(0, 1)).returncode == 0
-    run_native("git", ["-C", root, "worktree", "add", *( ["--", path, branch] if exists else ["-b", branch, "--", path, base_reference] )])
-    return path
 
 
 def assert_amendment_commit(worktree: str | Path, base_sha: str, authorized_paths: list[str]) -> dict[str, Any]:
@@ -255,7 +223,7 @@ def invoke_pm_resolution(
         if not is_semantic_blocker(value):
             raise BraceError(f"Operational blocker requires correction, not a PM decision: {value['message']}")
         sequence = int(state["amendmentSequence"]) + 1
-        if sequence > maximum_amendment_rounds(config):
+        if sequence > config["maximumAmendmentRounds"]:
             raise BraceError(f"Semantic amendment limit exhausted at {sequence} attempts.")
         identity = f"AMEND-{sequence:04d}"
         state["amendmentSequence"] = sequence
@@ -278,7 +246,7 @@ def invoke_pm_resolution(
         known = [entry["pullRequest"]["mergeSha"] for entry in entries if (entry.get("pullRequest") or {}).get("mergeSha")]
         state["integrationSha"] = ensure_integration_branch(root, config, state, known)
         amendment["baseSha"] = state["integrationSha"]
-        amendment["worktree"] = str(new_amendment_worktree(root, config, identity, amendment["baseSha"]))
+        amendment["worktree"] = str(new_worktree(root, config, identity, amendment["branch"], amendment["baseSha"]))
         if analysis_path.exists():
             analysis = read_json(analysis_path, paths.schemas / "pm-blocker-result.schema.json")
         else:
@@ -323,7 +291,7 @@ def invoke_pm_resolution(
 
     result_path = attempt_path(paths, "result", identity, 1)
     if amendment["status"] in {"approved", "agent_active"}:
-        amendment["worktree"] = str(new_amendment_worktree(root, config, identity, amendment["baseSha"], amendment.get("resultSha")))
+        amendment["worktree"] = str(new_worktree(root, config, identity, amendment["branch"], amendment["baseSha"], amendment.get("resultSha")))
         amendment.update(attemptCount=1, status="agent_active")
         save_state(state, paths)
         assignment_path = attempt_path(paths, "assignment", identity, 1)

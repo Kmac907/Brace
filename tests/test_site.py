@@ -61,7 +61,3 @@ class SiteTests(unittest.TestCase):
             self.assertIn(f"@keyframes {animation}", styles)
         self.assertIn("@media (prefers-reduced-motion: reduce)", styles)
         self.assertIn("animation: none !important", styles)
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -4,15 +4,12 @@ import argparse
 import json
 import re
 import shutil
-import subprocess
-import tempfile
 from pathlib import Path
 from urllib.parse import unquote
-from uuid import uuid4
 
 from importlib.resources import files
 
-from .common import get_configuration, initialize_state_files, read_json
+from .common import get_configuration, initialize_state_files, read_json, run_native
 from .ui import ask, confirm, info, success, warning
 
 
@@ -24,30 +21,12 @@ def bundled_template() -> Path:
     return Path(str(files("brace").joinpath("resources", "template")))
 
 
-def probe(command: str, arguments: list[str], cwd: str | Path = ".") -> tuple[int, str]:
-    source = shutil.which(command)
-    if not source:
-        raise BootstrapError(f"Required command is unavailable: {command}")
-    process = subprocess.run([source, *arguments], cwd=str(Path(cwd).resolve()), capture_output=True, text=True, encoding="utf-8", errors="strict", check=False)
-    return process.returncode, (process.stdout + process.stderr).rstrip()
-
-
-def run(command: str, arguments: list[str], cwd: str | Path = ".", allowed: tuple[int, ...] = (0,)) -> str:
-    code, output = probe(command, arguments, cwd)
-    if code not in allowed:
-        raise BootstrapError(f"Command failed with exit code {code}: {command} {' '.join(arguments)}\n{output}")
-    return output
-
-
 def required(value: str | None, prompt: str) -> str:
     result = (value or ask(prompt)).strip()
     if not result:
         raise BootstrapError(f"{prompt} is required.")
     return result
 
-
-def existing_choice() -> bool:
-    return confirm("Is this an existing Git repository?", default=False)
 
 def add_section(path: Path, name: str, content: str) -> None:
     begin, end = f"# BEGIN {name}", f"# END {name}"
@@ -62,35 +41,32 @@ def existing_details(path: str) -> dict[str, str]:
     requested = Path(path).resolve()
     if not requested.is_dir():
         raise BootstrapError(f"Existing repository directory does not exist: {requested}")
-    root_code, root_result = probe("git", ["-C", str(requested), "rev-parse", "--show-toplevel"])
-    if root_code:
+    root_result = run_native("git", ["-C", requested, "rev-parse", "--show-toplevel"], allowed_exit_codes=(0, 1))
+    if root_result.returncode:
         raise BootstrapError(f"Path is not a Git repository: {requested}")
-    root = Path(root_result).resolve()
+    root = Path(root_result.output).resolve()
     if root != requested:
         info(f"Using repository root: {root}")
-    if run("git", ["-C", str(root), "status", "--porcelain", "--untracked-files=all"]).strip():
+    if run_native("git", ["-C", root, "status", "--porcelain", "--untracked-files=all"]).output.strip():
         raise BootstrapError(f"Existing repository worktree is not clean: {root}")
     if (root / ".codex").is_dir():
         raise BootstrapError(f"Existing repository already contains .codex; refusing to overwrite or duplicate a workflow installation: {root}")
-    branch = run("git", ["-C", str(root), "branch", "--show-current"]).strip()
+    branch = run_native("git", ["-C", root, "branch", "--show-current"]).output.strip()
     if not branch:
         raise BootstrapError("Existing repository must be checked out on a branch, not a detached HEAD.")
-    remote_url = run("git", ["-C", str(root), "config", "--get", "remote.origin.url"], allowed=(0, 1)).strip()
+    remote_url = run_native("git", ["-C", root, "config", "--get", "remote.origin.url"], allowed_exit_codes=(0, 1)).output.strip()
     if not remote_url:
         raise BootstrapError("Existing repository must have an origin remote.")
-    run("git", ["-C", str(root), "fetch", "origin", "--prune"])
-    remote_head_code, remote_head = probe("git", ["-C", str(root), "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
-    if remote_head_code not in {0, 1}:
-        raise BootstrapError("Unable to determine the origin default branch.")
-    target = re.sub(r"^origin/", "", remote_head.strip()) if remote_head_code == 0 and remote_head.strip() else branch
+    run_native("git", ["-C", root, "fetch", "origin", "--prune"])
+    remote_head = run_native("git", ["-C", root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], allowed_exit_codes=(0, 1))
+    target = re.sub(r"^origin/", "", remote_head.output.strip()) if remote_head.returncode == 0 and remote_head.output.strip() else branch
     if branch != target:
         raise BootstrapError(f"Existing repository must be checked out on its target branch '{target}'; current branch is '{branch}'.")
-    local_sha = run("git", ["-C", str(root), "rev-parse", "HEAD"]).strip()
-    remote_sha_code, remote_sha = probe("git", ["-C", str(root), "rev-parse", f"refs/remotes/origin/{target}"])
-    if remote_sha_code:
+    local_sha = run_native("git", ["-C", root, "rev-parse", "HEAD"]).output.strip()
+    remote_sha = run_native("git", ["-C", root, "rev-parse", f"refs/remotes/origin/{target}"], allowed_exit_codes=(0, 1))
+    if remote_sha.returncode:
         raise BootstrapError(f"Origin does not contain target branch '{target}'.")
-    remote_sha = remote_sha.strip()
-    if local_sha != remote_sha:
+    if local_sha != remote_sha.output.strip():
         raise BootstrapError(f"Local {target} must exactly match origin/{target} before installation.")
 
     normalized = re.sub(r"\.git$", "", remote_url.strip())
@@ -108,9 +84,9 @@ def existing_details(path: str) -> dict[str, str]:
 
 def copy_template(template: Path, target: Path, existing: bool) -> None:
     if not existing:
-        shutil.copytree(template, target, dirs_exist_ok=True, ignore=shutil.ignore_patterns("scripts", "requirements.txt"))
+        shutil.copytree(template, target, dirs_exist_ok=True)
         return
-    shutil.copytree(template / ".codex", target / ".codex", ignore=shutil.ignore_patterns("scripts", "requirements.txt"))
+    shutil.copytree(template / ".codex", target / ".codex")
     for name in ("requirements.md", "REQUIREMENTS-PROMPT.md"):
         destination = target / name
         if destination.exists():
@@ -130,7 +106,7 @@ def bootstrap(args: argparse.Namespace) -> None:
     use_existing = bool(args.existing_repository_path)
     if use_existing and (args.project_name or args.parent_directory):
         raise BootstrapError("Existing repository path cannot be combined with project name or parent directory.")
-    if not use_existing and not args.project_name and not args.parent_directory and existing_choice():
+    if not use_existing and not args.project_name and not args.parent_directory and confirm("Is this an existing Git repository?", default=False):
         use_existing = True
         args.existing_repository_path = ask("Existing repository path", default=str(Path.cwd())).strip()
 
@@ -170,42 +146,29 @@ def bootstrap(args: argparse.Namespace) -> None:
         target.mkdir(parents=True, exist_ok=True)
 
     if args.provider == "github":
-        run("gh", ["auth", "status"])
+        run_native("gh", ["auth", "status"])
         if not use_existing:
-            args.github_owner = args.github_owner or run("gh", ["api", "user", "--jq", ".login"]).strip()
+            args.github_owner = args.github_owner or run_native("gh", ["api", "user", "--jq", ".login"]).output.strip()
             identity = f"{args.github_owner}/{args.project_name}"
-            code, _ = probe("gh", ["repo", "view", identity, "--json", "nameWithOwner"])
-            if code == 0:
+            existing = run_native("gh", ["repo", "view", identity, "--json", "nameWithOwner"], allowed_exit_codes=None)
+            if existing.returncode == 0:
                 raise BootstrapError(f"GitHub repository already exists: {identity}")
-            if code != 1:
+            if existing.returncode != 1:
                 raise BootstrapError("Unable to check whether the GitHub repository already exists.")
     else:
-        run("az", ["account", "show", "--output", "none"])
-        run("az", ["extension", "show", "--name", "azure-devops", "--output", "none"])
+        run_native("az", ["account", "show", "--output", "none"])
+        run_native("az", ["extension", "show", "--name", "azure-devops", "--output", "none"])
         if not use_existing:
             args.azure_organization = required(args.azure_organization, "Azure DevOps organization URL")
             args.azure_project = required(args.azure_project, "Azure DevOps project")
             identity = f"{args.azure_organization}|{args.azure_project}|{args.project_name}"
-            code, _ = probe("az", ["repos", "show", "--organization", args.azure_organization, "--project", args.azure_project, "--repository", args.project_name, "--output", "none"])
-            if code == 0:
+            existing = run_native("az", ["repos", "show", "--organization", args.azure_organization, "--project", args.azure_project, "--repository", args.project_name, "--output", "none"], allowed_exit_codes=None)
+            if existing.returncode == 0:
                 raise BootstrapError(f"Azure DevOps repository already exists: {args.project_name}")
 
-    temporary = None
     succeeded = False
     try:
-        if args.source_repository:
-            temporary = Path(tempfile.gettempdir()) / f"brace-bootstrap-{uuid4().hex}"
-            source = temporary / "source"
-            temporary.mkdir()
-            run("git", ["clone", "--depth", "1", "--", args.source_repository, str(source)])
-            template = source / "template"
-            if not template.is_dir():
-                template = source / "src" / "brace" / "resources" / "template"
-            if not template.is_dir():
-                raise BootstrapError(f"Source repository has no template directory: {args.source_repository}")
-        else:
-            template = bundled_template()
-        copy_template(template, target, use_existing)
+        copy_template(bundled_template(), target, use_existing)
         workflow_path = target / ".codex" / "workflow.json"
         workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
         workflow.update(provider=args.provider, targetBranch=target_branch, maximumConcurrentBuilders=args.maximum_concurrent_builders, maximumConcurrentFixers=args.maximum_concurrent_fixers, worktreeRoot=str(Path(args.worktree_root).resolve()) if args.worktree_root else None)
@@ -216,39 +179,39 @@ def bootstrap(args: argparse.Namespace) -> None:
         workflow_path.write_text(json.dumps(workflow, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
 
         if not use_existing:
-            run("git", ["init", "-b", target_branch], target)
+            run_native("git", ["init", "-b", target_branch], target)
         if args.git_user_name:
-            run("git", ["config", "user.name", args.git_user_name.strip()], target)
+            run_native("git", ["config", "user.name", args.git_user_name.strip()], target)
         if args.git_user_email:
-            run("git", ["config", "user.email", args.git_user_email.strip()], target)
-        if not run("git", ["config", "user.name"], target, (0, 1)).strip() or not run("git", ["config", "user.email"], target, (0, 1)).strip():
+            run_native("git", ["config", "user.email", args.git_user_email.strip()], target)
+        if not run_native("git", ["config", "user.name"], target, allowed_exit_codes=(0, 1)).output.strip() or not run_native("git", ["config", "user.email"], target, allowed_exit_codes=(0, 1)).output.strip():
             raise BootstrapError("Git user.name and user.email must be configured before bootstrap.")
 
-        run("git", ["add", "--force", "--", ".codex"], target)
-        run("git", ["add", "--", ".gitignore", ".gitattributes", "AGENTS.md", "requirements.md", "REQUIREMENTS-PROMPT.md"], target)
-        staged = [line for line in run("git", ["diff", "--cached", "--name-only"], target).splitlines() if line]
+        run_native("git", ["add", "--force", "--", ".codex"], target)
+        run_native("git", ["add", "--", ".gitignore", ".gitattributes", "AGENTS.md", "requirements.md", "REQUIREMENTS-PROMPT.md"], target)
+        staged = [line for line in run_native("git", ["diff", "--cached", "--name-only"], target).lines if line]
         unexpected = [path for path in staged if not re.match(r"^(\.codex/|\.gitignore$|\.gitattributes$|AGENTS\.md$|requirements\.md$|REQUIREMENTS-PROMPT\.md$)", path)]
         if unexpected:
             raise BootstrapError("Bootstrap staged unexpected paths: " + ", ".join(unexpected))
         if not staged or ".codex/workflow.json" not in staged:
             raise BootstrapError("Bootstrap did not stage the required workflow payload.")
         info("FILES TO COMMIT:\n  " + "\n  ".join(staged))
-        run("git", ["commit", "-m", "Install Brace workflow" if use_existing else "Initialize Brace project"], target)
+        run_native("git", ["commit", "-m", "Install Brace workflow" if use_existing else "Initialize Brace project"], target)
 
         if use_existing:
-            run("git", ["push", "origin", target_branch], target)
+            run_native("git", ["push", "origin", target_branch], target)
         elif args.provider == "github":
-            run("gh", ["repo", "create", identity, f"--{args.visibility}", "--source", str(target), "--remote", "origin", "--push"], target)
+            run_native("gh", ["repo", "create", identity, f"--{args.visibility}", "--source", target, "--remote", "origin", "--push"], target)
         else:
-            created = json.loads(run("az", ["repos", "create", "--organization", args.azure_organization, "--project", args.azure_project, "--name", args.project_name, "--output", "json"]))
+            created = json.loads(run_native("az", ["repos", "create", "--organization", args.azure_organization, "--project", args.azure_project, "--name", args.project_name, "--output", "json"]).output)
             if not created.get("remoteUrl"):
                 raise BootstrapError("Azure DevOps did not return a repository remote URL.")
-            run("git", ["remote", "add", "origin", created["remoteUrl"]], target)
-            run("git", ["push", "--set-upstream", "origin", target_branch], target)
+            run_native("git", ["remote", "add", "origin", created["remoteUrl"]], target)
+            run_native("git", ["push", "--set-upstream", "origin", target_branch], target)
 
-        run("git", ["fetch", "origin"], target)
-        local_sha = run("git", ["rev-parse", "HEAD"], target).strip()
-        if local_sha != run("git", ["rev-parse", f"origin/{target_branch}"], target).strip():
+        run_native("git", ["fetch", "origin"], target)
+        local_sha = run_native("git", ["rev-parse", "HEAD"], target).output.strip()
+        if local_sha != run_native("git", ["rev-parse", f"origin/{target_branch}"], target).output.strip():
             raise BootstrapError(f"Remote {target_branch} does not match the bootstrap commit.")
         paths = initialize_state_files(target, get_configuration(target))
         state = read_json(paths.state, paths.schemas / "state.schema.json")
@@ -257,19 +220,11 @@ def bootstrap(args: argparse.Namespace) -> None:
         succeeded = True
         success(f"\n{'BRACE INSTALLED' if use_existing else 'BRACE PROJECT CREATED'}\nPROJECT:      {target}\nREMOTE:       {identity}\nTARGET:       {target_branch}\nINITIAL SHA:  {local_sha}\nNEXT:         Complete requirements.md, then run brace plan.")
     finally:
-        if temporary is not None and succeeded:
-            expected_parent = Path(tempfile.gettempdir()).resolve()
-            resolved = temporary.resolve()
-            if resolved.parent != expected_parent or not re.fullmatch(r"brace-bootstrap-[0-9a-f]{32}", resolved.name):
-                raise BootstrapError(f"Refusing to remove unexpected temporary directory: {resolved}")
-            shutil.rmtree(resolved)
-        elif not succeeded:
+        if not succeeded:
             warning(f"Bootstrap failed. The destination was preserved: {target}")
-            if temporary is not None:
-                warning(f"Temporary source clone was preserved for diagnosis: {temporary}")
+
 
 def add_arguments(result: argparse.ArgumentParser) -> None:
-    result.add_argument("--source-repository")
     result.add_argument("--existing-repository-path")
     result.add_argument("--project-name")
     result.add_argument("--parent-directory")

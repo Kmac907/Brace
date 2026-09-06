@@ -54,6 +54,7 @@ class CoreTests(RepositoryTestCase):
             project_manager.assert_pm_analysis(analysis, {"tasks": [self.task()]}, None, "build")
 
     def test_native_timeout_is_bounded(self) -> None:
+        self.assertEqual(common.run_native(sys.executable, ["-c", "raise SystemExit(7)"], allowed_exit_codes=None).returncode, 7)
         started = time.monotonic()
         with self.assertRaisesRegex(common.BraceError, "deadline"):
             common.run_native(sys.executable, ["-c", "import time; time.sleep(30)"], timeout_seconds=1)
@@ -68,8 +69,19 @@ class CoreTests(RepositoryTestCase):
         invalid = dict(state, stage="impossible")
         with self.assertRaises(common.BraceError):
             common.write_json_atomic(paths.state.with_name("invalid.json"), invalid, paths.schemas / "state.schema.json")
+        sha = "a" * 40
+        blocker = dict(project_manager.structured_blocker("scope changed", "build", "TASK-0001"), kind="scope_gap", requiresUserDecision=True, scopeChangePossible=True)
+        state.update(amendmentSequence=1, activeAmendment={
+            "amendmentId": "AMEND-0001", "sourceStage": "build", "sourceKind": "task", "sourceIdentity": "TASK-0001",
+            "status": "submitted", "blocker": blocker, "analysisResultPath": "analysis.json", "selectedOptionId": "OPTION-0001",
+            "userResponse": "approve", "decisionIdentity": "sha256:" + "b" * 64, "authorizedDocumentationPaths": ["requirements.md", "plan.md"],
+            "branch": "worktree/AMEND-0001", "worktree": "worktree", "baseSha": sha, "resultSha": sha,
+            "pullRequest": {"id": "1", "url": "https://example.invalid/1", "state": "open", "repository": "owner/repo", "head": "worktree/AMEND-0001", "headSha": sha, "base": "brace/integration", "baseSha": sha, "mergeSha": None},
+            "affectedTaskIds": ["TASK-0001"], "affectedBugIds": [], "resumeStage": "build", "attemptCount": 1,
+        })
+        common.write_json_atomic(paths.state.with_name("referenced.json"), state, paths.schemas / "state.schema.json")
 
-    def test_worktree_commit_scope(self) -> None:
+    def test_worktree_commit_scope_and_amendment_identity(self) -> None:
         root, _, config = self.make_repository()
         base = self.git(root, "rev-parse", "HEAD")
         task = self.task(paths=["src/**"])
@@ -81,6 +93,9 @@ class CoreTests(RepositoryTestCase):
         result = common.assert_assignment_commit(path, base, task)
         self.assertRegex(result["Head"], r"^[0-9a-f]{40,64}$")
         common.remove_worktree(root, config, "TASK-0001", "worktree/TASK-0001")
+        amendment = common.new_worktree(root, config, "AMEND-0001", "worktree/AMEND-0001", base)
+        self.assertEqual(self.git(amendment, "branch", "--show-current"), "worktree/AMEND-0001")
+        common.remove_worktree(root, config, "AMEND-0001", "worktree/AMEND-0001")
 
     def test_unknown_integration_commit_is_rejected(self) -> None:
         root, remote, config = self.make_repository()
@@ -99,7 +114,3 @@ class CoreTests(RepositoryTestCase):
         self.git(clone, "push", "origin", "brace/integration")
         with self.assertRaisesRegex(common.BraceError, "unowned commits"):
             common.ensure_integration_branch(root, config, state)
-
-
-if __name__ == "__main__":
-    unittest.main()
