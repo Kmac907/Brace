@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 import time
@@ -12,6 +14,14 @@ from support import RepositoryTestCase
 
 
 class CoreTests(RepositoryTestCase):
+    @staticmethod
+    def schema_keys(value: object) -> set[str]:
+        if isinstance(value, dict):
+            return set(value) | set().union(*(CoreTests.schema_keys(item) for item in value.values()))
+        if isinstance(value, list):
+            return set().union(*(CoreTests.schema_keys(item) for item in value))
+        return set()
+
     def test_graph_and_coverage(self) -> None:
         first, second = self.task(), self.task("TASK-0002", ["TASK-0001"])
         common.assert_graph([first, second], "task")
@@ -59,6 +69,82 @@ class CoreTests(RepositoryTestCase):
         with self.assertRaisesRegex(common.BraceError, "deadline"):
             common.run_native(sys.executable, ["-c", "import time; time.sleep(30)"], timeout_seconds=1)
         self.assertLess(time.monotonic() - started, 8)
+
+    def test_output_schema_projection_supports_bundled_results(self) -> None:
+        root, _, config = self.make_repository()
+        schemas = common.initialize_state_files(root, config).schemas
+        projected = {path.name: common._project_output_schema(path) for path in sorted(schemas.glob("*-result.schema.json"))}
+        self.assertEqual(set(projected), {
+            "audit-result.schema.json", "builder-result.schema.json", "fixer-result.schema.json",
+            "planning-result.schema.json", "pm-amendment-result.schema.json",
+            "pm-blocker-result.schema.json", "verifier-result.schema.json",
+        })
+        self.assertNotIn("uniqueItems", self.schema_keys(projected["planning-result.schema.json"]))
+        for name in ("audit-result.schema.json", "builder-result.schema.json", "fixer-result.schema.json", "verifier-result.schema.json"):
+            self.assertTrue(self.schema_keys(projected[name]).isdisjoint({"allOf", "if", "then", "else"}))
+        blocker = projected["builder-result.schema.json"]["properties"]["blocker"]
+        self.assertIn("anyOf", blocker)
+        self.assertTrue(self.schema_keys(blocker).isdisjoint({"$schema", "$defs"}))
+        self.assertNotIn("oneOf", self.schema_keys(blocker))
+        self.assertNotIn("blocker.schema.json", json.dumps(projected["builder-result.schema.json"]))
+        self.assertEqual(projected["pm-amendment-result.schema.json"]["properties"]["newTasks"]["items"]["$ref"], "#/$defs/task")
+
+    def test_output_schema_projection_rejects_unsafe_references_before_launch(self) -> None:
+        schema_directory = self.base / "schemas"
+        schema_directory.mkdir()
+        (self.base / "outside.json").write_text("{}", encoding="utf-8")
+        for reference, error in (("https://example.invalid/schema.json", "Remote"), ("../outside.json", "leaves"), ("missing.json", "does not exist")):
+            schema = schema_directory / "result.schema.json"
+            schema.write_text(json.dumps({
+                "type": "object", "required": ["value"],
+                "properties": {"value": {"$ref": reference}}, "additionalProperties": False,
+            }), encoding="utf-8")
+            with self.subTest(reference=reference), patch.object(common.subprocess, "Popen") as process:
+                with self.assertRaisesRegex(common.BraceError, error):
+                    common.invoke_codex("prompt", self.base, schema, "read-only", self.base / "logs")
+                process.assert_not_called()
+
+    def test_invoke_codex_uses_temporary_projection_and_full_local_validation(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        schema_path = paths.schemas / "planning-result.schema.json"
+        result = {
+            "status": "complete", "questions": [], "normalizedRequirementsMarkdown": "requirements",
+            "planMarkdown": "plan", "tasks": [],
+            "summary": {"requirementsCount": 1, "taskCount": 0, "parallelizableTaskCount": 0,
+                        "assumptions": [], "deferredScope": [], "deferredRequirementIds": []},
+        }
+        outcomes = [result, result | {"summary": result["summary"] | {"deferredRequirementIds": ["REQ-ONE", "REQ-ONE"]}}]
+        captured: list[tuple[Path, dict]] = []
+
+        class Process:
+            returncode = 0
+
+            def __init__(self, command: list[str], **_: object):
+                self.command = command
+
+            def communicate(self, _: str, timeout: int) -> tuple[str, str]:
+                self.assert_timeout = timeout
+                projected_path = Path(self.command[self.command.index("--output-schema") + 1])
+                captured.append((projected_path, common.read_json(projected_path)))
+                result_path = Path(self.command[self.command.index("--output-last-message") + 1])
+                result_path.write_text(json.dumps(outcomes.pop(0)), encoding="utf-8")
+                return "", ""
+
+        executable_directory = self.base / "bin"
+        executable_directory.mkdir()
+        executable = executable_directory / ("codex.cmd" if os.name == "nt" else "codex")
+        executable.write_text("", encoding="utf-8")
+        executable.chmod(0o755)
+        environment = {"PATH": str(executable_directory) + os.pathsep + os.environ.get("PATH", "")}
+        with patch.dict(os.environ, environment), patch.object(common.subprocess, "Popen", Process):
+            self.assertEqual(common.invoke_codex("prompt", root, schema_path, "read-only", paths.logs), result)
+            self.assertFalse(captured[0][0].exists())
+            self.assertNotEqual(captured[0][0], schema_path.resolve())
+            self.assertNotIn("uniqueItems", self.schema_keys(captured[0][1]))
+            with self.assertRaisesRegex(common.BraceError, "unique"):
+                common.invoke_codex("prompt", root, schema_path, "read-only", paths.logs)
+            self.assertFalse(captured[1][0].exists())
 
     def test_state_creation_and_schema_validation(self) -> None:
         root, _, config = self.make_repository()

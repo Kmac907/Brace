@@ -15,6 +15,7 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 MAXIMUM_RESULT_BYTES = 1024 * 1024
 MAXIMUM_LOG_BYTES = 2 * 1024 * 1024
@@ -909,32 +910,149 @@ def remove_merged_assignment(root: str | Path, config: dict[str, Any], identity:
         run_native("git", ["-C", root, "push", config["remote"], "--delete", branch])
 
 
+def _project_output_schema(schema_path: str | Path) -> dict[str, Any]:
+    path = Path(schema_path).resolve()
+    schema_directory = path.parent
+    documents: dict[Path, Any] = {}
+    unsupported = {"uniqueItems", "allOf", "not", "dependentRequired", "dependentSchemas", "if", "then", "else"}
+
+    def load(document_path: Path) -> Any:
+        if document_path not in documents:
+            documents[document_path] = read_json(document_path)
+        return documents[document_path]
+
+    def pointer(document: Any, fragment: str, reference: str) -> Any:
+        if not fragment:
+            return document
+        if not fragment.startswith("/"):
+            raise BraceError(f"Unsupported JSON schema reference fragment: {reference}")
+        value = document
+        try:
+            for part in fragment[1:].split("/"):
+                part = unquote(part).replace("~1", "/").replace("~0", "~")
+                value = value[int(part)] if isinstance(value, list) else value[part]
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise BraceError(f"Unresolved JSON schema reference: {reference}") from exc
+        return value
+
+    def project(value: Any, document_path: Path, preserve_internal: bool, resolving: frozenset[tuple[Path, str]]) -> Any:
+        if not isinstance(value, dict):
+            return value
+        if "$ref" in value:
+            reference = value["$ref"]
+            if not isinstance(reference, str):
+                raise BraceError("JSON schema references must be strings.")
+            parsed = urlsplit(reference)
+            if parsed.scheme or parsed.netloc or parsed.query:
+                raise BraceError(f"Remote JSON schema reference is not allowed: {reference}")
+            if not parsed.path:
+                if not preserve_internal:
+                    target_path = document_path
+            else:
+                reference_path = Path(unquote(parsed.path))
+                if reference_path.is_absolute():
+                    raise BraceError(f"JSON schema reference leaves the schema directory: {reference}")
+                target_path = (document_path.parent / reference_path).resolve()
+                if not target_path.is_relative_to(schema_directory):
+                    raise BraceError(f"JSON schema reference leaves the schema directory: {reference}")
+            if parsed.path or not preserve_internal:
+                if len(value) != 1:
+                    raise BraceError(f"External JSON schema references cannot have sibling constraints: {reference}")
+                key = (target_path, parsed.fragment)
+                if key in resolving:
+                    raise BraceError(f"Recursive external JSON schema reference is not supported: {reference}")
+                target = pointer(load(target_path), parsed.fragment, reference)
+                return project(target, target_path, False, resolving | {key})
+        result = {}
+        for key, item in value.items():
+            if key in unsupported or not preserve_internal and key in {"$schema", "$defs"}:
+                continue
+            projected_key = "anyOf" if key == "oneOf" else key
+            if key in {"properties", "$defs", "patternProperties"} and isinstance(item, dict):
+                result[projected_key] = {name: project(schema, document_path, preserve_internal, resolving) for name, schema in item.items()}
+            elif key in {"oneOf", "anyOf", "prefixItems"} and isinstance(item, list):
+                result[projected_key] = [project(schema, document_path, preserve_internal, resolving) for schema in item]
+            elif key in {"items", "contains", "propertyNames", "additionalProperties"} and isinstance(item, dict):
+                result[projected_key] = project(item, document_path, preserve_internal, resolving)
+            else:
+                result[projected_key] = item
+        return result
+
+    projected = project(load(path), path, True, frozenset())
+    if not isinstance(projected, dict) or projected.get("type") != "object":
+        raise BraceError("Codex output schema root must be an object.")
+
+    def verify(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                verify(item)
+            return
+        if not isinstance(value, dict):
+            return
+        schema_type = value.get("type")
+        if schema_type == "object" or isinstance(schema_type, list) and "object" in schema_type:
+            properties = value.get("properties", {})
+            required = value.get("required", [])
+            if not isinstance(properties, dict) or not isinstance(required, list) or not set(properties).issubset(required):
+                raise BraceError("Every Codex output schema object property must be required.")
+            if value.get("additionalProperties") is not False:
+                raise BraceError("Every Codex output schema object must set additionalProperties to false.")
+        reference = value.get("$ref")
+        if reference is not None:
+            if not isinstance(reference, str) or not reference.startswith("#"):
+                raise BraceError(f"External JSON schema reference remains after projection: {reference}")
+            pointer(projected, reference[1:], reference)
+        for key in ("properties", "$defs", "patternProperties"):
+            if isinstance(value.get(key), dict):
+                for item in value[key].values():
+                    verify(item)
+        for key in ("oneOf", "anyOf", "prefixItems"):
+            if isinstance(value.get(key), list):
+                for item in value[key]:
+                    verify(item)
+        for key in ("items", "contains", "propertyNames", "additionalProperties"):
+            if isinstance(value.get(key), dict):
+                verify(value[key])
+
+    verify(projected)
+    return projected
+
+
 def invoke_codex(prompt: str, cwd: str | Path, schema_path: str | Path, sandbox: str, log_directory: str | Path, identity: str = "agent", timeout_minutes: int = 90, cleanup_grace_seconds: int = 10, timeout_seconds: int = 0) -> dict[str, Any]:
     token, safe_identity = uuid.uuid4().hex, re.sub(r"[^A-Za-z0-9_.-]", "_", identity)
     log_directory = Path(log_directory)
     log_directory.mkdir(parents=True, exist_ok=True)
     result_path = log_directory / f"{safe_identity}-{token}.result.json"
     log_path = log_directory / f"{safe_identity}-{token}.log"
-    command = _command_line("codex", ["exec", "--ephemeral", "--color", "never", "--sandbox", sandbox, "--output-schema", str(Path(schema_path).resolve()), "--output-last-message", str(result_path), "-"])
-    process = subprocess.Popen(command, cwd=str(Path(cwd).resolve()), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="strict", **_popen_options())
-    timeout = timeout_seconds or timeout_minutes * 60
+    projected_schema = _project_output_schema(schema_path)
+    temporary_schema: Path | None = None
     try:
-        stdout, stderr = process.communicate(prompt, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        _terminate_tree(process, cleanup_grace_seconds)
-        raise BraceError(f"Codex exceeded the {timeout_minutes}-minute deadline; its process tree was terminated.") from exc
-    output = stdout + os.linesep + stderr
-    if len(output.encode("utf-8")) > MAXIMUM_LOG_BYTES:
-        encoded = output.encode("utf-8")[:MAXIMUM_LOG_BYTES]
-        output = encoded.decode("utf-8", errors="ignore") + "\n[log truncated]"
-    write_text_atomic(log_path, output)
-    if process.returncode != 0:
-        raise BraceError(f"Codex exited with code {process.returncode}. Log: {log_path}")
-    if not result_path.is_file():
-        raise BraceError(f"Codex did not create its final result. Log: {log_path}")
-    if result_path.stat().st_size > MAXIMUM_RESULT_BYTES:
-        raise BraceError(f"Codex result exceeded 1 MiB: {result_path}")
-    return read_json(result_path, schema_path)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".schema.json", prefix=f"{safe_identity}-", dir=log_directory, delete=False) as handle:
+            temporary_schema = Path(handle.name).resolve()
+            json.dump(projected_schema, handle, ensure_ascii=False)
+        command = _command_line("codex", ["exec", "--ephemeral", "--color", "never", "--sandbox", sandbox, "--output-schema", str(temporary_schema), "--output-last-message", str(result_path), "-"])
+        process = subprocess.Popen(command, cwd=str(Path(cwd).resolve()), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="strict", **_popen_options())
+        timeout = timeout_seconds or timeout_minutes * 60
+        try:
+            stdout, stderr = process.communicate(prompt, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            _terminate_tree(process, cleanup_grace_seconds)
+            raise BraceError(f"Codex exceeded the {timeout_minutes}-minute deadline; its process tree was terminated.") from exc
+        output = stdout + os.linesep + stderr
+        if len(output.encode("utf-8")) > MAXIMUM_LOG_BYTES:
+            encoded = output.encode("utf-8")[:MAXIMUM_LOG_BYTES]
+            output = encoded.decode("utf-8", errors="ignore") + "\n[log truncated]"
+        write_text_atomic(log_path, output)
+        if process.returncode != 0:
+            raise BraceError(f"Codex exited with code {process.returncode}. Log: {log_path}")
+        if not result_path.is_file():
+            raise BraceError(f"Codex did not create its final result. Log: {log_path}")
+        if result_path.stat().st_size > MAXIMUM_RESULT_BYTES:
+            raise BraceError(f"Codex result exceeded 1 MiB: {result_path}")
+        return read_json(result_path, schema_path)
+    finally:
+        if temporary_schema is not None:
+            temporary_schema.unlink(missing_ok=True)
 
 
 def invoke_role(root: str | Path, cwd: str | Path, role: str, context: str, schema_name: str, sandbox: str) -> dict[str, Any]:
