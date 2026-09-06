@@ -330,7 +330,7 @@ def invoke_pm_resolution(
     superseded = set(result["supersededTaskIds"])
     prior_tasks = [task for task in tasks["tasks"] if task.get("amendmentId") != identity or task["taskId"] in superseded]
     expected = max((int(task["taskId"][5:]) for task in prior_tasks), default=0) + 1
-    canonicalize_graph_identities(result["newTasks"], "task", expected, (task["taskId"] for task in prior_tasks))
+    mapping = canonicalize_graph_identities(result["newTasks"], "task", expected, (task["taskId"] for task in prior_tasks))
     if amendment["status"] == "result_ready":
         commit = assert_amendment_commit(amendment["worktree"], amendment["baseSha"], amendment["authorizedDocumentationPaths"])
         assert_pm_result_identity(result, amendment, commit)
@@ -356,8 +356,7 @@ def invoke_pm_resolution(
         candidate = tasks["tasks"] + [persisted_task(task, identity) for task in result["newTasks"]]
         assert_graph(candidate, "task")
         plan = read_git_text(amendment["worktree"], commit["Head"], "plan.md")
-        if normalize_task_references(plan, {}, (task["taskId"] for task in candidate)) != plan:
-            raise BraceError("Committed plan.md contains noncanonical task references.")
+        normalize_task_references(plan, mapping, (task["taskId"] for task in candidate))
         for task in candidate:
             if task["taskId"] not in superseded and superseded.intersection(task["dependencies"]):
                 raise BraceError(f"{task['taskId']} depends on a superseded task.")
