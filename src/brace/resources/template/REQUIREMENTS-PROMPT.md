@@ -15,7 +15,7 @@ INSTRUCTIONS
 6. Record non-blocking unknowns under "Open questions" and continue instead of asking about them.
 7. Do not create a question file or require me to edit JSON.
 8. Once any necessary questions are answered, rewrite requirements.md completely.
-9. Do not create plan.md, tasks.json, state.json, or implementation code. This task is only for requirements.md.
+9. During this requirements-authoring task, do not create plan.md, tasks.json, state.json, or implementation code. This is an authoring boundary only; do not emit it as a `REQ-*` project requirement.
 
 REQUIREMENT-WRITING RULES
 
