@@ -17,6 +17,7 @@ from .common import (
     assert_state_identity,
     assert_target_drift,
     attempt_path,
+    canonicalize_graph_identities,
     complete_pull_request,
     definition_hash,
     ensure_integration_branch,
@@ -205,6 +206,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 if unchanged != state["integrationSha"]:
                     raise BraceError("Integration changed while the deep audit was running.")
                 if audit_result["bugs"]:
+                    canonicalize_graph_identities(audit_result["bugs"], "bug")
                     assert_graph(audit_result["bugs"], "bug")
                 persisted = [persisted_bug(bug) for bug in audit_result["bugs"]]
                 bug_hash = definition_hash(persisted, "bug")
