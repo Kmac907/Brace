@@ -99,6 +99,7 @@ class CliTests(unittest.TestCase):
         workflows = Path(__file__).resolve().parents[1] / ".github" / "workflows"
         self.assertFalse((workflows / "package.yml").exists())
         workflow = (workflows / "release.yml").read_text(encoding="utf-8")
+        lines = [line.strip() for line in workflow.splitlines()]
         for required in (
             "workflow_dispatch:",
             "          - patch\n          - minor\n          - major",
@@ -109,11 +110,13 @@ class CliTests(unittest.TestCase):
             'git commit -m "Release v${VERSION}"',
             'git tag -a "v${VERSION}" -m "Brace v${VERSION}"',
             'git push --atomic origin HEAD:main "refs/tags/v${VERSION}"',
-            'gh release create "v${VERSION}" dist/*',
-            "--verify-tag",
         ):
             self.assertIn(required, workflow)
-        self.assertEqual(workflow.count("uv build"), 1)
+        self.assertEqual(lines.count("run: uv build"), 1)
+        self.assertIn(
+            'run: gh release create "v${VERSION}" dist/* --verify-tag --generate-notes --title "Brace v${VERSION}"',
+            lines,
+        )
 
     def test_bundled_template_is_complete_and_has_no_scripts(self) -> None:
         template = bootstrap.bundled_template()
