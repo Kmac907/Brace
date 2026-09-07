@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -204,6 +205,89 @@ class WorkflowTests(RepositoryTestCase):
         self.assertTrue(paths.build_summary.is_file())
         self.assertTrue(paths.audit_summary.is_file())
         self.assertFalse(Path(config["worktreeRoot"]).exists())
+
+    def test_build_status_covers_success_and_exceptions(self) -> None:
+        root, _, _ = self.prepare()
+        self.plan(root)
+        active: list[str] = []
+        events: list[tuple[str, str]] = []
+        assignment_calls = 0
+        verification_calls = 0
+
+        @contextmanager
+        def recording_status(message: str):
+            active.append(message)
+            events.append(("enter", message))
+            try:
+                yield
+            finally:
+                self.assertEqual(active.pop(), message)
+                events.append(("exit", message))
+
+        def fake_assignment(repository, worktree, item, kind, paths):
+            nonlocal assignment_calls
+            assignment_calls += 1
+            self.assertEqual(active, ["Building TASK-0001"])
+            if assignment_calls == 1:
+                raise RuntimeError("builder failed")
+            target = Path(worktree) / "src" / "product.txt"
+            target.parent.mkdir(exist_ok=True)
+            target.write_text(f"attempt {item['attemptCount']}\n", encoding="utf-8")
+            self.git(Path(worktree), "add", "src/product.txt")
+            self.git(Path(worktree), "commit", "-m", f"attempt {item['attemptCount']}")
+            head = self.git(Path(worktree), "rev-parse", "HEAD")
+            result = {"status": "completed", "summary": "implemented", "commitSha": head, "filesChanged": ["src/product.txt"], "checks": [], "blocker": None}
+            record = {"schemaVersion": "1.0", "identity": item["taskId"], "attempt": item["attemptCount"], "succeeded": True, "result": result, "error": None, "completedAt": common.utc_now()}
+            common.write_immutable_json(common.attempt_path(paths, "result", item["taskId"], item["attemptCount"]), record)
+            return record
+
+        verifier = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
+
+        def fake_verifier(repository, worktree, role, context, schema, sandbox):
+            nonlocal verification_calls
+            if context.startswith("Verify only this task"):
+                verification_calls += 1
+                self.assertEqual(active, [f"Verifying TASK-0001 (attempt {verification_calls + 1})"])
+                if verification_calls == 1:
+                    raise RuntimeError("verifier failed")
+            return verifier
+
+        def fake_publish(repository, worktree, configuration, item, kind):
+            base = self.git(root, "rev-parse", f"origin/{configuration['integrationBranch']}")
+            self.git(root, "push", "origin", f"{item['resultSha']}:refs/heads/{configuration['integrationBranch']}")
+            return {
+                "id": "1", "url": "https://example.invalid/1", "state": "merged", "repository": "owner/repo",
+                "head": item["branch"], "headSha": item["resultSha"], "base": configuration["integrationBranch"],
+                "baseSha": base, "mergeSha": item["resultSha"],
+            }
+
+        with (
+            patch.object(build_loop, "assert_prerequisites"),
+            patch.object(build_loop, "status", side_effect=recording_status),
+            patch.object(build_loop, "run_assignment", side_effect=fake_assignment),
+            patch.object(build_loop, "invoke_role", side_effect=fake_verifier),
+            patch.object(build_loop, "publish_assignment", side_effect=fake_publish),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "builder failed"):
+                build_loop.run(root)
+            self.assertEqual(active, [])
+            self.assertEqual(build_loop.run(root), "audit")
+
+        self.assertEqual(active, [])
+        self.assertEqual(events, [
+            ("enter", "Building TASK-0001"),
+            ("exit", "Building TASK-0001"),
+            ("enter", "Building TASK-0001"),
+            ("exit", "Building TASK-0001"),
+            ("enter", "Verifying TASK-0001 (attempt 2)"),
+            ("exit", "Verifying TASK-0001 (attempt 2)"),
+            ("enter", "Building TASK-0001"),
+            ("exit", "Building TASK-0001"),
+            ("enter", "Verifying TASK-0001 (attempt 3)"),
+            ("exit", "Verifying TASK-0001 (attempt 3)"),
+            ("enter", "Running integration verification"),
+            ("exit", "Running integration verification"),
+        ])
 
     def test_rejected_task_and_bug_are_retried_from_their_base(self) -> None:
         root, _, config = self.prepare()

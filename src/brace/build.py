@@ -186,8 +186,8 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                             raise BraceError("Builder result commit SHA does not match the worktree HEAD.")
                         task["resultSha"] = commit["Head"]
                         save_ledger(tasks, paths)
-                        info(f"VERIFYING TASK: {task['taskId']} attempt {task['attemptCount']}")
-                        verification = invoke_role(root, task["worktree"], "verifier", f"Verify only this task:\n{pretty_json(task)}\nBuilder result:\n{pretty_json(result)}", "verifier-result.schema.json", "read-only")
+                        with status(f"Verifying {task['taskId']} (attempt {task['attemptCount']})"):
+                            verification = invoke_role(root, task["worktree"], "verifier", f"Verify only this task:\n{pretty_json(task)}\nBuilder result:\n{pretty_json(result)}", "verifier-result.schema.json", "read-only")
                         if not verification["approved"]:
                             blocker = structured_blocker(verification["blocker"], "build", task["taskId"])
                             if is_semantic_blocker(blocker):
@@ -258,14 +258,15 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                         "createdAt": utc_now(), "item": task,
                     })
                 save_ledger(tasks, paths)
-                with ThreadPoolExecutor(max_workers=len(wave)) as pool:
-                    records = {task["taskId"]: pool.submit(run_assignment, root, task["worktree"], task, "task", paths) for task in wave}
-                    for task in wave:
-                        record = records[task["taskId"]].result()
-                        if not record or not record["succeeded"]:
-                            task.update(status="pending", lastError="Builder returned no durable result." if not record else record["error"])
-                        else:
-                            task["status"] = "result_ready"
+                with status("Building " + ", ".join(task["taskId"] for task in wave)):
+                    with ThreadPoolExecutor(max_workers=len(wave)) as pool:
+                        records = {task["taskId"]: pool.submit(run_assignment, root, task["worktree"], task, "task", paths) for task in wave}
+                        for task in wave:
+                            record = records[task["taskId"]].result()
+                            if not record or not record["succeeded"]:
+                                task.update(status="pending", lastError="Builder returned no durable result." if not record else record["error"])
+                            else:
+                                task["status"] = "result_ready"
                 save_ledger(tasks, paths)
                 show_status(state, tasks)
 
