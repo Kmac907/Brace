@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import unittest
+from hashlib import sha256
 from importlib.metadata import version
 from pathlib import Path
 from unittest.mock import patch
@@ -99,6 +100,7 @@ class CliTests(unittest.TestCase):
         workflows = Path(__file__).resolve().parents[1] / ".github" / "workflows"
         self.assertFalse((workflows / "package.yml").exists())
         workflow = (workflows / "release.yml").read_text(encoding="utf-8")
+        self.assertEqual(sha256(workflow.encode()).hexdigest(), "db6166ddd925d8808af166b81f2e92f04c2c8bdbef527f4e60b554bce470689b")
         lines = [line.strip() for line in workflow.splitlines()]
         commands = [line.removeprefix("run: ") for line in lines]
         for required in (
