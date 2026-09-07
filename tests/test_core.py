@@ -403,48 +403,30 @@ class CoreTests(RepositoryTestCase):
         else:
             self.assertIn("deadline", str(failure.exception))
 
-    @unittest.skipUnless(os.name == "nt", "Windows taskkill behavior")
-    def test_windows_tree_cleanup_reports_unverified_termination_and_reaps_parent(self) -> None:
+    @unittest.skipUnless(os.name == "nt", "Windows process cleanup behavior")
+    def test_windows_tree_cleanup_uses_retained_parent_identity(self) -> None:
         process = Mock(pid=1234)
-        process.poll.return_value = None
         process.wait.return_value = 0
-        with patch.object(common.subprocess, "run", side_effect=subprocess.TimeoutExpired(["taskkill"], 0.5)) as taskkill:
-            with self.assertRaisesRegex(common.BraceError, "could not be verified.*exceeded"):
-                common._terminate_tree(process, 1)
-        self.assertLessEqual(taskkill.call_args.kwargs["timeout"], 1)
-        process.kill.assert_called_once_with()
-        process.wait.assert_called_once()
+        process.poll.side_effect = [None, 0]
 
-        process.reset_mock()
-        process.poll.return_value = None
-        process.wait.return_value = 0
-        failed = subprocess.CompletedProcess(["taskkill"], 5, stdout="", stderr="Access is denied")
-        with patch.object(common.subprocess, "run", return_value=failed) as taskkill:
-            with self.assertRaisesRegex(common.BraceError, "could not be verified.*code 5.*Access is denied"):
-                common._terminate_tree(process, 1)
-        taskkill.assert_called_once()
-        process.kill.assert_called_once_with()
-        process.wait.assert_called_once()
+        def exit_during_safe_parent_kill() -> None:
+            self.assertIsNone(process.poll())
+            self.assertEqual(process.poll(), 0)
 
-        process.reset_mock()
-        process.poll.return_value = None
-        process.wait.return_value = 0
-        terminated = subprocess.CompletedProcess(["taskkill"], 0, stdout="SUCCESS", stderr="")
-        with patch.object(common.subprocess, "run", return_value=terminated) as taskkill:
-            common._terminate_tree(process, 1)
-        taskkill.assert_called_once()
-        process.kill.assert_called_once_with()
-        process.wait.assert_called_once()
-
-        process.reset_mock()
-        process.poll.return_value = 0
-        process.wait.return_value = 0
+        process.kill.side_effect = exit_during_safe_parent_kill
         with patch.object(common.subprocess, "run") as taskkill:
-            with self.assertRaisesRegex(common.BraceError, "could not be verified.*tracked parent exited"):
+            with self.assertRaisesRegex(common.BraceError, "could not be verified.*retained process-tree identity"):
                 common._terminate_tree(process, 1)
         taskkill.assert_not_called()
         process.kill.assert_called_once_with()
-        process.wait.assert_called_once()
+        self.assertLessEqual(process.wait.call_args.kwargs["timeout"], 1)
+
+        process.reset_mock(side_effect=True)
+        process.wait.side_effect = subprocess.TimeoutExpired(["tracked"], 1)
+        with patch.object(common.subprocess, "run") as taskkill:
+            with self.assertRaisesRegex(common.BraceError, "Tracked process did not stop"):
+                common._terminate_tree(process, 1)
+        taskkill.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
     def test_native_timeout_checks_tree_after_parent_exits(self) -> None:
