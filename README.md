@@ -247,9 +247,9 @@ Tests use temporary local Git repositories and mocked provider and agent boundar
 
 ## Releases
 
-Run **Release Brace** from GitHub Actions and choose `patch`, `minor`, or `major`. The release workflow uses `uv version` to update `pyproject.toml` and `uv.lock`, runs the full test and package checks, commits the version, creates an annotated `vX.Y.Z` tag, and publishes a GitHub Release containing the wheel and source distribution.
+Merging to `main` does not publish or retain a package. **Release Brace** is the only packaging and release workflow, and Brace is not published to PyPI.
 
-Ordinary pushes to `main` continue to run the **Build Python package** workflow and retain its distributions as a workflow artifact.
+Run **Release Brace** from GitHub Actions and choose `patch`, `minor`, or `major`. The workflow uses `uv version` to update `pyproject.toml` and `uv.lock`, runs the full test and package checks, builds one official wheel and source distribution, commits the version, creates an annotated `vX.Y.Z` tag, and attaches those exact artifacts to the matching GitHub Release.
 
 The installed package metadata is the single runtime version source used by `brace --version`.
 
