@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import unittest
+from hashlib import sha256
 from importlib.metadata import version
 from pathlib import Path
 from unittest.mock import patch
@@ -96,14 +97,38 @@ class CliTests(unittest.TestCase):
         self.assertEqual(__version__, version("brace"))
 
     def test_release_workflow_versions_tests_tags_and_publishes(self) -> None:
-        workflow = (
-            Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml"
-        ).read_text(encoding="utf-8")
+        workflows = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+        self.assertFalse((workflows / "package.yml").exists())
+        workflow = (workflows / "release.yml").read_text(encoding="utf-8")
+        self.assertEqual(sha256(workflow.encode()).hexdigest(), "db6166ddd925d8808af166b81f2e92f04c2c8bdbef527f4e60b554bce470689b")
+        lines = [line.strip() for line in workflow.splitlines()]
+        commands = [line.removeprefix("run: ") for line in lines]
         for required in (
-            "workflow_dispatch:", "uv version --bump", "uv run --locked", "uv build",
-            "git tag -a", "git push --atomic", "gh release create", "--verify-tag",
+            "workflow_dispatch:",
+            "          - patch\n          - minor\n          - major",
+            'uv version --bump "${{ inputs.bump }}"',
+            "uv run --locked python -m unittest discover -s tests -v",
+            'git commit -m "Release v${VERSION}"',
+            'git tag -a "v${VERSION}" -m "Brace v${VERSION}"',
+            'git push --atomic origin HEAD:main "refs/tags/v${VERSION}"',
         ):
             self.assertIn(required, workflow)
+        self.assertIn(
+            "      - name: Build wheel and source distribution\n"
+            "        run: uv build\n"
+            "      - name: Verify distributions",
+            workflow,
+        )
+        self.assertEqual(sum(command == "uv build" or command.startswith("uv build ") for command in commands), 1)
+        for verification in (
+            'test "$(uv run --isolated --no-project --with dist/*.whl brace --version)" = "brace ${VERSION}"',
+            'test "$(uv run --isolated --no-project --with dist/*.tar.gz brace --version)" = "brace ${VERSION}"',
+        ):
+            self.assertIn(verification, lines)
+        self.assertIn(
+            'run: gh release create "v${VERSION}" dist/* --verify-tag --generate-notes --title "Brace v${VERSION}"',
+            lines,
+        )
 
     def test_bundled_template_is_complete_and_has_no_scripts(self) -> None:
         template = bootstrap.bundled_template()
