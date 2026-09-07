@@ -137,7 +137,7 @@ def _popen_options() -> dict[str, Any]:
 
 
 def _terminate_tree(process: subprocess.Popen[str], grace_seconds: int) -> None:
-    if process.poll() is not None:
+    if os.name != "nt" and process.poll() is not None:
         return
     if os.name == "nt":
         deadline = time.monotonic() + grace_seconds
