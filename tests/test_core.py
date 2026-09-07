@@ -351,10 +351,24 @@ class CoreTests(RepositoryTestCase):
 
     def test_native_timeout_is_bounded(self) -> None:
         self.assertEqual(common.run_native(sys.executable, ["-c", "raise SystemExit(7)"], allowed_exit_codes=None).returncode, 7)
+        pid_path = self.base / "timeout-pids.json"
+        script = (
+            "import json, os, pathlib, subprocess, sys, time; "
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+            "pathlib.Path(sys.argv[1]).write_text(json.dumps([os.getpid(), child.pid]), encoding='utf-8'); "
+            "time.sleep(30)"
+        )
         started = time.monotonic()
         with self.assertRaisesRegex(common.BraceError, "deadline"):
-            common.run_native(sys.executable, ["-c", "import time; time.sleep(30)"], timeout_seconds=1)
+            common.run_native(sys.executable, ["-c", script, pid_path], timeout_seconds=1)
         self.assertLess(time.monotonic() - started, 8)
+        if os.name == "nt":
+            for pid in json.loads(pid_path.read_text(encoding="utf-8")):
+                listing = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                    capture_output=True, text=True, encoding="utf-8", errors="strict", check=False,
+                )
+                self.assertNotIn(f'"{pid}"', listing.stdout)
 
     def test_output_schema_projection_supports_bundled_results(self) -> None:
         root, _, config = self.make_repository()
