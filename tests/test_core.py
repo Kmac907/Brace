@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import subprocess
@@ -7,13 +8,36 @@ import sys
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from brace import common, project_manager
 from support import RepositoryTestCase
 
 
 class CoreTests(RepositoryTestCase):
+    def windows_process_is_running(self, pid: int) -> bool:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel32.OpenProcess(0x00100000, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 87:
+                return False
+            self.fail(f"OpenProcess failed for PID {pid} with Windows error {error}.")
+        try:
+            status = kernel32.WaitForSingleObject(handle, 0)
+        finally:
+            kernel32.CloseHandle(handle)
+        if status == 0:
+            return False
+        if status == 258:
+            return True
+        self.fail(f"WaitForSingleObject failed for PID {pid} with status {status}.")
+
     @staticmethod
     def schema_keys(value: object) -> set[str]:
         if isinstance(value, dict):
@@ -354,21 +378,52 @@ class CoreTests(RepositoryTestCase):
         pid_path = self.base / "timeout-pids.json"
         script = (
             "import json, os, pathlib, subprocess, sys, time; "
-            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(4)']); "
             "pathlib.Path(sys.argv[1]).write_text(json.dumps([os.getpid(), child.pid]), encoding='utf-8'); "
             "time.sleep(30)"
         )
         started = time.monotonic()
-        with self.assertRaisesRegex(common.BraceError, "deadline"):
+        with self.assertRaises(common.BraceError) as failure:
             common.run_native(sys.executable, ["-c", script, pid_path], timeout_seconds=1)
         self.assertLess(time.monotonic() - started, 8)
         if os.name == "nt":
-            for pid in json.loads(pid_path.read_text(encoding="utf-8")):
-                listing = subprocess.run(
-                    ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                    capture_output=True, text=True, encoding="utf-8", errors="strict", check=False,
-                )
-                self.assertNotIn(f'"{pid}"', listing.stdout)
+            parent_pid, child_pid = json.loads(pid_path.read_text(encoding="utf-8"))
+            parent_deadline = time.monotonic() + 1
+            while self.windows_process_is_running(parent_pid) and time.monotonic() < parent_deadline:
+                time.sleep(0.05)
+            self.assertFalse(self.windows_process_is_running(parent_pid))
+            if "deadline" in str(failure.exception):
+                self.assertFalse(self.windows_process_is_running(child_pid))
+            else:
+                self.assertRegex(str(failure.exception), "Process-tree termination could not be verified")
+                deadline = time.monotonic() + 5
+                while self.windows_process_is_running(child_pid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertFalse(self.windows_process_is_running(child_pid))
+        else:
+            self.assertIn("deadline", str(failure.exception))
+
+    @unittest.skipUnless(os.name == "nt", "Windows taskkill behavior")
+    def test_windows_tree_cleanup_reports_unverified_termination_and_reaps_parent(self) -> None:
+        process = Mock(pid=1234)
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        with patch.object(common.subprocess, "run", side_effect=subprocess.TimeoutExpired(["taskkill"], 0.5)) as taskkill:
+            with self.assertRaisesRegex(common.BraceError, "could not be verified.*exceeded"):
+                common._terminate_tree(process, 1)
+        self.assertLessEqual(taskkill.call_args.kwargs["timeout"], 1)
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once()
+
+        process.reset_mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        failed = subprocess.CompletedProcess(["taskkill"], 5, stdout="", stderr="Access is denied")
+        with patch.object(common.subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(common.BraceError, "could not be verified.*code 5.*Access is denied"):
+                common._terminate_tree(process, 1)
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once()
 
     def test_output_schema_projection_supports_bundled_results(self) -> None:
         root, _, config = self.make_repository()
