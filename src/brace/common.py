@@ -145,6 +145,8 @@ def _terminate_tree(process: subprocess.Popen[str], grace_seconds: int) -> None:
             stderr=subprocess.DEVNULL,
             check=False,
         )
+        with contextlib.suppress(OSError):
+            process.kill()
     else:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGKILL)
