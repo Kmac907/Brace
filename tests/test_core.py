@@ -416,14 +416,50 @@ class CoreTests(RepositoryTestCase):
         process.wait.assert_called_once()
 
         process.reset_mock()
-        process.poll.return_value = None
+        process.poll.return_value = 0
         process.wait.return_value = 0
         failed = subprocess.CompletedProcess(["taskkill"], 5, stdout="", stderr="Access is denied")
-        with patch.object(common.subprocess, "run", return_value=failed):
+        with patch.object(common.subprocess, "run", return_value=failed) as taskkill:
             with self.assertRaisesRegex(common.BraceError, "could not be verified.*code 5.*Access is denied"):
                 common._terminate_tree(process, 1)
+        taskkill.assert_called_once()
         process.kill.assert_called_once_with()
         process.wait.assert_called_once()
+
+        process.reset_mock()
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        terminated = subprocess.CompletedProcess(["taskkill"], 0, stdout="SUCCESS", stderr="")
+        with patch.object(common.subprocess, "run", return_value=terminated) as taskkill:
+            common._terminate_tree(process, 1)
+        taskkill.assert_called_once()
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once()
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
+    def test_native_timeout_checks_tree_after_parent_exits(self) -> None:
+        pid_path = self.base / "exited-parent-pids.json"
+        child_script = "import time; time.sleep(4)"
+        script = (
+            "import json, os, pathlib, subprocess, sys; "
+            f"child = subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
+            "pathlib.Path(sys.argv[1]).write_text(json.dumps([os.getpid(), child.pid]), encoding='utf-8')"
+        )
+        started = time.monotonic()
+        with self.assertRaises(common.BraceError) as failure:
+            common.run_native(sys.executable, ["-c", script, pid_path], timeout_seconds=1)
+        self.assertLess(time.monotonic() - started, 8)
+        parent_pid, child_pid = json.loads(pid_path.read_text(encoding="utf-8"))
+        self.assertFalse(self.windows_process_is_running(parent_pid))
+        if "deadline" in str(failure.exception):
+            self.assertFalse(self.windows_process_is_running(child_pid))
+        else:
+            self.assertRegex(str(failure.exception), "Process-tree termination could not be verified")
+            self.assertTrue(self.windows_process_is_running(child_pid))
+            deadline = time.monotonic() + 5
+            while self.windows_process_is_running(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(self.windows_process_is_running(child_pid))
 
     def test_output_schema_projection_supports_bundled_results(self) -> None:
         root, _, config = self.make_repository()
