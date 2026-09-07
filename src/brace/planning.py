@@ -12,11 +12,13 @@ from .common import (
     assert_state_identity,
     assert_target_drift,
     assert_task_coverage,
+    canonicalize_graph_identities,
     definition_hash,
     get_configuration,
     git_blob_identity,
     initialize_state_files,
     invoke_role,
+    normalize_task_references,
     read_json,
     read_text,
     repository_root,
@@ -78,7 +80,6 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
             state.update(stage="planning", stageStatus="running", blocker=None)
             save_state(state, paths)
             completed = None
-            validation_error = None
             for round_number in range(1, config["maximumPlanningQuestionRounds"] + 1):
                 context = (
                     f"Repository root: {root}\nQuestion round: {round_number} of {config['maximumPlanningQuestionRounds']}\n\n"
@@ -86,8 +87,6 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
                     "treat them as authoritative. If the requirements are sufficient, return the normalized requirements, "
                     "complete plan, and complete task graph now."
                 )
-                if validation_error:
-                    context += f"\n\nThe previous completed result was rejected by coordinator validation: {validation_error}\nReturn a corrected complete result."
                 with status(f"Planning project (round {round_number})"):
                     result = invoke_role(root, root, "planner", context, "planning-result.schema.json", "read-only")
                 if result["status"] == "questions":
@@ -108,19 +107,16 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
                     raise BraceError("Planner completed without plan.md content.")
                 if not result["tasks"]:
                     raise BraceError("Planner completed without implementation tasks.")
-                try:
-                    assert_graph(result["tasks"], "task")
-                    assert_task_coverage(result["tasks"], result["normalizedRequirementsMarkdown"], result["summary"]["deferredRequirementIds"])
-                except BraceError as error:
-                    validation_error = str(error)
-                    continue
+                mapping = canonicalize_graph_identities(result["tasks"], "task")
+                result["planMarkdown"] = normalize_task_references(
+                    result["planMarkdown"], mapping, (task["taskId"] for task in result["tasks"])
+                )
+                assert_graph(result["tasks"], "task")
+                assert_task_coverage(result["tasks"], result["normalizedRequirementsMarkdown"], result["summary"]["deferredRequirementIds"])
                 completed = result
                 break
             if completed is None:
-                message = f"Planning did not complete within {config['maximumPlanningQuestionRounds']} rounds."
-                if validation_error:
-                    message += f" Last validation error: {validation_error}"
-                raise BraceError(message)
+                raise BraceError(f"Planning did not complete within {config['maximumPlanningQuestionRounds']} rounds.")
 
             write_text_atomic(requirements_path, completed["normalizedRequirementsMarkdown"].rstrip())
             write_text_atomic(root / "plan.md", completed["planMarkdown"].rstrip())

@@ -11,6 +11,7 @@ from .common import (
     assert_graph,
     assert_task_coverage,
     attempt_path,
+    canonicalize_graph_identities,
     complete_pull_request,
     definition_hash,
     ensure_integration_branch,
@@ -19,11 +20,13 @@ from .common import (
     invoke_role,
     new_worktree,
     new_pull_request,
+    normalize_task_references,
     object_hash,
     pretty_json,
     read_attempt_result,
     read_git_text,
     read_json,
+    read_text,
     remove_worktree,
     run_native,
     safe_relative_pattern,
@@ -31,6 +34,7 @@ from .common import (
     utc_now,
     write_immutable_json,
     write_json_atomic,
+    write_text_atomic,
 )
 from .ui import ask, info
 
@@ -123,10 +127,15 @@ def decision_identity(amendment_id: str, option_id: str, response: str, question
     return object_hash({"amendmentId": amendment_id, "optionId": option_id, "response": response, "question": question})
 
 
-def assert_amendment_commit(worktree: str | Path, base_sha: str, authorized_paths: list[str]) -> dict[str, Any]:
-    if run_native("git", ["-C", worktree, "status", "--porcelain", "--untracked-files=all"]).output.strip():
+def assert_amendment_commit(
+    worktree: str | Path, base_sha: str, authorized_paths: list[str], head_sha: str | None = None
+) -> dict[str, Any]:
+    if head_sha is None and run_native("git", ["-C", worktree, "status", "--porcelain", "--untracked-files=all"]).output.strip():
         raise BraceError("PM amendment worktree is not clean.")
-    head = run_native("git", ["-C", worktree, "rev-parse", "HEAD"]).output.strip()
+    current = run_native("git", ["-C", worktree, "rev-parse", "HEAD"]).output.strip()
+    head = head_sha or current
+    if head_sha and run_native("git", ["-C", worktree, "merge-base", "--is-ancestor", head, current], allowed_exit_codes=(0, 1)).returncode != 0:
+        raise BraceError("PM result commit is not in the amendment worktree history.")
     if head == base_sha or run_native("git", ["-C", worktree, "merge-base", "--is-ancestor", base_sha, head], allowed_exit_codes=(0, 1)).returncode != 0:
         raise BraceError("PM did not create a descendant amendment commit.")
     count = int(run_native("git", ["-C", worktree, "rev-list", "--count", f"{base_sha}..{head}"]).output.strip())
@@ -307,11 +316,13 @@ def invoke_pm_resolution(
         else:
             head = run_native("git", ["-C", amendment["worktree"], "rev-parse", "HEAD"]).output.strip()
             mode = "recover_result" if head != amendment["baseSha"] else "amend"
+            first_task_id = max((int(task["taskId"][5:]) for task in tasks["tasks"]), default=0) + 1
             context = "\n".join((
                 f"Mode: {mode}", f"Amendment: {identity}", f"Approved option: {amendment['selectedOptionId']}",
                 f"User response: {amendment['userResponse']}", f"Decision identity: {amendment['decisionIdentity']}",
                 f"Authorized documentation paths: {', '.join(amendment['authorizedDocumentationPaths'])}",
-                f"Base SHA: {amendment['baseSha']}", f"Analysis:\n{pretty_json(analysis)}", f"Current tasks:\n{pretty_json(tasks)}",
+                f"Base SHA: {amendment['baseSha']}", f"First available follow-up task ID: TASK-{first_task_id:04d}",
+                f"Analysis:\n{pretty_json(analysis)}", f"Current tasks:\n{pretty_json(tasks)}",
             ))
             result = invoke_role(root, amendment["worktree"], "project-manager", context, "pm-amendment-result.schema.json", "read-only" if mode == "recover_result" else "workspace-write")
             if result["status"] != "completed":
@@ -323,14 +334,15 @@ def invoke_pm_resolution(
 
     record = read_json(result_path)
     result = record["result"]
+    superseded = set(result["supersededTaskIds"])
+    prior_tasks = [task for task in tasks["tasks"] if task.get("amendmentId") != identity or task["taskId"] in superseded]
+    expected = max((int(task["taskId"][5:]) for task in prior_tasks), default=0) + 1
+    mapping = canonicalize_graph_identities(result["newTasks"], "task", expected, (task["taskId"] for task in prior_tasks))
     if amendment["status"] == "result_ready":
-        commit = assert_amendment_commit(amendment["worktree"], amendment["baseSha"], amendment["authorizedDocumentationPaths"])
+        commit = assert_amendment_commit(
+            amendment["worktree"], amendment["baseSha"], amendment["authorizedDocumentationPaths"], result["commitSha"]
+        )
         assert_pm_result_identity(result, amendment, commit)
-        amendment["resultSha"] = commit["Head"]
-        expected = max((int(task["taskId"][5:]) for task in tasks["tasks"]), default=0) + 1
-        for index, task in enumerate(result["newTasks"]):
-            if task["taskId"] != f"TASK-{expected + index:04d}":
-                raise BraceError("PM follow-up task IDs must append monotonically.")
         if result["supersededTaskIds"] and not result["newTasks"]:
             raise BraceError("A superseded task requires at least one replacement follow-up task.")
         for task_id in result["supersededTaskIds"]:
@@ -351,12 +363,38 @@ def invoke_pm_resolution(
                     raise BraceError(f"PM cannot supersede task {task_id} because its worktree contains unrecorded work.")
         candidate = tasks["tasks"] + [persisted_task(task, identity) for task in result["newTasks"]]
         assert_graph(candidate, "task")
-        superseded = set(result["supersededTaskIds"])
+        plan = read_git_text(amendment["worktree"], commit["Head"], "plan.md")
+        normalized_plan = normalize_task_references(plan, mapping, (task["taskId"] for task in candidate))
         for task in candidate:
             if task["taskId"] not in superseded and superseded.intersection(task["dependencies"]):
                 raise BraceError(f"{task['taskId']} depends on a superseded task.")
         requirements = read_git_text(amendment["worktree"], commit["Head"], "requirements.md")
         assert_task_coverage([task for task in candidate if task["taskId"] not in superseded], requirements)
+        head = run_native("git", ["-C", amendment["worktree"], "rev-parse", "HEAD"]).output.strip()
+        dirty = run_native("git", ["-C", amendment["worktree"], "status", "--porcelain", "--untracked-files=all"]).output
+        if normalized_plan != plan and head == commit["Head"]:
+            plan_path = Path(amendment["worktree"]) / "plan.md"
+            if dirty:
+                if dirty not in {" M plan.md", "M  plan.md", "MM plan.md"}:
+                    raise BraceError(f"Amendment worktree contains unexpected uncommitted changes: {dirty}")
+                if read_text(plan_path) != normalized_plan:
+                    raise BraceError("Amendment worktree contains a mismatched plan normalization.")
+            else:
+                write_text_atomic(plan_path, normalized_plan)
+            run_native("git", ["-C", amendment["worktree"], "add", "--", "plan.md"])
+            run_native("git", ["-C", amendment["worktree"], "commit", "-m", "Normalize PM task references"])
+            head = run_native("git", ["-C", amendment["worktree"], "rev-parse", "HEAD"]).output.strip()
+        elif head != commit["Head"]:
+            count = int(run_native("git", ["-C", amendment["worktree"], "rev-list", "--count", f"{commit['Head']}..{head}"]).output.strip())
+            changed = run_native("git", ["-C", amendment["worktree"], "diff", "--name-only", f"{commit['Head']}..{head}"]).lines
+            if dirty or normalized_plan == plan or count != 1 or changed != ["plan.md"] or read_git_text(amendment["worktree"], head, "plan.md") != normalized_plan:
+                raise BraceError("Amendment worktree contains an unexpected post-result commit.")
+        elif dirty:
+            raise BraceError("Amendment worktree contains unexpected uncommitted changes.")
+        if amendment.get("resultSha") not in {None, head}:
+            raise BraceError("Recorded amendment result SHA does not match the normalized plan commit.")
+        amendment["resultSha"] = head
+        save_state(state, paths)
         verification = invoke_role(root, amendment["worktree"], "verifier", "Verify this approved project amendment against the exact user decision.\n" + pretty_json(result), "verifier-result.schema.json", "read-only")
         if not verification["approved"]:
             raise BraceError("PM amendment semantic verification failed: " + "; ".join(verification["findings"]))
@@ -379,23 +417,33 @@ def invoke_pm_resolution(
 
     if amendment["status"] == "integrated":
         new_ids = [task["taskId"] for task in result["newTasks"]]
+        previous_tasks = object_hash(tasks)
         for task in tasks["tasks"]:
             if task["taskId"] in result["supersededTaskIds"]:
                 task.update(status="superseded", amendmentId=identity, supersededBy=new_ids)
-        existing = {task["taskId"] for task in tasks["tasks"]}
-        tasks["tasks"].extend(persisted_task(task, identity) for task in result["newTasks"] if task["taskId"] not in existing)
+        existing = {task["taskId"]: task for task in tasks["tasks"]}
+        for definition in result["newTasks"]:
+            follow_up = persisted_task(definition, identity)
+            current = existing.get(follow_up["taskId"])
+            if current is None:
+                tasks["tasks"].append(follow_up)
+            elif current.get("amendmentId") != identity or definition_hash([current], "task") != definition_hash([follow_up], "task"):
+                raise BraceError(f"Persisted follow-up task conflicts with {identity}: {follow_up['taskId']}")
         state["requirementsHash"] = git_blob_identity(root, state["integrationSha"], "requirements.md")
         state["planHash"] = git_blob_identity(root, state["integrationSha"], "plan.md")
         tasks.update(planHash=state["planHash"], definitionHash=definition_hash(tasks["tasks"], "task"), status="active")
         state["taskDefinitionHash"] = tasks["definitionHash"]
-        save_pm_task_ledger(tasks, paths)
+        if object_hash(tasks) != previous_tasks:
+            save_pm_task_ledger(tasks, paths)
         resume = "build" if source_stage == "build" or result["newTasks"] or result["supersededTaskIds"] else result["resumeStage"]
         if source_stage == "audit" and bugs is not None:
             history = paths.results / f"{identity}-pre-expansion-audit.json"
-            if not history.exists():
-                write_immutable_json(history, bugs)
-            bugs.update(schemaVersion="1.2", revision=bugs["revision"] + 1, auditSha=None, definitionHash=None, status="not_audited", bugs=[])
-            write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
+            bugs_changed = bugs["auditSha"] is not None or bugs["definitionHash"] is not None or bugs["status"] != "not_audited" or bool(bugs["bugs"])
+            if bugs_changed:
+                if not history.exists():
+                    write_immutable_json(history, bugs)
+                bugs.update(schemaVersion="1.2", revision=bugs["revision"] + 1, auditSha=None, definitionHash=None, status="not_audited", bugs=[])
+                write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
             state["bugDefinitionHash"] = None
         amendment.update(resumeStage=resume, status="applied")
         state.update(stage=resume, stageStatus="amending")

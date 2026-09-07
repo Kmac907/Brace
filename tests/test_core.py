@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import subprocess
@@ -7,13 +8,36 @@ import sys
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from brace import common, project_manager
 from support import RepositoryTestCase
 
 
 class CoreTests(RepositoryTestCase):
+    def windows_process_is_running(self, pid: int) -> bool:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel32.OpenProcess(0x00100000, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 87:
+                return False
+            self.fail(f"OpenProcess failed for PID {pid} with Windows error {error}.")
+        try:
+            status = kernel32.WaitForSingleObject(handle, 0)
+        finally:
+            kernel32.CloseHandle(handle)
+        if status == 0:
+            return False
+        if status == 258:
+            return True
+        self.fail(f"WaitForSingleObject failed for PID {pid} with status {status}.")
+
     @staticmethod
     def schema_keys(value: object) -> set[str]:
         if isinstance(value, dict):
@@ -31,6 +55,286 @@ class CoreTests(RepositoryTestCase):
         with self.assertRaisesRegex(common.BraceError, "REQ-TWO"):
             common.assert_task_coverage([first], "REQ-ONE REQ-TWO")
 
+    def test_coordinator_canonicalizes_graph_identities_and_references(self) -> None:
+        first = self.task("TASK-0018")
+        second = self.task("TASK-0028", ["TASK-0018"])
+        mapping = common.canonicalize_graph_identities([first, second], "task")
+        self.assertEqual(mapping, {"TASK-0018": "TASK-0001", "TASK-0028": "TASK-0002"})
+        self.assertEqual((first["taskId"], second["taskId"], second["dependencies"]), ("TASK-0001", "TASK-0002", ["TASK-0001"]))
+        plan = "Implement TASK-001, then TASK-0028; leave X-TASK-0018-extra unchanged."
+        self.assertEqual(
+            common.normalize_task_references(plan, mapping, (first["taskId"], second["taskId"])),
+            "Implement TASK-0001, then TASK-0002; leave X-TASK-0018-extra unchanged.",
+        )
+
+        bug = {"bugId": "BUG-0018", "dependencies": [], "allowedPaths": ["src/**"]}
+        common.canonicalize_graph_identities([bug], "bug")
+        self.assertEqual(bug["bugId"], "BUG-0001")
+        follow_up = self.task("TASK-0018", ["TASK-0002"])
+        common.canonicalize_graph_identities([follow_up], "task", 3, ["TASK-0001", "TASK-0002"])
+        self.assertEqual((follow_up["taskId"], follow_up["dependencies"]), ("TASK-0003", ["TASK-0002"]))
+
+    def test_coordinator_rejects_ambiguous_or_unknown_identities(self) -> None:
+        with self.assertRaisesRegex(common.BraceError, "Duplicate provisional task identity"):
+            common.canonicalize_graph_identities([self.task("TASK-0018"), self.task("TASK-0018")], "task")
+        with self.assertRaisesRegex(common.BraceError, "Provisional task identity conflicts with existing identity: TASK-0001"):
+            common.canonicalize_graph_identities(
+                [self.task("TASK-0001"), self.task("TASK-0018", ["TASK-0001"])],
+                "task",
+                3,
+                ["TASK-0001", "TASK-0002"],
+            )
+        with self.assertRaisesRegex(common.BraceError, "Unresolved task dependency collides with canonical identity: TASK-0001"):
+            common.canonicalize_graph_identities([self.task("TASK-0018"), self.task("TASK-0028", ["TASK-0001"])], "task")
+        bugs = [
+            {"bugId": "BUG-0018", "dependencies": [], "allowedPaths": ["src/**"]},
+            {"bugId": "BUG-0028", "dependencies": ["BUG-0001"], "allowedPaths": ["src/**"]},
+        ]
+        with self.assertRaisesRegex(common.BraceError, "Unresolved bug dependency collides with canonical identity: BUG-0001"):
+            common.canonicalize_graph_identities(bugs, "bug")
+        task = self.task("TASK-0018", ["TASK-9999"])
+        common.canonicalize_graph_identities([task], "task")
+        with self.assertRaisesRegex(common.BraceError, "unknown task TASK-9999"):
+            common.assert_graph([task], "task")
+        with self.assertRaisesRegex(common.BraceError, "Plan references unknown tasks: TASK-9999"):
+            common.normalize_task_references("Implement TASK-9999.", {}, ["TASK-0001"])
+
+    def assert_pm_follow_up_recovery(self, provisional_id: str) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        head = self.git(root, "rev-parse", "HEAD")
+        identity = "AMEND-0001"
+        initial = [self.task(), self.task("TASK-0002")]
+        plan_hash = common.git_blob_identity(root, head, "plan.md")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        tasks.update(revision=1, planHash=plan_hash, definitionHash=common.definition_hash(initial, "task"), status="active", tasks=initial)
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+
+        analysis = {
+            "summary": "append follow-up", "recommendation": "amend", "question": "Proceed?", "amendmentRequired": True,
+            "effects": {name: "updated" for name in ("requirements", "plan", "tasks", "bugs", "completedWork", "schedule")},
+            "options": [{
+                "optionId": "OPTION-0001", "label": "Amend", "description": "Append work", "recommended": True,
+                "action": "amend", "requiresInput": False, "inputPrompt": None,
+                "authorizedDocumentationPaths": [], "bugDispositions": [],
+            }],
+            "affectedTaskIds": ["TASK-0001"], "affectedBugIds": [],
+        }
+        analysis_path = paths.results / f"{identity}-analysis.json"
+        common.write_immutable_json(analysis_path, analysis)
+        decision = project_manager.decision_identity(identity, "OPTION-0001", "OPTION-0001", analysis["question"])
+        pull_request = {
+            "id": "1", "url": "https://example.invalid/1", "state": "merged", "repository": "owner/repo",
+            "head": f"worktree/{identity}", "headSha": head, "base": config["integrationBranch"], "baseSha": head, "mergeSha": head,
+        }
+        blocker = dict(project_manager.structured_blocker("scope changed", "build", "TASK-0001"), kind="scope_gap", requiresUserDecision=True, scopeChangePossible=True)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        state.update(
+            stage="build", stageStatus="amending", targetBaseSha=head, integrationSha=head, planHash=plan_hash,
+            requirementsHash=common.git_blob_identity(root, head, "requirements.md"), taskDefinitionHash=tasks["definitionHash"],
+            amendmentSequence=1, activeAmendment={
+                "amendmentId": identity, "sourceStage": "build", "sourceKind": "task", "sourceIdentity": "TASK-0001",
+                "status": "integrated", "blocker": blocker, "analysisResultPath": str(analysis_path),
+                "selectedOptionId": "OPTION-0001", "userResponse": "OPTION-0001", "decisionIdentity": decision,
+                "authorizedDocumentationPaths": ["requirements.md", "plan.md"], "branch": f"worktree/{identity}",
+                "worktree": None, "baseSha": head, "resultSha": head, "pullRequest": pull_request,
+                "affectedTaskIds": ["TASK-0001"], "affectedBugIds": [], "resumeStage": "build", "attemptCount": 1,
+            },
+        )
+        common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
+        definition = {
+            key: value for key, value in self.task(provisional_id, ["TASK-0002"]).items()
+            if key in {"taskId", "title", "description", "requirementIds", "planSections", "dependencies", "allowedPaths", "exclusiveResources", "acceptanceCriteria", "checks"}
+        }
+        result = {
+            "status": "completed", "summary": "amended", "decisionIdentity": decision, "selectedOptionId": "OPTION-0001",
+            "commitSha": head, "changedFiles": ["plan.md"], "newTasks": [definition], "supersededTaskIds": [],
+            "resumeStage": "build", "blocker": None,
+        }
+        result_path = common.attempt_path(paths, "result", identity, 1)
+        common.write_immutable_json(result_path, {
+            "schemaVersion": "1.0", "identity": identity, "attempt": 1, "succeeded": True,
+            "result": result, "error": None, "completedAt": common.utc_now(),
+        })
+
+        with patch.object(project_manager, "save_state", side_effect=RuntimeError("interrupted after task ledger")):
+            with self.assertRaisesRegex(RuntimeError, "interrupted after task ledger"):
+                project_manager.invoke_pm_resolution(root, config, state, paths, tasks, common.read_json(paths.bugs), "build", "task", "TASK-0001", blocker)
+
+        interrupted_tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        interrupted_revision = interrupted_tasks["revision"]
+        persisted_state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        self.assertEqual(persisted_state["activeAmendment"]["status"], "integrated")
+        self.assertEqual([task["taskId"] for task in interrupted_tasks["tasks"]], ["TASK-0001", "TASK-0002", "TASK-0003"])
+
+        resolution = project_manager.invoke_pm_resolution(
+            root, config, persisted_state, paths, interrupted_tasks, common.read_json(paths.bugs),
+            "build", "task", "TASK-0001", blocker,
+        )
+        recovered_tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        recovered_state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        self.assertEqual(resolution["action"], "amended")
+        self.assertEqual(recovered_tasks["revision"], interrupted_revision)
+        self.assertEqual([task["taskId"] for task in recovered_tasks["tasks"]], ["TASK-0001", "TASK-0002", "TASK-0003"])
+        self.assertIsNone(recovered_state["activeAmendment"])
+        common.assert_ledger_identity(recovered_state, recovered_tasks, "task")
+        self.assertEqual(common.read_json(result_path)["result"]["newTasks"][0]["taskId"], provisional_id)
+
+    def test_pm_follow_up_recovery_is_idempotent_for_provisional_result(self) -> None:
+        self.assert_pm_follow_up_recovery("TASK-0018")
+
+    def test_pm_follow_up_recovery_is_idempotent_for_canonical_result(self) -> None:
+        self.assert_pm_follow_up_recovery("TASK-0003")
+
+    def pm_result_ready_fixture(self, plan: str) -> tuple:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        base = self.git(root, "rev-parse", "HEAD")
+        identity = "AMEND-0001"
+        worktree = common.new_worktree(root, config, identity, f"worktree/{identity}", base)
+        (worktree / "plan.md").write_text(plan, encoding="utf-8")
+        self.git(worktree, "add", "plan.md")
+        self.git(worktree, "commit", "-m", "amend plan")
+        result_sha = self.git(worktree, "rev-parse", "HEAD")
+
+        initial = [self.task(), self.task("TASK-0002")]
+        plan_hash = common.git_blob_identity(root, base, "plan.md")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        tasks.update(revision=1, planHash=plan_hash, definitionHash=common.definition_hash(initial, "task"), status="active", tasks=initial)
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+
+        analysis_path = paths.results / f"{identity}-analysis.json"
+        analysis = {
+            "summary": "append follow-up", "recommendation": "amend", "question": "Proceed?", "amendmentRequired": True,
+            "effects": {name: "updated" for name in ("requirements", "plan", "tasks", "bugs", "completedWork", "schedule")},
+            "options": [{
+                "optionId": "OPTION-0001", "label": "Amend", "description": "Append work", "recommended": True,
+                "action": "amend", "requiresInput": False, "inputPrompt": None,
+                "authorizedDocumentationPaths": [], "bugDispositions": [],
+            }],
+            "affectedTaskIds": ["TASK-0001"], "affectedBugIds": [],
+        }
+        common.write_immutable_json(analysis_path, analysis)
+        decision = project_manager.decision_identity(identity, "OPTION-0001", "OPTION-0001", analysis["question"])
+        blocker = dict(project_manager.structured_blocker("scope changed", "build", "TASK-0001"), kind="scope_gap", requiresUserDecision=True, scopeChangePossible=True)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        state.update(
+            stage="build", stageStatus="amending", targetBaseSha=base, integrationSha=base, planHash=plan_hash,
+            requirementsHash=common.git_blob_identity(root, base, "requirements.md"), taskDefinitionHash=tasks["definitionHash"],
+            amendmentSequence=1, activeAmendment={
+                "amendmentId": identity, "sourceStage": "build", "sourceKind": "task", "sourceIdentity": "TASK-0001",
+                "status": "result_ready", "blocker": blocker, "analysisResultPath": str(analysis_path),
+                "selectedOptionId": "OPTION-0001", "userResponse": "OPTION-0001", "decisionIdentity": decision,
+                "authorizedDocumentationPaths": ["requirements.md", "plan.md"], "branch": f"worktree/{identity}",
+                "worktree": str(worktree), "baseSha": base, "resultSha": None, "pullRequest": None,
+                "affectedTaskIds": ["TASK-0001"], "affectedBugIds": [], "resumeStage": "build", "attemptCount": 1,
+            },
+        )
+        common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
+        definition = {
+            key: value for key, value in self.task("TASK-0018", ["TASK-0002"]).items()
+            if key in {"taskId", "title", "description", "requirementIds", "planSections", "dependencies", "allowedPaths", "exclusiveResources", "acceptanceCriteria", "checks"}
+        }
+        result_path = common.attempt_path(paths, "result", identity, 1)
+        common.write_immutable_json(result_path, {
+            "schemaVersion": "1.0", "identity": identity, "attempt": 1, "succeeded": True,
+            "result": {
+                "status": "completed", "summary": "amended", "decisionIdentity": decision,
+                "selectedOptionId": "OPTION-0001", "commitSha": result_sha, "changedFiles": ["plan.md"],
+                "newTasks": [definition], "supersededTaskIds": [], "resumeStage": "build", "blocker": None,
+            }, "error": None, "completedAt": common.utc_now(),
+        })
+        return root, config, paths, state, tasks, blocker, worktree, base, result_sha, result_path
+
+    def test_pm_plan_normalization_is_durable_and_replay_safe(self) -> None:
+        raw_plan = "# Plan\n\nImplement TASK-0018, then TASK-003. Preserve X-TASK-0018-extra.\n"
+        root, config, paths, state, tasks, blocker, worktree, base, result_sha, result_path = self.pm_result_ready_fixture(raw_plan)
+
+        with patch.object(project_manager, "save_state", side_effect=RuntimeError("interrupted after normalization")):
+            with self.assertRaisesRegex(RuntimeError, "interrupted after normalization"):
+                project_manager.invoke_pm_resolution(root, config, state, paths, tasks, None, "build", "task", "TASK-0001", blocker)
+
+        normalized_sha = self.git(worktree, "rev-parse", "HEAD")
+        self.assertNotEqual(normalized_sha, result_sha)
+        self.assertEqual(self.git(worktree, "rev-list", "--count", f"{base}..{normalized_sha}"), "2")
+        self.assertEqual(self.git(worktree, "show", f"{result_sha}:plan.md"), raw_plan.strip())
+        self.assertEqual(
+            self.git(worktree, "show", f"{normalized_sha}:plan.md"),
+            "# Plan\n\nImplement TASK-0003, then TASK-0003. Preserve X-TASK-0018-extra.",
+        )
+        self.assertIsNone(common.read_json(paths.state, paths.schemas / "state.schema.json")["activeAmendment"]["resultSha"])
+
+        for _ in range(2):
+            recovered_state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+            recovered_tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+            with patch.object(project_manager, "invoke_role", side_effect=RuntimeError("verifier reached")):
+                with self.assertRaisesRegex(RuntimeError, "verifier reached"):
+                    project_manager.invoke_pm_resolution(
+                        root, config, recovered_state, paths, recovered_tasks, None, "build", "task", "TASK-0001", blocker,
+                    )
+            self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), normalized_sha)
+            self.assertEqual(common.read_json(paths.state, paths.schemas / "state.schema.json")["activeAmendment"]["resultSha"], normalized_sha)
+
+        self.assertEqual(common.read_json(result_path)["result"]["newTasks"][0]["taskId"], "TASK-0018")
+
+    def test_pm_plan_normalization_recovers_exact_unstaged_plan(self) -> None:
+        raw_plan = "# Plan\n\nImplement TASK-0018.\n"
+        root, config, paths, state, tasks, blocker, worktree, base, result_sha, _ = self.pm_result_ready_fixture(raw_plan)
+        normalized = "# Plan\n\nImplement TASK-0003."
+        (worktree / "plan.md").write_text(normalized, encoding="utf-8")
+
+        with patch.object(project_manager, "invoke_role", side_effect=RuntimeError("verifier reached")):
+            with self.assertRaisesRegex(RuntimeError, "verifier reached"):
+                project_manager.invoke_pm_resolution(root, config, state, paths, tasks, None, "build", "task", "TASK-0001", blocker)
+
+        head = self.git(worktree, "rev-parse", "HEAD")
+        self.assertEqual(self.git(worktree, "rev-list", "--count", f"{base}..{head}"), "2")
+        self.assertEqual(self.git(worktree, "show", f"{head}:plan.md"), normalized.strip())
+        self.assertEqual(self.git(worktree, "status", "--porcelain", "--untracked-files=all"), "")
+        self.assertNotEqual(head, result_sha)
+
+    def test_pm_plan_normalization_recovers_exact_staged_plan(self) -> None:
+        raw_plan = "# Plan\n\nImplement TASK-0018.\n"
+        root, config, paths, state, tasks, blocker, worktree, base, result_sha, _ = self.pm_result_ready_fixture(raw_plan)
+        normalized = "# Plan\n\nImplement TASK-0003."
+        (worktree / "plan.md").write_text(normalized, encoding="utf-8")
+        self.git(worktree, "add", "plan.md")
+
+        with patch.object(project_manager, "invoke_role", side_effect=RuntimeError("verifier reached")):
+            with self.assertRaisesRegex(RuntimeError, "verifier reached"):
+                project_manager.invoke_pm_resolution(root, config, state, paths, tasks, None, "build", "task", "TASK-0001", blocker)
+
+        head = self.git(worktree, "rev-parse", "HEAD")
+        self.assertEqual(self.git(worktree, "rev-list", "--count", f"{base}..{head}"), "2")
+        self.assertEqual(self.git(worktree, "show", f"{head}:plan.md"), normalized.strip())
+        self.assertEqual(self.git(worktree, "status", "--porcelain", "--untracked-files=all"), "")
+        self.assertNotEqual(head, result_sha)
+
+    def test_pm_plan_normalization_rejects_mismatched_and_unrelated_dirt(self) -> None:
+        raw_plan = "# Plan\n\nImplement TASK-0018.\n"
+        root, config, paths, state, tasks, blocker, worktree, _, result_sha, _ = self.pm_result_ready_fixture(raw_plan)
+        (worktree / "plan.md").write_text("# Plan\n\nImplement TASK-0004.\n", encoding="utf-8")
+        with self.assertRaisesRegex(common.BraceError, "mismatched plan normalization"):
+            project_manager.invoke_pm_resolution(root, config, state, paths, tasks, None, "build", "task", "TASK-0001", blocker)
+        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), result_sha)
+
+        (worktree / "plan.md").write_text(raw_plan, encoding="utf-8")
+        (worktree / "unrelated.txt").write_text("unrelated", encoding="utf-8")
+        with self.assertRaisesRegex(common.BraceError, "unexpected uncommitted changes"):
+            project_manager.invoke_pm_resolution(root, config, state, paths, tasks, None, "build", "task", "TASK-0001", blocker)
+        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), result_sha)
+
+    def test_pm_plan_normalization_rejects_unknown_references_before_commit(self) -> None:
+        root, config, paths, state, tasks, blocker, worktree, base, result_sha, result_path = self.pm_result_ready_fixture(
+            "# Plan\n\nImplement TASK-9999.\n"
+        )
+        with self.assertRaisesRegex(common.BraceError, "Plan references unknown tasks: TASK-9999"):
+            project_manager.invoke_pm_resolution(root, config, state, paths, tasks, None, "build", "task", "TASK-0001", blocker)
+        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), result_sha)
+        self.assertEqual(self.git(worktree, "rev-list", "--count", f"{base}..{result_sha}"), "1")
+        self.assertIsNone(common.read_json(paths.state, paths.schemas / "state.schema.json")["activeAmendment"]["resultSha"])
+        self.assertEqual(common.read_json(result_path)["result"]["newTasks"][0]["taskId"], "TASK-0018")
+
     def test_conflict_scheduling(self) -> None:
         first, second = self.task(paths=["src/a/**"]), self.task("TASK-0002", paths=["src/b/**"])
         self.assertEqual([item["taskId"] for item in common.select_ready_items([first, second], "task", 2)], ["TASK-0001", "TASK-0002"])
@@ -45,7 +349,7 @@ class CoreTests(RepositoryTestCase):
         with self.assertRaisesRegex(common.BraceError, "evidence"):
             project_manager.structured_blocker(dict(semantic, evidence=""), "build", "TASK-0001")
 
-    def test_role_prompt_recommends_optional_ponytail(self) -> None:
+    def test_role_prompt_requires_empirical_ponytail_compliance(self) -> None:
         root, _, _ = self.make_repository()
         (root / ".codex" / "prompts" / "builder.md").write_text("builder role", encoding="utf-8")
         with patch.object(common, "invoke_codex", return_value={}) as invoke:
@@ -54,6 +358,12 @@ class CoreTests(RepositoryTestCase):
         self.assertIn("load and use it at full level", prompt)
         self.assertIn("optional and its absence is not a blocker", prompt)
         self.assertIn("required JSON output schema overrides", prompt)
+        self.assertIn("Identify the root cause and the component that owns the affected invariant", prompt)
+        self.assertIn("Prefer enforcing deterministic behavior in deterministic code", prompt)
+        self.assertIn("Recheck the proposed solution against every applicable Ponytail rule", prompt)
+        self.assertIn("Ponytail impact: chose [solution] at [owning layer] instead of [rejected alternative] because [reason].", prompt)
+        self.assertIn("Reviewers and verifiers must verify Ponytail compliance independently", prompt)
+        self.assertNotIn("Coordinator identity guidance", prompt)
 
     def test_pm_analysis_rejects_unknown_task(self) -> None:
         analysis = {
@@ -65,10 +375,132 @@ class CoreTests(RepositoryTestCase):
 
     def test_native_timeout_is_bounded(self) -> None:
         self.assertEqual(common.run_native(sys.executable, ["-c", "raise SystemExit(7)"], allowed_exit_codes=None).returncode, 7)
+        pid_path = self.base / "timeout-pids.json"
+        script = (
+            "import json, os, pathlib, subprocess, sys, time; "
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(4)']); "
+            "pathlib.Path(sys.argv[1]).write_text(json.dumps([os.getpid(), child.pid]), encoding='utf-8'); "
+            "time.sleep(30)"
+        )
+        started = time.monotonic()
+        with self.assertRaises(common.BraceError) as failure:
+            common.run_native(sys.executable, ["-c", script, pid_path], timeout_seconds=1)
+        self.assertLess(time.monotonic() - started, 8)
+        if os.name == "nt":
+            parent_pid, child_pid = json.loads(pid_path.read_text(encoding="utf-8"))
+            parent_deadline = time.monotonic() + 1
+            while self.windows_process_is_running(parent_pid) and time.monotonic() < parent_deadline:
+                time.sleep(0.05)
+            self.assertFalse(self.windows_process_is_running(parent_pid))
+            if "deadline" in str(failure.exception):
+                self.assertFalse(self.windows_process_is_running(child_pid))
+            else:
+                self.assertRegex(str(failure.exception), "Process-tree termination could not be verified")
+                deadline = time.monotonic() + 5
+                while self.windows_process_is_running(child_pid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertFalse(self.windows_process_is_running(child_pid))
+        else:
+            self.assertIn("deadline", str(failure.exception))
+
+    @unittest.skipUnless(os.name == "nt", "Windows process cleanup behavior")
+    def test_windows_tree_cleanup_uses_retained_parent_identity(self) -> None:
+        process = Mock(pid=1234)
+        process.wait.return_value = 0
+        process.poll.side_effect = [None, 0]
+
+        def exit_during_safe_parent_kill() -> None:
+            self.assertIsNone(process.poll())
+            self.assertEqual(process.poll(), 0)
+
+        process.kill.side_effect = exit_during_safe_parent_kill
+        with patch.object(common.subprocess, "run") as taskkill:
+            with self.assertRaisesRegex(common.BraceError, "could not be verified.*retained process-tree identity"):
+                common._terminate_tree(process, 1)
+        taskkill.assert_not_called()
+        process.kill.assert_called_once_with()
+        self.assertLessEqual(process.wait.call_args.kwargs["timeout"], 1)
+
+        process.reset_mock(side_effect=True)
+        process.wait.side_effect = subprocess.TimeoutExpired(["tracked"], 1)
+        with patch.object(common.subprocess, "run") as taskkill:
+            with self.assertRaisesRegex(common.BraceError, "Tracked process did not stop"):
+                common._terminate_tree(process, 1)
+        taskkill.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
+    def test_native_timeout_checks_tree_after_parent_exits(self) -> None:
+        pid_path = self.base / "exited-parent-pids.json"
+        child_script = "import time; time.sleep(4)"
+        script = (
+            "import json, os, pathlib, subprocess, sys; "
+            f"child = subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
+            "pathlib.Path(sys.argv[1]).write_text(json.dumps([os.getpid(), child.pid]), encoding='utf-8')"
+        )
+        started = time.monotonic()
+        with self.assertRaises(common.BraceError) as failure:
+            common.run_native(sys.executable, ["-c", script, pid_path], timeout_seconds=1)
+        self.assertLess(time.monotonic() - started, 8)
+        parent_pid, child_pid = json.loads(pid_path.read_text(encoding="utf-8"))
+        self.assertFalse(self.windows_process_is_running(parent_pid))
+        if "deadline" in str(failure.exception):
+            self.assertFalse(self.windows_process_is_running(child_pid))
+        else:
+            self.assertRegex(str(failure.exception), "Process-tree termination could not be verified")
+            self.assertTrue(self.windows_process_is_running(child_pid))
+            deadline = time.monotonic() + 5
+            while self.windows_process_is_running(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(self.windows_process_is_running(child_pid))
+
+    def test_posix_tree_cleanup_uses_spawn_group_after_parent_exits(self) -> None:
+        process = Mock(pid=1234)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with patch.object(common.os, "name", "posix"), patch.object(
+            common.os, "killpg", create=True
+        ) as killpg, patch.object(common.signal, "SIGKILL", 9, create=True):
+            common._terminate_tree(process, 1)
+        killpg.assert_called_once_with(1234, 9)
+        process.poll.assert_not_called()
+        process.wait.assert_called_once_with(timeout=1)
+
+        process.reset_mock()
+        process.wait.return_value = 0
+        with patch.object(common.os, "name", "posix"), patch.object(
+            common.os, "killpg", side_effect=ProcessLookupError, create=True
+        ), patch.object(common.signal, "SIGKILL", 9, create=True):
+            common._terminate_tree(process, 1)
+        process.kill.assert_not_called()
+        process.wait.assert_called_once_with(timeout=1)
+
+        process.reset_mock()
+        process.wait.return_value = 0
+        with patch.object(common.os, "name", "posix"), patch.object(
+            common.os, "killpg", side_effect=PermissionError("denied"), create=True
+        ), patch.object(common.signal, "SIGKILL", 9, create=True):
+            with self.assertRaisesRegex(common.BraceError, "could not be verified.*group 1234.*denied"):
+                common._terminate_tree(process, 1)
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=1)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group behavior")
+    def test_native_timeout_kills_posix_group_after_parent_exits(self) -> None:
+        sentinel = self.base / "surviving-descendant.txt"
+        child_script = (
+            "import pathlib, sys, time; time.sleep(2); "
+            "pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')"
+        )
+        script = (
+            "import subprocess, sys; "
+            f"subprocess.Popen([sys.executable, '-c', {child_script!r}, sys.argv[1]])"
+        )
         started = time.monotonic()
         with self.assertRaisesRegex(common.BraceError, "deadline"):
-            common.run_native(sys.executable, ["-c", "import time; time.sleep(30)"], timeout_seconds=1)
+            common.run_native(sys.executable, ["-c", script, sentinel], timeout_seconds=1)
         self.assertLess(time.monotonic() - started, 8)
+        time.sleep(3)
+        self.assertFalse(sentinel.exists())
 
     def test_output_schema_projection_supports_bundled_results(self) -> None:
         root, _, config = self.make_repository()
@@ -110,8 +542,12 @@ class CoreTests(RepositoryTestCase):
         schema_path = paths.schemas / "planning-result.schema.json"
         result = {
             "status": "complete", "questions": [], "normalizedRequirementsMarkdown": "requirements",
-            "planMarkdown": "plan", "tasks": [],
-            "summary": {"requirementsCount": 1, "taskCount": 0, "parallelizableTaskCount": 0,
+            "planMarkdown": "plan", "tasks": [{
+                "taskId": "TASK-0018", "title": "task", "description": "description", "requirementIds": ["REQ-ONE"],
+                "planSections": ["plan"], "dependencies": [], "allowedPaths": ["src/**"], "exclusiveResources": [],
+                "acceptanceCriteria": ["works"], "checks": ["check"],
+            }],
+            "summary": {"requirementsCount": 1, "taskCount": 1, "parallelizableTaskCount": 1,
                         "assumptions": [], "deferredScope": [], "deferredRequirementIds": []},
         }
         outcomes = [result, result | {"summary": result["summary"] | {"deferredRequirementIds": ["REQ-ONE", "REQ-ONE"]}}]
@@ -138,7 +574,12 @@ class CoreTests(RepositoryTestCase):
         executable.chmod(0o755)
         environment = {"PATH": str(executable_directory) + os.pathsep + os.environ.get("PATH", "")}
         with patch.dict(os.environ, environment), patch.object(common.subprocess, "Popen", Process):
-            self.assertEqual(common.invoke_codex("prompt", root, schema_path, "read-only", paths.logs), result)
+            returned = common.invoke_codex("prompt", root, schema_path, "read-only", paths.logs)
+            self.assertEqual(returned, result)
+            common.canonicalize_graph_identities(returned["tasks"], "task")
+            raw_result = common.read_json(next(paths.logs.glob("agent-*.result.json")))
+            self.assertEqual(raw_result["tasks"][0]["taskId"], "TASK-0018")
+            self.assertEqual(returned["tasks"][0]["taskId"], "TASK-0001")
             self.assertFalse(captured[0][0].exists())
             self.assertNotEqual(captured[0][0], schema_path.resolve())
             self.assertNotIn("uniqueItems", self.schema_keys(captured[0][1]))
