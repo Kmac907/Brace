@@ -96,14 +96,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(__version__, version("brace"))
 
     def test_release_workflow_versions_tests_tags_and_publishes(self) -> None:
-        workflow = (
-            Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml"
-        ).read_text(encoding="utf-8")
+        workflows = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+        self.assertFalse((workflows / "package.yml").exists())
+        workflow = (workflows / "release.yml").read_text(encoding="utf-8")
         for required in (
-            "workflow_dispatch:", "uv version --bump", "uv run --locked", "uv build",
-            "git tag -a", "git push --atomic", "gh release create", "--verify-tag",
+            "workflow_dispatch:",
+            "          - patch\n          - minor\n          - major",
+            'uv version --bump "${{ inputs.bump }}"',
+            "uv run --locked python -m unittest discover -s tests -v",
+            'dist/*.whl brace --version)" = "brace ${VERSION}"',
+            'dist/*.tar.gz brace --version)" = "brace ${VERSION}"',
+            'git commit -m "Release v${VERSION}"',
+            'git tag -a "v${VERSION}" -m "Brace v${VERSION}"',
+            'git push --atomic origin HEAD:main "refs/tags/v${VERSION}"',
+            'gh release create "v${VERSION}" dist/*',
+            "--verify-tag",
         ):
             self.assertIn(required, workflow)
+        self.assertEqual(workflow.count("uv build"), 1)
 
     def test_bundled_template_is_complete_and_has_no_scripts(self) -> None:
         template = bootstrap.bundled_template()
