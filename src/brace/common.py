@@ -122,11 +122,6 @@ def _command_line(command: str, arguments: list[str]) -> list[str]:
         if not pwsh:
             raise BraceError("Required command is unavailable: pwsh")
         return [pwsh, "-NoProfile", "-NonInteractive", "-File", source, *arguments]
-    if suffix in {".cmd", ".bat"}:
-        comspec = os.environ.get("COMSPEC")
-        if not comspec:
-            raise BraceError(f"Windows command script cannot run on this platform: {source}")
-        return [comspec, "/d", "/c", source, *arguments]
     return [source, *arguments]
 
 
