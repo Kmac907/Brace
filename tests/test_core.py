@@ -403,6 +403,15 @@ class CoreTests(RepositoryTestCase):
         else:
             self.assertIn("deadline", str(failure.exception))
 
+    @unittest.skipUnless(os.name == "nt", "Windows command script behavior")
+    def test_native_runs_command_script_from_path_with_spaces(self) -> None:
+        directory = self.base / "Program Files"
+        directory.mkdir()
+        script = directory / "capture argument.cmd"
+        script.write_text("@echo off\n@echo(%~1\n", encoding="utf-8")
+
+        self.assertEqual(common.run_native(str(script), ["Endpoint Engineering"]).output, "Endpoint Engineering")
+
     @unittest.skipUnless(os.name == "nt", "Windows process cleanup behavior")
     def test_windows_tree_cleanup_uses_retained_parent_identity(self) -> None:
         process = Mock(pid=1234)
