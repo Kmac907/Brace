@@ -137,11 +137,9 @@ def _popen_options() -> dict[str, Any]:
 
 
 def _terminate_tree(process: subprocess.Popen[str], grace_seconds: int) -> None:
-    if os.name != "nt" and process.poll() is not None:
-        return
+    tree_error: str | None = None
     if os.name == "nt":
         deadline = time.monotonic() + grace_seconds
-        tree_error: str | None = None
         try:
             terminated = subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
@@ -168,13 +166,20 @@ def _terminate_tree(process: subprocess.Popen[str], grace_seconds: int) -> None:
         if tree_error:
             raise BraceError(f"Process-tree termination could not be verified: {tree_error}")
         return
-    else:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        tree_error = f"os.killpg could not terminate group {process.pid}: {exc}"
+        with contextlib.suppress(OSError):
+            process.kill()
     try:
         process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired as exc:
         raise BraceError("Process tree did not stop within cleanup grace.") from exc
+    if tree_error:
+        raise BraceError(f"Process-tree termination could not be verified: {tree_error}")
 
 
 def run_native(
