@@ -100,19 +100,29 @@ class CliTests(unittest.TestCase):
         self.assertFalse((workflows / "package.yml").exists())
         workflow = (workflows / "release.yml").read_text(encoding="utf-8")
         lines = [line.strip() for line in workflow.splitlines()]
+        commands = [line.removeprefix("run: ") for line in lines]
         for required in (
             "workflow_dispatch:",
             "          - patch\n          - minor\n          - major",
             'uv version --bump "${{ inputs.bump }}"',
             "uv run --locked python -m unittest discover -s tests -v",
-            'dist/*.whl brace --version)" = "brace ${VERSION}"',
-            'dist/*.tar.gz brace --version)" = "brace ${VERSION}"',
             'git commit -m "Release v${VERSION}"',
             'git tag -a "v${VERSION}" -m "Brace v${VERSION}"',
             'git push --atomic origin HEAD:main "refs/tags/v${VERSION}"',
         ):
             self.assertIn(required, workflow)
-        self.assertEqual(lines.count("run: uv build"), 1)
+        self.assertIn(
+            "      - name: Build wheel and source distribution\n"
+            "        run: uv build\n"
+            "      - name: Verify distributions",
+            workflow,
+        )
+        self.assertEqual(sum(command == "uv build" or command.startswith("uv build ") for command in commands), 1)
+        for verification in (
+            'test "$(uv run --isolated --no-project --with dist/*.whl brace --version)" = "brace ${VERSION}"',
+            'test "$(uv run --isolated --no-project --with dist/*.tar.gz brace --version)" = "brace ${VERSION}"',
+        ):
+            self.assertIn(verification, lines)
         self.assertIn(
             'run: gh release create "v${VERSION}" dist/* --verify-tag --generate-notes --title "Brace v${VERSION}"',
             lines,
