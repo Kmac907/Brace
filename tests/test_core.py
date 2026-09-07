@@ -416,7 +416,7 @@ class CoreTests(RepositoryTestCase):
         process.wait.assert_called_once()
 
         process.reset_mock()
-        process.poll.return_value = 0
+        process.poll.return_value = None
         process.wait.return_value = 0
         failed = subprocess.CompletedProcess(["taskkill"], 5, stdout="", stderr="Access is denied")
         with patch.object(common.subprocess, "run", return_value=failed) as taskkill:
@@ -427,12 +427,22 @@ class CoreTests(RepositoryTestCase):
         process.wait.assert_called_once()
 
         process.reset_mock()
-        process.poll.return_value = 0
+        process.poll.return_value = None
         process.wait.return_value = 0
         terminated = subprocess.CompletedProcess(["taskkill"], 0, stdout="SUCCESS", stderr="")
         with patch.object(common.subprocess, "run", return_value=terminated) as taskkill:
             common._terminate_tree(process, 1)
         taskkill.assert_called_once()
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once()
+
+        process.reset_mock()
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with patch.object(common.subprocess, "run") as taskkill:
+            with self.assertRaisesRegex(common.BraceError, "could not be verified.*tracked parent exited"):
+                common._terminate_tree(process, 1)
+        taskkill.assert_not_called()
         process.kill.assert_called_once_with()
         process.wait.assert_called_once()
 

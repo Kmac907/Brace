@@ -140,23 +140,26 @@ def _terminate_tree(process: subprocess.Popen[str], grace_seconds: int) -> None:
     tree_error: str | None = None
     if os.name == "nt":
         deadline = time.monotonic() + grace_seconds
-        try:
-            terminated = subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                timeout=max(grace_seconds / 2, 0.1),
-            )
-            if terminated.returncode != 0:
-                detail = (terminated.stdout + os.linesep + terminated.stderr).strip()
-                tree_error = f"taskkill exited with code {terminated.returncode}{': ' + detail if detail else ''}"
-        except subprocess.TimeoutExpired:
-            tree_error = "taskkill exceeded the cleanup grace"
-        except OSError as exc:
-            tree_error = f"taskkill could not run: {exc}"
+        if process.poll() is not None:
+            tree_error = "tracked parent exited before its process tree could be terminated safely"
+        else:
+            try:
+                terminated = subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                    timeout=max(grace_seconds / 2, 0.1),
+                )
+                if terminated.returncode != 0:
+                    detail = (terminated.stdout + os.linesep + terminated.stderr).strip()
+                    tree_error = f"taskkill exited with code {terminated.returncode}{': ' + detail if detail else ''}"
+            except subprocess.TimeoutExpired:
+                tree_error = "taskkill exceeded the cleanup grace"
+            except OSError as exc:
+                tree_error = f"taskkill could not run: {exc}"
         with contextlib.suppress(OSError):
             process.kill()
         try:
