@@ -461,6 +461,55 @@ class CoreTests(RepositoryTestCase):
                 time.sleep(0.05)
             self.assertFalse(self.windows_process_is_running(child_pid))
 
+    def test_posix_tree_cleanup_uses_spawn_group_after_parent_exits(self) -> None:
+        process = Mock(pid=1234)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with patch.object(common.os, "name", "posix"), patch.object(
+            common.os, "killpg", create=True
+        ) as killpg, patch.object(common.signal, "SIGKILL", 9, create=True):
+            common._terminate_tree(process, 1)
+        killpg.assert_called_once_with(1234, 9)
+        process.poll.assert_not_called()
+        process.wait.assert_called_once_with(timeout=1)
+
+        process.reset_mock()
+        process.wait.return_value = 0
+        with patch.object(common.os, "name", "posix"), patch.object(
+            common.os, "killpg", side_effect=ProcessLookupError, create=True
+        ), patch.object(common.signal, "SIGKILL", 9, create=True):
+            common._terminate_tree(process, 1)
+        process.kill.assert_not_called()
+        process.wait.assert_called_once_with(timeout=1)
+
+        process.reset_mock()
+        process.wait.return_value = 0
+        with patch.object(common.os, "name", "posix"), patch.object(
+            common.os, "killpg", side_effect=PermissionError("denied"), create=True
+        ), patch.object(common.signal, "SIGKILL", 9, create=True):
+            with self.assertRaisesRegex(common.BraceError, "could not be verified.*group 1234.*denied"):
+                common._terminate_tree(process, 1)
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=1)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group behavior")
+    def test_native_timeout_kills_posix_group_after_parent_exits(self) -> None:
+        sentinel = self.base / "surviving-descendant.txt"
+        child_script = (
+            "import pathlib, sys, time; time.sleep(2); "
+            "pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')"
+        )
+        script = (
+            "import subprocess, sys; "
+            f"subprocess.Popen([sys.executable, '-c', {child_script!r}, sys.argv[1]])"
+        )
+        started = time.monotonic()
+        with self.assertRaisesRegex(common.BraceError, "deadline"):
+            common.run_native(sys.executable, ["-c", script, sentinel], timeout_seconds=1)
+        self.assertLess(time.monotonic() - started, 8)
+        time.sleep(3)
+        self.assertFalse(sentinel.exists())
+
     def test_output_schema_projection_supports_bundled_results(self) -> None:
         root, _, config = self.make_repository()
         schemas = common.initialize_state_files(root, config).schemas
