@@ -1226,7 +1226,9 @@ def _wait_for_required_checks(root: str | Path, config: dict[str, Any], pull_req
             root,
             allowed_exit_codes=(0, 1, 8),
         )
-        no_checks = result.returncode == 1 and result.output.lstrip().lower().startswith("no checks reported")
+        no_checks = result.returncode == 1 and re.fullmatch(
+            r"no (?:required )?checks reported on the '.+' branch", result.output.strip(), re.IGNORECASE
+        ) is not None
         if result.returncode != 0 and not no_checks:
             raise BraceError(f"Required GitHub checks did not pass for pull request {pull_request['id']}.\n{result.output}")
         return
@@ -1253,7 +1255,8 @@ def _wait_for_required_checks(root: str | Path, config: dict[str, Any], pull_req
 def complete_pull_request(root: str | Path, config: dict[str, Any], pull_request: dict[str, Any], expected_head_sha: str, expected_base_sha: str) -> dict[str, Any]:
     if pull_request["repository"] != get_repository_identity(root, config):
         raise BraceError("Pull request repository identity does not match this workflow.")
-    if pull_request["state"] not in {"merged", "completed"}:
+    recovering_merge = pull_request["state"] in {"merged", "completed"}
+    if not recovering_merge:
         if pull_request["state"] not in {"open", "active"}:
             raise BraceError(f"Pull request {pull_request['id']} cannot be merged from state {pull_request['state']}.")
         current = get_pull_request(root, config, pull_request["head"], pull_request["base"], expected_head_sha, pull_request["id"], expected_base_sha)
@@ -1281,6 +1284,8 @@ def complete_pull_request(root: str | Path, config: dict[str, Any], pull_request
         raise BraceError("Provider did not return a verifiable merged pull request.")
     if any(str(merged.get(field)) != str(value) for field, value in {"repository": pull_request["repository"], "id": pull_request["id"], "head": pull_request["head"], "headSha": expected_head_sha, "base": pull_request["base"]}.items()):
         raise BraceError("Merged pull request identity does not match the reviewed candidate.")
+    if recovering_merge:
+        _wait_for_required_checks(root, config, merged)
     run_native("git", ["-C", root, "fetch", config["remote"], "--prune"])
     base_sha = run_native("git", ["-C", root, "rev-parse", f"{config['remote']}/{pull_request['base']}"]).output.strip()
     merge_parent = run_native("git", ["-C", root, "rev-parse", f"{merged['mergeSha']}^1"]).output.strip()

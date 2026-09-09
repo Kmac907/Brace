@@ -98,7 +98,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_pending_or_failed_required_github_checks_block_merge(self) -> None:
         pull_request = self.pull_request()
-        for returncode, output in ((8, "checks pending"), (1, "build fail")):
+        for returncode, output in ((8, "checks pending"), (1, "build fail"), (1, "no required checks reported: provider failure")):
             with self.subTest(returncode=returncode):
                 commands: list[list[str]] = []
 
@@ -114,6 +114,12 @@ class SafetyTests(unittest.TestCase):
                 ):
                     common.complete_pull_request(".", self.provider_config(), pull_request, pull_request["headSha"], pull_request["baseSha"])
                 self.assertFalse(any(arguments[:2] == ["pr", "merge"] for arguments in commands))
+
+    def test_empty_required_github_check_set_is_allowed(self) -> None:
+        pull_request = self.pull_request()
+        response = "no required checks reported on the 'worktree/TASK-0001' branch"
+        with patch.object(common, "run_native", return_value=common.NativeResult(1, response)):
+            common._wait_for_required_checks(".", self.provider_config(), pull_request)
 
     def test_azure_source_sha_mismatch_blocks_completion(self) -> None:
         pull_request = self.pull_request("azure_devops")
@@ -158,7 +164,7 @@ class SafetyTests(unittest.TestCase):
         ):
             common.complete_pull_request(".", self.provider_config(), pull_request, pull_request["headSha"], pull_request["baseSha"])
 
-    def test_merged_recovery_uses_reviewed_base_not_moved_provider_base(self) -> None:
+    def test_merged_recovery_revalidates_checks_and_reviewed_base(self) -> None:
         reviewed_base = "a" * 40
         pull_request = self.pull_request(state="merged") | {"baseSha": "c" * 40, "mergeSha": "d" * 40}
         commands: list[list[str]] = []
@@ -177,7 +183,31 @@ class SafetyTests(unittest.TestCase):
         ):
             recovered = common.complete_pull_request(".", self.provider_config(), pull_request, pull_request["headSha"], reviewed_base)
         self.assertEqual(recovered["baseSha"], reviewed_base)
-        self.assertFalse(any(arguments[:2] in (["pr", "checks"], ["pr", "merge"]) for arguments in commands))
+        self.assertTrue(any(arguments[:2] == ["pr", "checks"] for arguments in commands))
+        self.assertFalse(any(arguments[:2] == ["pr", "merge"] for arguments in commands))
+
+    def test_merged_recovery_rejects_failed_or_pending_checks(self) -> None:
+        pull_request = self.pull_request(state="merged") | {"mergeSha": "d" * 40}
+        for returncode, output in ((8, "checks pending"), (1, "build fail")):
+            with self.subTest(returncode=returncode):
+                with (
+                    patch.object(common, "get_repository_identity", return_value=pull_request["repository"]),
+                    patch.object(common, "get_pull_request", return_value=pull_request),
+                    patch.object(common, "run_native", return_value=common.NativeResult(returncode, output)),
+                    self.assertRaisesRegex(common.BraceError, "checks did not pass"),
+                ):
+                    common.complete_pull_request(".", self.provider_config(), pull_request, pull_request["headSha"], pull_request["baseSha"])
+
+    def test_merged_recovery_rejects_missing_provider_record(self) -> None:
+        pull_request = self.pull_request(state="merged") | {"mergeSha": "d" * 40}
+        with (
+            patch.object(common, "get_repository_identity", return_value=pull_request["repository"]),
+            patch.object(common, "get_pull_request", return_value=None),
+            patch.object(common, "run_native") as native,
+            self.assertRaisesRegex(common.BraceError, "verifiable merged pull request"),
+        ):
+            common.complete_pull_request(".", self.provider_config(), pull_request, pull_request["headSha"], pull_request["baseSha"])
+        native.assert_not_called()
 
     def test_failed_publication_preserves_assignment_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
