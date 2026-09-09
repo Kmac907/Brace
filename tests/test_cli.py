@@ -34,12 +34,82 @@ class CliTests(RepositoryTestCase):
         self.assertEqual(args.command, "init")
         self.assertEqual(args.maximum_concurrent_builders, 4)
         self.assertEqual(args.maximum_concurrent_fixers, 5)
+        omitted = cli.parser().parse_args(["init"])
+        self.assertIsNone(omitted.maximum_concurrent_builders)
+        self.assertIsNone(omitted.maximum_concurrent_fixers)
 
         plan = cli.parser().parse_args(["plan", "repository", "--start-new-workflow"])
         self.assertEqual((plan.command, plan.repository, plan.start_new_workflow), ("plan", "repository", True))
         self.assertEqual(cli.parser().parse_args(["build"]).repository, ".")
         self.assertEqual(cli.parser().parse_args(["audit"]).repository, ".")
         self.assertEqual(cli.parser().parse_args(["status"]).repository, ".")
+
+    def test_init_concurrency_defaults_and_rejects_invalid_interactive_values(self) -> None:
+        with (
+            patch.object(bootstrap.sys.stdin, "isatty", return_value=False),
+            patch.object(bootstrap, "ask") as ask,
+        ):
+            self.assertEqual(bootstrap.concurrency_ceiling(None, "builders"), 3)
+            self.assertEqual(bootstrap.concurrency_ceiling(4, "fixers"), 4)
+        ask.assert_not_called()
+
+        with (
+            patch.object(bootstrap.sys.stdin, "isatty", return_value=True),
+            patch.object(bootstrap, "ask", return_value="7") as ask,
+        ):
+            self.assertEqual(bootstrap.concurrency_ceiling(4, "fixers"), 4)
+            self.assertEqual(bootstrap.concurrency_ceiling(None, "builders"), 7)
+        self.assertEqual(ask.call_count, 1)
+        self.assertIn("may choose fewer", ask.call_args.args[0])
+
+        args = cli.parser().parse_args([
+            "init", "--project-name", "example", "--parent-directory", str(self.base), "--provider", "github",
+        ])
+        with (
+            patch.object(bootstrap.shutil, "which", return_value="available"),
+            patch.object(bootstrap.sys.stdin, "isatty", return_value=True),
+            patch.object(bootstrap, "ask", return_value="0"),
+            self.assertRaisesRegex(bootstrap.BootstrapError, "between 1 and 32"),
+        ):
+            bootstrap.bootstrap(args)
+        self.assertFalse((self.base / "example").exists())
+
+    def test_interactive_init_persists_concurrency_ceilings(self) -> None:
+        target = self.base / "existing"
+        target.mkdir()
+        args = cli.parser().parse_args(["init", "--existing-repository-path", str(target)])
+        commit = "a" * 40
+
+        def native(command: str, arguments: list[str], *_args: object, **_kwargs: object) -> common.NativeResult:
+            if command == "git" and arguments[:2] in (["config", "user.name"], ["config", "user.email"]):
+                return common.NativeResult(0, "Test")
+            if command == "git" and arguments[:3] == ["diff", "--cached", "--name-only"]:
+                return common.NativeResult(0, ".codex/workflow.json\n")
+            if command == "git" and arguments[:2] in (["rev-parse", "HEAD"], ["rev-parse", "origin/main"]):
+                return common.NativeResult(0, commit)
+            return common.NativeResult(0, "")
+
+        with (
+            patch.object(bootstrap.shutil, "which", return_value="available"),
+            patch.object(bootstrap.sys.stdin, "isatty", return_value=True),
+            patch.object(bootstrap, "ask", side_effect=["7", "8"]) as ask,
+            patch.object(bootstrap, "existing_details", return_value={
+                "root": str(target), "provider": "github", "target": "main",
+                "identity": "owner/repository", "repository": "repository", "github_owner": "owner",
+            }),
+            patch.object(bootstrap, "run_native", side_effect=native),
+            patch.object(bootstrap, "initialize_state_files", return_value=common.Paths(target)),
+            patch.object(bootstrap, "get_configuration", return_value={}),
+            patch.object(bootstrap, "read_json", return_value={"repository": "owner/repository"}),
+            patch.object(bootstrap, "info"),
+            patch.object(bootstrap, "success"),
+        ):
+            bootstrap.bootstrap(args)
+
+        workflow = json.loads((target / ".codex" / "workflow.json").read_text(encoding="utf-8"))
+        self.assertEqual(workflow["maximumConcurrentBuilders"], 7)
+        self.assertEqual(workflow["maximumConcurrentFixers"], 8)
+        self.assertEqual(ask.call_count, 2)
 
     def test_plan_dispatch_and_expected_error_exit(self) -> None:
         with patch.object(cli.planning, "run") as run:
