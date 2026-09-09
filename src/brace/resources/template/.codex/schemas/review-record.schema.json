@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "identity",
+    "attempt",
+    "reviewer",
+    "baseSha",
+    "candidateSha",
+    "completedAt",
+    "result"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "1.0"
+    },
+    "identity": {
+      "type": "string",
+      "pattern": "^(TASK|BUG)-[0-9]{4}$"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "reviewer": {
+      "enum": [1, 2]
+    },
+    "baseSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "candidateSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "completedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "result": {
+      "$ref": "verifier-result.schema.json"
+    }
+  },
+  "additionalProperties": false
+}

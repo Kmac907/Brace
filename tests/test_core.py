@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -643,6 +644,106 @@ class CoreTests(RepositoryTestCase):
         amendment = common.new_worktree(root, config, "AMEND-0001", "worktree/AMEND-0001", base)
         self.assertEqual(self.git(amendment, "branch", "--show-current"), "worktree/AMEND-0001")
         common.remove_worktree(root, config, "AMEND-0001", "worktree/AMEND-0001")
+
+    def test_review_records_are_distinct_resumable_and_candidate_bound(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        base = "a" * 40
+        candidate = "b" * 40
+        approved = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
+
+        first = common.write_review_result(paths, "TASK-0001", 2, 1, base, candidate, approved)
+        second = common.write_review_result(paths, "TASK-0001", 2, 2, base, candidate, approved)
+
+        self.assertEqual(common.review_path(paths, "TASK-0001", 2, 1).name, "TASK-0001-attempt-002-review-01.json")
+        self.assertNotEqual(common.review_path(paths, "TASK-0001", 2, 1), common.review_path(paths, "TASK-0001", 2, 2))
+        self.assertNotEqual(common.review_path(paths, "TASK-0001", 2, 1), common.attempt_path(paths, "result", "TASK-0001", 2))
+        self.assertEqual(common.read_review_result(paths, "TASK-0001", 2, 1, base, candidate), first)
+        self.assertEqual(common.read_review_result(paths, "TASK-0001", 2, 2, base, candidate), second)
+        self.assertIsNone(common.read_review_result(paths, "TASK-0001", 2, 1, base, "c" * 40))
+        self.assertEqual(len(list(paths.results.glob("TASK-0001-attempt-002-review-*.json"))), 2)
+
+        for completed_at, error in (("not-a-date-time", "date-time"), ("2026-09-09T00:00:00+01:60", "date-time"), (123, "string")):
+            malformed = dict(first, completedAt=completed_at)
+            common.write_text_atomic(common.review_path(paths, "TASK-0001", 2, 1), common.pretty_json(malformed))
+            with self.subTest(completed_at=completed_at), self.assertRaisesRegex(common.BraceError, error):
+                common.read_review_result(paths, "TASK-0001", 2, 1, base, candidate)
+
+    def test_review_worktree_recovery_mutation_and_cleanup(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        base = self.git(root, "rev-parse", "HEAD")
+        candidate_file = root / "candidate.txt"
+        candidate_file.write_text("candidate\n", encoding="utf-8")
+        (root / ".gitignore").write_text(".ignored/\n", encoding="utf-8")
+        self.git(root, "add", "candidate.txt", ".gitignore")
+        self.git(root, "commit", "-m", "candidate")
+        candidate = self.git(root, "rev-parse", "HEAD")
+        approved = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
+
+        worktree = common.new_review_worktree(root, config, "BUG-0001", 1, 1, candidate)
+        self.assertTrue(worktree.is_absolute())
+        self.assertEqual(self.git(worktree, "branch", "--show-current"), "")
+        self.assertEqual(common.new_review_worktree(root, config, "BUG-0001", 1, 1, candidate), worktree)
+        with self.assertRaisesRegex(common.BraceError, "matching durable result"):
+            common.remove_review_worktree(root, config, paths, "BUG-0001", 1, 1, base, candidate)
+
+        (worktree / "untracked.txt").write_text("mutation\n", encoding="utf-8")
+        with self.assertRaisesRegex(common.BraceError, "contains changes"):
+            common.assert_review_worktree(worktree, candidate)
+        (worktree / "untracked.txt").unlink()
+        (worktree / ".ignored").mkdir()
+        (worktree / ".ignored" / "mutation.txt").write_text("ignored\n", encoding="utf-8")
+        with self.assertRaisesRegex(common.BraceError, "contains changes"):
+            common.assert_review_worktree(worktree, candidate)
+        (worktree / ".ignored" / "mutation.txt").unlink()
+        (worktree / ".ignored").rmdir()
+        (worktree / ".ignored").mkdir()
+        with self.assertRaisesRegex(common.BraceError, "contains changes"):
+            common.assert_review_worktree(worktree, candidate)
+        (worktree / ".ignored").rmdir()
+        common.write_review_result(paths, "BUG-0001", 1, 1, base, candidate, approved)
+        common.remove_review_worktree(root, config, paths, "BUG-0001", 1, 1, base, candidate)
+        self.assertFalse(worktree.exists())
+
+        def mutate_review(_: Path, review_worktree: Path, role: str, context: str, schema: str, sandbox: str) -> dict:
+            self.assertEqual((role, schema, sandbox), ("verifier", "verifier-result.schema.json", "read-only"))
+            (Path(review_worktree) / "mutation.txt").write_text("changed\n", encoding="utf-8")
+            return approved
+
+        with patch.object(common, "invoke_role", side_effect=mutate_review) as invoke:
+            self.assertEqual(common.run_review(root, paths, "BUG-0001", 1, 1, base, candidate, "review"), common.read_review_result(paths, "BUG-0001", 1, 1, base, candidate))
+            invoke.assert_not_called()
+            with self.assertRaisesRegex(common.BraceError, "contains changes"):
+                common.run_review(root, paths, "BUG-0001", 1, 2, base, candidate, "review")
+
+        second_worktree = common.review_worktree_path(root, config, "BUG-0001", 1, 2)
+        self.assertFalse(common.review_path(paths, "BUG-0001", 1, 2).exists())
+        (second_worktree / "mutation.txt").unlink()
+        with patch.object(common, "invoke_role", return_value=approved) as invoke:
+            common.run_review(root, paths, "BUG-0001", 1, 2, base, candidate, "review")
+            invoke.assert_called_once()
+        common.remove_review_worktree(root, config, paths, "BUG-0001", 1, 2, base, candidate)
+        self.assertFalse(second_worktree.exists())
+
+    def test_review_worktree_recovers_and_cleans_stale_registration(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        base = candidate = self.git(root, "rev-parse", "HEAD")
+        approved = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
+
+        interrupted = common.new_review_worktree(root, config, "TASK-0001", 1, 1, candidate)
+        shutil.rmtree(interrupted)
+        self.assertTrue(common._worktree_registered(root, interrupted))
+        self.assertEqual(common.new_review_worktree(root, config, "TASK-0001", 1, 1, candidate), interrupted)
+        common.write_review_result(paths, "TASK-0001", 1, 1, base, candidate, approved)
+        common.remove_review_worktree(root, config, paths, "TASK-0001", 1, 1, base, candidate)
+
+        completed = common.new_review_worktree(root, config, "TASK-0001", 1, 2, candidate)
+        common.write_review_result(paths, "TASK-0001", 1, 2, base, candidate, approved)
+        shutil.rmtree(completed)
+        common.remove_review_worktree(root, config, paths, "TASK-0001", 1, 2, base, candidate)
+        self.assertFalse(common._worktree_registered(root, completed))
 
     def test_unknown_integration_commit_is_rejected(self) -> None:
         root, remote, config = self.make_repository()
