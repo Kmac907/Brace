@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import unittest
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -90,7 +91,7 @@ class CliTests(RepositoryTestCase):
             "stage": "build", "stageStatus": "running", "repository": "owner/repo",
             "targetBranch": "main", "integrationBranch": "brace/integration", "integrationSha": "abc",
             "blocker": {"message": "operator input required", "requiredDecision": "choose a scope"},
-            "updatedAt": "2026-09-09T00:00:00Z",
+            "updatedAt": "2026-09-09t00:00:00z",
         }
         tasks = {"tasks": [
             {"taskId": "TASK-0001", "status": "integrated", "attemptCount": 1, "lastError": None, "pullRequest": None},
@@ -135,13 +136,17 @@ class CliTests(RepositoryTestCase):
         output = io.StringIO()
         with patch.object(ui, "console", Console(file=output, force_terminal=False, color_system=None, width=500, theme=ui.THEME)):
             ui.agent_heartbeat("builder", "TASK-0001", 2, 62)
-            ui.agent_completed("builder", "TASK-0001", 2, 63, "done\n" + "x" * 400)
+            ui.agent_completed(
+                "builder", "TASK-0001", 2, 63,
+                "\x1b[31mdone\x1b[0m \x1b]8;;https://example.invalid\x07link\x1b]8;;\x07\n" + "x" * 400,
+            )
         rendered = output.getvalue()
         self.assertNotIn("\x1b", rendered)
         self.assertIn("Heartbeat: builder | TASK-0001 | attempt 2 | elapsed 00:01:02", rendered)
         self.assertIn("Completed: builder | TASK-0001 | attempt 2 | elapsed 00:01:03", rendered)
         self.assertIn("…", rendered)
         self.assertNotIn("x" * 241, rendered)
+        self.assertNotIn("]8;;", rendered)
 
     def test_status_reads_validated_state_while_lock_is_owned_without_mutation(self) -> None:
         root, _, config = self.make_repository()
@@ -187,6 +192,38 @@ class CliTests(RepositoryTestCase):
         paths = common.initialize_state_files(root, config)
         paths.state.write_text("{", encoding="utf-8")
         with self.assertRaisesRegex(BraceError, "Unable to read Brace status: Invalid JSON"):
+            common.show_repository_status(root)
+
+    def test_status_rejects_malformed_assignment_concisely(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        task = self.task() | {"status": "active", "attemptCount": 1}
+        task_hash = common.definition_hash([task], "task")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        tasks.update(status="active", definitionHash=task_hash, tasks=[task])
+        state["taskDefinitionHash"] = task_hash
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
+        assignment = common.attempt_path(paths, "assignment", task["taskId"], 1)
+        assignment.parent.mkdir(parents=True, exist_ok=True)
+        assignment.write_text("[]", encoding="utf-8")
+        with self.assertRaisesRegex(BraceError, "Unable to read Brace status: Active assignment record is invalid"):
+            common.show_repository_status(root)
+
+    def test_status_rejects_definition_drift(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        task = self.task()
+        task_hash = common.definition_hash([task], "task")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        tasks.update(status="ready", definitionHash=task_hash, tasks=[task])
+        state["taskDefinitionHash"] = task_hash
+        tasks["tasks"][0]["title"] = "altered after planning"
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
+        with self.assertRaisesRegex(BraceError, "task ledger definitions changed"):
             common.show_repository_status(root)
 
     def test_runtime_version_uses_package_metadata(self) -> None:

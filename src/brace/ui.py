@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any
@@ -16,6 +17,7 @@ THEME = Theme({"brace": "bold cyan", "success": "bold green", "warning": "yellow
 console = Console(theme=THEME)
 error_console = Console(stderr=True, theme=THEME)
 MAXIMUM_SUMMARY_CHARACTERS = 240
+TERMINAL_ESCAPE = re.compile(r"\x1b(?:\][^\x07]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])")
 
 
 def _duration(seconds: float) -> str:
@@ -43,6 +45,8 @@ def agent_completed(operation: str, identity: str | None, attempt: int | None, e
         )
     else:
         rendered = "Validated result received"
+    rendered = TERMINAL_ESCAPE.sub("", rendered)
+    rendered = " ".join("".join(character for character in rendered if character.isprintable() or character.isspace()).split())
     if len(rendered) > MAXIMUM_SUMMARY_CHARACTERS:
         rendered = rendered[: MAXIMUM_SUMMARY_CHARACTERS - 1].rstrip() + "…"
     info("Completed: " + _activity(operation, identity, attempt, elapsed) + f" | {rendered}", "success")
@@ -105,7 +109,10 @@ def render_status(
     table.add_row("Integration", "", str(state["integrationBranch"]))
     integration_sha = str(state.get("integrationSha") or "")
     table.add_row("Integration SHA", "", integration_sha[:12])
-    updated = datetime.fromisoformat(str(state["updatedAt"]).replace("Z", "+00:00"))
+    timestamp = str(state["updatedAt"])
+    if timestamp[-1:] in {"Z", "z"}:
+        timestamp = timestamp[:-1] + "+00:00"
+    updated = datetime.fromisoformat(timestamp)
     table.add_row("Updated", "", f"{state['updatedAt']} ({_duration((now - updated).total_seconds())} ago)")
     if tasks is not None:
         complete, total = sum(item["status"] in {"integrated", "superseded"} for item in tasks["tasks"]), len(tasks["tasks"])

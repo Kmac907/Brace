@@ -1574,6 +1574,10 @@ def show_repository_status(repository: str | Path = ".") -> None:
         bugs = read_json(paths.bugs, paths.schemas / "bugs.schema.json")
         if Path(state["repositoryRoot"]).resolve() != root:
             raise BraceError("Recorded repository root does not match the requested repository.")
+        if state["taskDefinitionHash"] is not None or tasks["definitionHash"] is not None:
+            assert_ledger_identity(state, tasks, "task")
+        if state["bugDefinitionHash"] is not None or bugs["definitionHash"] is not None:
+            assert_ledger_identity(state, bugs, "bug")
         active_started: dict[str, datetime] = {}
         for identity_key, ledger_key, ledger in (("taskId", "tasks", tasks), ("bugId", "bugs", bugs)):
             for item in (entry for entry in ledger[ledger_key] if entry["status"] == "active"):
@@ -1582,6 +1586,8 @@ def show_repository_status(repository: str | Path = ".") -> None:
                 if not path.is_file():
                     raise BraceError(f"Active assignment record is missing: {identity} attempt {attempt}.")
                 record = read_json(path)
+                if not isinstance(record, dict):
+                    raise BraceError(f"Active assignment record is invalid: {identity} attempt {attempt}.")
                 if record.get("schemaVersion") != "1.0" or record.get("identity") != identity or record.get("attempt") != attempt:
                     raise BraceError(f"Active assignment identity is invalid: {identity} attempt {attempt}.")
                 created = record.get("createdAt")
