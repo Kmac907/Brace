@@ -300,6 +300,46 @@ class CliTests(RepositoryTestCase):
         sleep.assert_called_once()
         self.assertIn("0/1 complete", output.getvalue())
 
+    def test_status_rejects_unrecorded_provider_merge(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        base_sha, merge_sha, result_sha = "a" * 40, "b" * 40, "c" * 40
+        plan_hash = "gitblob:" + "d" * 40
+        task = self.task() | {
+            "status": "integrated", "branch": "worktree/TASK-0001", "baseSha": base_sha,
+            "resultSha": result_sha, "pullRequest": {
+                "id": "1", "url": "https://example.invalid/1", "state": "merged", "repository": "owner/repo",
+                "head": "worktree/TASK-0001", "headSha": result_sha, "base": "brace/integration",
+                "baseSha": base_sha, "mergeSha": merge_sha,
+            },
+        }
+        task_hash = common.definition_hash([task], "task")
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        state.update(
+            stage="build", stageStatus="running", planHash=plan_hash,
+            taskDefinitionHash=task_hash, integrationSha=base_sha,
+        )
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        tasks.update(status="active", planHash=plan_hash, definitionHash=task_hash, tasks=[task])
+        common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+
+        with patch.object(common.time, "sleep") as sleep:
+            with self.assertRaisesRegex(BraceError, "provider merge is not recorded"):
+                common.show_repository_status(root)
+        self.assertEqual(sleep.call_count, common.STATUS_SNAPSHOT_ATTEMPTS - 1)
+
+        def finish_cross_file_write(_: float) -> None:
+            state["integrationSha"] = merge_sha
+            common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
+
+        with (
+            patch.object(common.time, "sleep", side_effect=finish_cross_file_write) as sleep,
+            patch.object(ui, "console", Console(file=io.StringIO(), force_terminal=False)),
+        ):
+            common.show_repository_status(root)
+        sleep.assert_called_once()
+
     def test_runtime_version_uses_package_metadata(self) -> None:
         self.assertEqual(__version__, version("brace"))
 

@@ -1599,6 +1599,16 @@ def _read_status_snapshot(paths: Paths) -> tuple[dict[str, Any], dict[str, Any],
             state, tasks, bugs = second
             _assert_status_ledger_identity(state, tasks, "task")
             _assert_status_ledger_identity(state, bugs, "bug")
+            for item in tasks["tasks"] + bugs["bugs"]:
+                pull_request = item.get("pullRequest")
+                if (
+                    pull_request
+                    and pull_request["state"].lower() in {"merged", "completed"}
+                    and pull_request["baseSha"] == state["integrationSha"]
+                    and pull_request["mergeSha"] != state["integrationSha"]
+                ):
+                    identity = item.get("taskId") or item["bugId"]
+                    raise BraceError(f"{identity} provider merge is not recorded by state.json integration SHA.")
             return state, tasks, bugs
         except BraceError as exc:
             error = exc
