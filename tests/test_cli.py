@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import io
 import unittest
+from datetime import datetime, timezone
 from hashlib import sha256
 from importlib.metadata import version
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from rich.console import Console
 
-from brace import __version__, bootstrap, cli, ui
+from brace import __version__, bootstrap, cli, common, ui
 from brace.common import BraceError
+from support import RepositoryTestCase
 
 
-class CliTests(unittest.TestCase):
+class CliTests(RepositoryTestCase):
     def test_commands_and_init_flags_parse(self) -> None:
         args = cli.parser().parse_args([
             "init",
@@ -36,6 +38,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual((plan.command, plan.repository, plan.start_new_workflow), ("plan", "repository", True))
         self.assertEqual(cli.parser().parse_args(["build"]).repository, ".")
         self.assertEqual(cli.parser().parse_args(["audit"]).repository, ".")
+        self.assertEqual(cli.parser().parse_args(["status"]).repository, ".")
 
     def test_plan_dispatch_and_expected_error_exit(self) -> None:
         with patch.object(cli.planning, "run") as run:
@@ -44,6 +47,9 @@ class CliTests(unittest.TestCase):
         with patch.object(cli.planning, "run", side_effect=BraceError("failed")), patch.object(cli, "error") as report:
             self.assertEqual(cli.main(["plan"]), 1)
             report.assert_called_once_with("failed")
+        with patch.object(cli, "show_repository_status") as show:
+            self.assertEqual(cli.main(["status", "repository"]), 0)
+            show.assert_called_once_with("repository")
 
     def test_interrupts_and_unexpected_errors_are_rendered(self) -> None:
         with patch.object(cli, "_dispatch", side_effect=KeyboardInterrupt), patch.object(cli, "error") as report:
@@ -82,16 +88,106 @@ class CliTests(unittest.TestCase):
         output = io.StringIO()
         state = {
             "stage": "build", "stageStatus": "running", "repository": "owner/repo",
-            "targetBranch": "main", "integrationBranch": "brace/integration", "integrationSha": "abc", "blocker": None,
+            "targetBranch": "main", "integrationBranch": "brace/integration", "integrationSha": "abc",
+            "blocker": {"message": "operator input required", "requiredDecision": "choose a scope"},
+            "updatedAt": "2026-09-09T00:00:00Z",
         }
-        tasks = {"tasks": [{"status": "integrated"}, {"status": "pending"}]}
-        bugs = {"bugs": [{"status": "verified"}]}
-        with patch.object(ui, "console", Console(file=output, force_terminal=False, color_system=None, width=100)):
-            ui.render_status(state, tasks, bugs)
+        tasks = {"tasks": [
+            {"taskId": "TASK-0001", "status": "integrated", "attemptCount": 1, "lastError": None, "pullRequest": None},
+            {"taskId": "TASK-0002", "status": "active", "attemptCount": 2, "lastError": "review interrupted", "pullRequest": None},
+        ]}
+        bugs = {"bugs": [
+            {
+                "bugId": "BUG-0001", "status": "verified", "attemptCount": 1, "lastError": None,
+                "pullRequest": {"id": "17", "state": "merged", "url": "https://example.invalid/17"},
+            },
+            {"bugId": "BUG-0002", "status": "active", "attemptCount": 3, "lastError": None, "pullRequest": None},
+        ]}
+        with patch.object(ui, "console", Console(file=output, force_terminal=False, color_system=None, width=100, theme=ui.THEME)):
+            ui.render_status(
+                state, tasks, bugs,
+                {
+                    "TASK-0002": datetime(2026, 9, 9, tzinfo=timezone.utc),
+                    "BUG-0002": datetime(2026, 9, 9, 0, 2, 3, tzinfo=timezone.utc),
+                },
+                datetime(2026, 9, 9, 1, 2, 3, tzinfo=timezone.utc),
+            )
         rendered = output.getvalue()
         self.assertNotIn("\x1b", rendered)
-        self.assertIn("1/2 integrated", rendered)
-        self.assertIn("1/1 verified", rendered)
+        self.assertIn("1/2 complete", rendered)
+        self.assertIn("1/2 complete", rendered)
+        self.assertIn("TASK-0002 | attempt 2 | elapsed 01:02:03", rendered)
+        self.assertIn("BUG-0002 | attempt 3 | elapsed 01:00:00", rendered)
+        self.assertIn("review interrupted", rendered)
+        self.assertIn("17 | merged", rendered)
+        self.assertIn("operator input required", rendered)
+        self.assertIn("choose a scope", rendered)
+
+    def test_interactive_status_retains_rich_spinner(self) -> None:
+        terminal = Mock(is_terminal=True)
+        expected = object()
+        terminal.status.return_value = expected
+        with patch.object(ui, "console", terminal):
+            self.assertIs(ui.status("working"), expected)
+        terminal.status.assert_called_once_with("working", spinner="dots", spinner_style="brace")
+
+    def test_plain_agent_updates_are_bounded_and_have_operation_identity_attempt_elapsed(self) -> None:
+        output = io.StringIO()
+        with patch.object(ui, "console", Console(file=output, force_terminal=False, color_system=None, width=500, theme=ui.THEME)):
+            ui.agent_heartbeat("builder", "TASK-0001", 2, 62)
+            ui.agent_completed("builder", "TASK-0001", 2, 63, "done\n" + "x" * 400)
+        rendered = output.getvalue()
+        self.assertNotIn("\x1b", rendered)
+        self.assertIn("Heartbeat: builder | TASK-0001 | attempt 2 | elapsed 00:01:02", rendered)
+        self.assertIn("Completed: builder | TASK-0001 | attempt 2 | elapsed 00:01:03", rendered)
+        self.assertIn("…", rendered)
+        self.assertNotIn("x" * 241, rendered)
+
+    def test_status_reads_validated_state_while_lock_is_owned_without_mutation(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        state.update(stage="build", stageStatus="running")
+        common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
+        task = self.task() | {"status": "active", "attemptCount": 2, "lastError": "second reviewer interrupted"}
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        tasks.update(status="active", tasks=[task])
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        common.write_immutable_json(common.attempt_path(paths, "assignment", task["taskId"], 2), {
+            "schemaVersion": "1.0", "identity": task["taskId"], "attempt": 2,
+            "baseSha": "a" * 40, "startingHead": "a" * 40,
+            "createdAt": "2026-09-09T00:00:00Z", "item": task,
+        })
+        output = io.StringIO()
+        terminal = Console(file=output, force_terminal=False, color_system=None, width=120)
+        with common.WorkflowLock(paths.lock):
+            before = {
+                path: (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in paths.codex.rglob("*") if path.is_file()
+                and path != paths.lock
+            }
+            with (
+                patch.object(ui, "console", terminal),
+                patch.object(common, "get_repository_identity", side_effect=AssertionError("provider lookup")),
+                patch.object(common, "assert_prerequisites", side_effect=AssertionError("provider check")),
+            ):
+                common.show_repository_status(root)
+            after = {
+                path: (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in paths.codex.rglob("*") if path.is_file()
+                and path != paths.lock
+            }
+        self.assertEqual(after, before)
+        self.assertIn("TASK-0001 | attempt 2 | elapsed", output.getvalue())
+
+    def test_status_reports_missing_and_malformed_state_concisely(self) -> None:
+        root, _, config = self.make_repository()
+        with self.assertRaisesRegex(BraceError, "not initialized"):
+            common.show_repository_status(root)
+        paths = common.initialize_state_files(root, config)
+        paths.state.write_text("{", encoding="utf-8")
+        with self.assertRaisesRegex(BraceError, "Unable to read Brace status: Invalid JSON"):
+            common.show_repository_status(root)
 
     def test_runtime_version_uses_package_metadata(self) -> None:
         self.assertEqual(__version__, version("brace"))

@@ -119,6 +119,12 @@ Planning reads the repository and `requirements.md`. If essential information is
 
 Planning stops before implementation so you can review `plan.md`, `.codex/tasks.json`, and `.codex/planning-summary.json`.
 
+At any stage, inspect the atomically persisted workflow state without acquiring the workflow lock or contacting the provider:
+
+```bash
+brace status
+```
+
 ### 4. Build
 
 ```bash

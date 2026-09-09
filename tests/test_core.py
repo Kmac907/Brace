@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from brace import audit as audit_loop
-from brace import common, project_manager
+from brace import common, project_manager, ui
 from support import RepositoryTestCase
 
 
@@ -613,6 +613,80 @@ class CoreTests(RepositoryTestCase):
             with self.assertRaisesRegex(common.BraceError, "unique"):
                 common.invoke_codex("prompt", root, schema_path, "read-only", paths.logs)
             self.assertFalse(captured[1][0].exists())
+
+    def test_agent_heartbeats_stop_and_only_valid_results_emit_completion(self) -> None:
+        schema = self.base / "result.schema.json"
+        schema.write_text(json.dumps({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object", "required": ["summary"],
+            "properties": {"summary": {"type": "string", "minLength": 1}},
+            "additionalProperties": False,
+        }), encoding="utf-8")
+        logs = self.base / "logs"
+
+        class Process:
+            def __init__(self, command: list[str], mode: str):
+                self.command, self.mode = command, mode
+                self.returncode = 0
+
+            def communicate(self, _: str, timeout: int) -> tuple[str, str]:
+                time.sleep(0.04)
+                if self.mode == "timeout":
+                    raise subprocess.TimeoutExpired(self.command, timeout)
+                if self.mode == "failed":
+                    self.returncode = 2
+                    return "", "failed"
+                result = {"summary": "completed" if self.mode == "success" else ""}
+                Path(self.command[self.command.index("--output-last-message") + 1]).write_text(
+                    json.dumps(result), encoding="utf-8"
+                )
+                return "", ""
+
+        heartbeat_calls: list[tuple[object, ...]] = []
+        completion_calls: list[tuple[object, ...]] = []
+
+        def invoke(mode: str) -> dict:
+            with (
+                patch.object(common, "_command_line", side_effect=lambda command, arguments: [command, *arguments]),
+                patch.object(common.subprocess, "Popen", side_effect=lambda command, **_: Process(command, mode)),
+                patch.object(common, "_terminate_tree"),
+                patch.object(ui, "agent_heartbeat", side_effect=lambda *args: heartbeat_calls.append(args)),
+                patch.object(ui, "agent_completed", side_effect=lambda *args: completion_calls.append(args)),
+            ):
+                return common.invoke_codex(
+                    "prompt", self.base, schema, "read-only", logs,
+                    "builder", timeout_seconds=1, work_identity="TASK-0001", attempt=2,
+                    heartbeat_seconds=0.01,
+                )
+
+        self.assertEqual(invoke("success"), {"summary": "completed"})
+        self.assertTrue(heartbeat_calls)
+        self.assertEqual(heartbeat_calls[0][:3], ("builder", "TASK-0001", 2))
+        self.assertEqual(completion_calls[0][:3], ("builder", "TASK-0001", 2))
+        completed_heartbeats = len(heartbeat_calls)
+        time.sleep(0.03)
+        self.assertEqual(len(heartbeat_calls), completed_heartbeats)
+
+        with self.assertRaisesRegex(common.BraceError, "exited with code 2"):
+            invoke("failed")
+        failed_heartbeats = len(heartbeat_calls)
+        time.sleep(0.03)
+        self.assertEqual(len(heartbeat_calls), failed_heartbeats)
+        self.assertEqual(len(completion_calls), 1)
+
+        with self.assertRaisesRegex(common.BraceError, "deadline"):
+            invoke("timeout")
+        timed_out_heartbeats = len(heartbeat_calls)
+        time.sleep(0.03)
+        self.assertEqual(len(heartbeat_calls), timed_out_heartbeats)
+        self.assertEqual(len(completion_calls), 1)
+
+        with self.assertRaisesRegex(common.BraceError, "non-empty"):
+            invoke("invalid")
+        invalid_heartbeats = len(heartbeat_calls)
+        time.sleep(0.03)
+        self.assertEqual(len(heartbeat_calls), invalid_heartbeats)
+        self.assertEqual(len(completion_calls), 1)
 
     def test_state_creation_and_schema_validation(self) -> None:
         root, _, config = self.make_repository()
@@ -1216,7 +1290,7 @@ class CoreTests(RepositoryTestCase):
         common.remove_review_worktree(root, config, paths, "BUG-0001", 1, 1, base, candidate)
         self.assertFalse(worktree.exists())
 
-        def mutate_review(_: Path, review_worktree: Path, role: str, context: str, schema: str, sandbox: str) -> dict:
+        def mutate_review(_: Path, review_worktree: Path, role: str, context: str, schema: str, sandbox: str, **__: object) -> dict:
             self.assertEqual((role, schema, sandbox), ("reviewer", "reviewer-result.schema.json", "read-only"))
             (Path(review_worktree) / "mutation.txt").write_text("changed\n", encoding="utf-8")
             return approved

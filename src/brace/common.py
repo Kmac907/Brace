@@ -10,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Iterable
@@ -22,6 +23,7 @@ from urllib.parse import unquote, urlsplit
 
 MAXIMUM_RESULT_BYTES = 1024 * 1024
 MAXIMUM_LOG_BYTES = 2 * 1024 * 1024
+AGENT_HEARTBEAT_SECONDS = 30
 REVIEW_SUPPORT_PATHS = {
     ".codex/prompts/reviewer.md",
     ".codex/schemas/closure-record.schema.json",
@@ -1001,7 +1003,10 @@ def run_review(root: str | Path, paths: Paths, identity: str, attempt: int, revi
         return existing
     worktree = new_review_worktree(root, get_configuration(root), identity, attempt, reviewer, candidate_sha)
     assert_review_worktree(worktree, candidate_sha)
-    result = invoke_role(root, worktree, "reviewer", context, "reviewer-result.schema.json", "read-only")
+    result = invoke_role(
+        root, worktree, "reviewer", context, "reviewer-result.schema.json", "read-only",
+        work_identity=identity, attempt=attempt,
+    )
     assert_review_worktree(worktree, candidate_sha)
     return write_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha, result, required_checks)
 
@@ -1134,7 +1139,10 @@ def recover_committed_attempt(root: str | Path, paths: Paths, item: dict[str, An
         return None
     schema, role, expected = ("builder-result.schema.json", "builder", "completed") if kind == "task" else ("fixer-result.schema.json", "bug-fixer", "fixed")
     context = f"Recovery mode for {identity} attempt {item['attemptCount']}. A commit exists but the coordinator result record was interrupted. Inspect exact base {item['baseSha']} and HEAD {head}. Do not edit, commit, or rewrite history. Return the structured result for the existing commit only.\nAssignment:\n{pretty_json(item)}"
-    result = invoke_role(root, worktree, role, context, schema, "read-only")
+    result = invoke_role(
+        root, worktree, role, context, schema, "read-only",
+        work_identity=identity, attempt=int(item["attemptCount"]),
+    )
     if result["status"] != expected or result.get("commitSha") != head:
         raise BraceError(f"Recovered result does not identify the existing {identity} commit.")
     if run_native("git", ["-C", worktree, "status", "--porcelain", "--untracked-files=all"]).output.strip() or run_native("git", ["-C", worktree, "rev-parse", "HEAD"]).output.strip() != head:
@@ -1452,7 +1460,20 @@ def _project_output_schema(schema_path: str | Path) -> dict[str, Any]:
     return projected
 
 
-def invoke_codex(prompt: str, cwd: str | Path, schema_path: str | Path, sandbox: str, log_directory: str | Path, identity: str = "agent", timeout_minutes: int = 90, cleanup_grace_seconds: int = 10, timeout_seconds: int = 0) -> dict[str, Any]:
+def invoke_codex(
+    prompt: str,
+    cwd: str | Path,
+    schema_path: str | Path,
+    sandbox: str,
+    log_directory: str | Path,
+    identity: str = "agent",
+    timeout_minutes: int = 90,
+    cleanup_grace_seconds: int = 10,
+    timeout_seconds: int = 0,
+    work_identity: str | None = None,
+    attempt: int | None = None,
+    heartbeat_seconds: float = AGENT_HEARTBEAT_SECONDS,
+) -> dict[str, Any]:
     token, safe_identity = uuid.uuid4().hex, re.sub(r"[^A-Za-z0-9_.-]", "_", identity)
     log_directory = Path(log_directory)
     log_directory.mkdir(parents=True, exist_ok=True)
@@ -1467,11 +1488,30 @@ def invoke_codex(prompt: str, cwd: str | Path, schema_path: str | Path, sandbox:
         command = _command_line("codex", ["exec", "--ephemeral", "--color", "never", "--sandbox", sandbox, "--output-schema", str(temporary_schema), "--output-last-message", str(result_path), "-"])
         process = subprocess.Popen(command, cwd=str(Path(cwd).resolve()), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="strict", **_popen_options())
         timeout = timeout_seconds or timeout_minutes * 60
+        started = time.monotonic()
+        stop_heartbeat = threading.Event()
+
+        def heartbeat() -> None:
+            while not stop_heartbeat.wait(heartbeat_seconds):
+                try:
+                    from .ui import agent_heartbeat
+
+                    agent_heartbeat(identity, work_identity, attempt, time.monotonic() - started)
+                except Exception:
+                    return
+
+        heartbeat_thread = threading.Thread(target=heartbeat, name=f"brace-{safe_identity}-heartbeat", daemon=True)
+        heartbeat_thread.start()
         try:
             stdout, stderr = process.communicate(prompt, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
+            stop_heartbeat.set()
+            heartbeat_thread.join()
             _terminate_tree(process, cleanup_grace_seconds)
             raise BraceError(f"Codex exceeded the {timeout_minutes}-minute deadline; its process tree was terminated.") from exc
+        finally:
+            stop_heartbeat.set()
+            heartbeat_thread.join()
         output = stdout + os.linesep + stderr
         if len(output.encode("utf-8")) > MAXIMUM_LOG_BYTES:
             encoded = output.encode("utf-8")[:MAXIMUM_LOG_BYTES]
@@ -1483,26 +1523,79 @@ def invoke_codex(prompt: str, cwd: str | Path, schema_path: str | Path, sandbox:
             raise BraceError(f"Codex did not create its final result. Log: {log_path}")
         if result_path.stat().st_size > MAXIMUM_RESULT_BYTES:
             raise BraceError(f"Codex result exceeded 1 MiB: {result_path}")
-        return read_json(result_path, schema_path)
+        result = read_json(result_path, schema_path)
+        from .ui import agent_completed
+
+        agent_completed(identity, work_identity, attempt, time.monotonic() - started, result.get("summary"))
+        return result
     finally:
         if temporary_schema is not None:
             temporary_schema.unlink(missing_ok=True)
 
 
-def invoke_role(root: str | Path, cwd: str | Path, role: str, context: str, schema_name: str, sandbox: str) -> dict[str, Any]:
+def invoke_role(
+    root: str | Path,
+    cwd: str | Path,
+    role: str,
+    context: str,
+    schema_name: str,
+    sandbox: str,
+    work_identity: str | None = None,
+    attempt: int | None = None,
+) -> dict[str, Any]:
     paths, config = Paths(root), get_configuration(root)
     prompt = f"{read_text(paths.codex / 'AGENTS.md')}\n\n{PONYTAIL_GUIDANCE}\n{read_text(paths.prompts / f'{role}.md')}\n\n# Assignment context\n\n{context}"
-    return invoke_codex(prompt, cwd, paths.schemas / schema_name, sandbox, paths.logs, role, int(config["agentTimeoutMinutes"]), int(config["agentCleanupGraceSeconds"]))
+    return invoke_codex(prompt, cwd, paths.schemas / schema_name, sandbox, paths.logs, role, int(config["agentTimeoutMinutes"]), int(config["agentCleanupGraceSeconds"]), work_identity=work_identity, attempt=attempt)
 
 
 def write_summary(path: str | Path, summary: dict[str, Any]) -> None:
     write_text_atomic(path, pretty_json(summary))
 
 
-def show_status(state: dict[str, Any], tasks: dict[str, Any] | None = None, bugs: dict[str, Any] | None = None) -> None:
+def show_status(
+    state: dict[str, Any],
+    tasks: dict[str, Any] | None = None,
+    bugs: dict[str, Any] | None = None,
+    active_started: dict[str, datetime] | None = None,
+) -> None:
     from .ui import render_status
 
-    render_status(state, tasks, bugs)
+    render_status(state, tasks, bugs, active_started)
+
+
+def show_repository_status(repository: str | Path = ".") -> None:
+    root = repository_root(repository)
+    paths = Paths(root)
+    if not paths.state.is_file():
+        raise BraceError(f"Brace is not initialized in {root}.")
+    try:
+        state = read_json(paths.state, paths.schemas / "state.schema.json")
+        tasks = read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        bugs = read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        if Path(state["repositoryRoot"]).resolve() != root:
+            raise BraceError("Recorded repository root does not match the requested repository.")
+        active_started: dict[str, datetime] = {}
+        for identity_key, ledger_key, ledger in (("taskId", "tasks", tasks), ("bugId", "bugs", bugs)):
+            for item in (entry for entry in ledger[ledger_key] if entry["status"] == "active"):
+                identity, attempt = item[identity_key], int(item["attemptCount"])
+                path = attempt_path(paths, "assignment", identity, attempt)
+                if not path.is_file():
+                    raise BraceError(f"Active assignment record is missing: {identity} attempt {attempt}.")
+                record = read_json(path)
+                if record.get("schemaVersion") != "1.0" or record.get("identity") != identity or record.get("attempt") != attempt:
+                    raise BraceError(f"Active assignment identity is invalid: {identity} attempt {attempt}.")
+                created = record.get("createdAt")
+                if not isinstance(created, str) or not re.fullmatch(
+                    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", created
+                ):
+                    raise BraceError(f"Active assignment timestamp is invalid: {identity} attempt {attempt}.")
+                started = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                if started.tzinfo is None:
+                    raise BraceError(f"Active assignment timestamp is invalid: {identity} attempt {attempt}.")
+                active_started[identity] = started
+    except (KeyError, OSError, TypeError, ValueError, UnicodeError, BraceError) as exc:
+        raise BraceError(f"Unable to read Brace status: {exc}") from exc
+    show_status(state, tasks, bugs, active_started)
 
 
 def new_audit_worktree(root: str | Path, config: dict[str, Any], reference: str) -> Path:
@@ -1536,7 +1629,10 @@ def run_assignment(root: str | Path, worktree: str | Path, item: dict[str, Any],
     identity = item["taskId" if kind == "task" else "bugId"]
     role, schema, label = ("builder", "builder-result.schema.json", "Task") if kind == "task" else ("bug-fixer", "fixer-result.schema.json", "Bug")
     try:
-        result = invoke_role(root, worktree, role, f"{label} assignment:\n{pretty_json(item)}", schema, "workspace-write")
+        result = invoke_role(
+            root, worktree, role, f"{label} assignment:\n{pretty_json(item)}", schema, "workspace-write",
+            work_identity=identity, attempt=int(item["attemptCount"]),
+        )
         record = {"schemaVersion": "1.0", "identity": identity, "attempt": int(item["attemptCount"]), "succeeded": True, "result": result, "error": None, "completedAt": utc_now()}
     except Exception as exc:
         record = {"schemaVersion": "1.0", "identity": identity, "attempt": int(item["attemptCount"]), "succeeded": False, "result": None, "error": str(exc), "completedAt": utc_now()}
