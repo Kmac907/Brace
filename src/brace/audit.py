@@ -31,6 +31,7 @@ from .common import (
     new_audit_worktree,
     new_pull_request,
     new_worktree,
+    object_hash,
     pretty_json,
     publish_assignment,
     read_attempt_result,
@@ -67,6 +68,7 @@ from .project_manager import (
 from .ui import status, success, warning
 
 InputReader = Callable[[dict[str, Any], str, dict[str, Any] | None], str]
+PRIOR_BUG_STATE_PREFIX = "Brace coordinator prior bug state: "
 
 
 def save_ledger(ledger: dict[str, Any], paths: Any) -> None:
@@ -114,7 +116,13 @@ def read_closure_result(paths: Any, cycle: int, kind: str, candidate_sha: str) -
     return record if (record["cycle"], record["kind"], record["candidateSha"]) == (cycle, kind, candidate_sha) else None
 
 
-def write_closure_result(paths: Any, cycle: int, kind: str, candidate_sha: str, result: dict[str, Any]) -> dict[str, Any]:
+def write_closure_result(paths: Any, cycle: int, kind: str, candidate_sha: str, result: dict[str, Any], prior_bugs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    result = copy.deepcopy(result)
+    if prior_bugs is not None:
+        if kind != "audit":
+            raise BraceError("Only audit closure records may bind prior bug state.")
+        result["checks"] = [check for check in result["checks"] if not check.startswith(PRIOR_BUG_STATE_PREFIX)]
+        result["checks"].append(PRIOR_BUG_STATE_PREFIX + object_hash(prior_bugs))
     record = {
         "schemaVersion": "1.0", "kind": kind, "cycle": cycle, "candidateSha": candidate_sha,
         "completedAt": utc_now(), "result": result,
@@ -179,6 +187,9 @@ def recover_bug_definition_state(state: dict[str, Any], bugs: dict[str, Any], pa
     prefix = bugs["bugs"][:len(bugs["bugs"]) - len(findings)] if findings else bugs["bugs"]
     prior_hash = definition_hash(prefix, "bug")
     if state.get("bugDefinitionHash") not in ({prior_hash} if prefix else {None, prior_hash}):
+        return False
+    prior_state_checks = [check for check in record["result"]["checks"] if check.startswith(PRIOR_BUG_STATE_PREFIX)]
+    if prior_state_checks != [PRIOR_BUG_STATE_PREFIX + object_hash(prefix)] and (prefix or prior_state_checks):
         return False
     replayed = append_findings(copy.deepcopy(prefix), findings)
     if replayed != bugs["bugs"] or definition_hash(replayed, "bug") != actual:
@@ -328,6 +339,7 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
             run_native("git", ["-C", root, "fetch", config["remote"], "--prune"])
             current_target = run_native("git", ["-C", root, "rev-parse", f"{config['remote']}/{config['targetBranch']}"]).output.strip()
             if state.get("targetBaseSha") and current_target != state["targetBaseSha"] and state.get("integrationSha"):
+                assert_ledger_identity(state, bugs, "bug")
                 require_final_evidence(paths, state, tasks, bugs)
                 final_pr = get_pull_request(root, config, config["integrationBranch"], config["targetBranch"], state["integrationSha"])
                 if not final_pr or final_pr["state"] not in {"merged", "completed"}:
@@ -358,7 +370,7 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                 if audit_record is None:
                     with status(f"Running closure audit cycle {cycle}"):
                         audit_result = invoke_frozen_role(root, audit_worktree, state["integrationSha"], "auditor", f"Run a fresh comprehensive closure audit of exact integration commit {state['integrationSha']} against the complete approved requirements and plan. This is closure cycle {cycle}. Return only newly supported findings for this candidate; the existing immutable bug history contains {len(bugs['bugs'])} entries. Independently reconcile these findings from the preceding final reviewers after both completed: {pretty_json(review_findings)}. Do not edit the worktree.", "audit-result.schema.json")
-                    audit_record = write_closure_result(paths, cycle, "audit", state["integrationSha"], audit_result)
+                    audit_record = write_closure_result(paths, cycle, "audit", state["integrationSha"], audit_result, bugs["bugs"])
                 audit_result = audit_record["result"]
                 if audit_result["status"] == "completed" and audit_result["missingEvidence"]:
                     raise BraceError("Closure audit is incomplete: " + "; ".join(audit_result["missingEvidence"]))

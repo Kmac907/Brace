@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import copy
 import json
 import os
 import shutil
@@ -758,7 +759,7 @@ class CoreTests(RepositoryTestCase):
             "status": "completed", "summary": "one finding", "bugs": [finding], "checks": [],
             "missingEvidence": [], "blocker": None,
         }
-        audit_loop.write_closure_result(paths, 1, "audit", candidate, audit_result)
+        audit_loop.write_closure_result(paths, 1, "audit", candidate, audit_result, [])
         persisted = audit_loop.append_findings([], [dict(finding)])
         bug_hash = common.definition_hash(persisted, "bug")
         bugs.update(auditCycle=1, auditSha=candidate, definitionHash=bug_hash, status="ready", bugs=persisted)
@@ -807,6 +808,76 @@ class CoreTests(RepositoryTestCase):
 
         self.assertFalse(audit_loop.recover_bug_definition_state(state, bugs, paths))
         self.assertIsNone(state["bugDefinitionHash"])
+
+    def test_torn_bug_ledger_recovery_authenticates_preexisting_operational_state(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        candidate = self.git(root, "rev-parse", "HEAD")
+        prior_finding = {
+            "bugId": "BUG-0001", "title": "Prior defect", "severity": "medium", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "Prior defect", "evidence": "Prior reproduction",
+            "actualBehavior": "wrong", "requiredBehavior": "right", "impact": "incorrect output",
+            "requiredCorrection": "Correct output", "acceptanceTest": "prior output is right",
+            "dependencies": [], "allowedPaths": ["src/**"], "exclusiveResources": [],
+        }
+        prior = audit_loop.persisted_bug(prior_finding)
+        prior.update(status="verified", disposition="fixed", dispositionEvidence="regression passed", attemptCount=1)
+        state["bugDefinitionHash"] = common.definition_hash([prior], "bug")
+        finding = dict(prior_finding, bugId="BUG-0018", title="New defect", description="New defect")
+        audit_loop.write_closure_result(paths, 2, "audit", candidate, {
+            "status": "completed", "summary": "one finding", "bugs": [finding], "checks": [],
+            "missingEvidence": [], "blocker": None,
+        }, [prior])
+        tampered = copy.deepcopy(prior)
+        tampered.update(disposition="not_reproducible", dispositionEvidence="fabricated")
+        persisted = audit_loop.append_findings([tampered], [dict(finding)])
+        bug_hash = common.definition_hash(persisted, "bug")
+        bugs.update(auditCycle=2, auditSha=candidate, definitionHash=bug_hash, status="ready", bugs=persisted)
+        common.validate_json(bugs, paths.schemas / "bugs.schema.json")
+
+        self.assertFalse(audit_loop.recover_bug_definition_state(state, bugs, paths))
+        self.assertEqual(state["bugDefinitionHash"], common.definition_hash([prior], "bug"))
+
+        persisted = audit_loop.append_findings([copy.deepcopy(prior)], [dict(finding)])
+        bugs.update(definitionHash=common.definition_hash(persisted, "bug"), bugs=persisted)
+        self.assertTrue(audit_loop.recover_bug_definition_state(state, bugs, paths))
+
+    def test_merged_recovery_rejects_changed_bug_identity_before_final_evidence(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        head = self.git(root, "rev-parse", "HEAD")
+        plan_hash = common.git_blob_identity(root, head, "plan.md")
+        task = self.task() | {"status": "integrated"}
+        task_hash = common.definition_hash([task], "task")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        tasks.update(revision=1, planHash=plan_hash, definitionHash=task_hash, status="complete", tasks=[task])
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        bug_hash = common.definition_hash([], "bug")
+        bugs.update(
+            revision=1, auditCycle=1, auditSha=head, definitionHash="sha256:" + "f" * 64,
+            status="complete", bugs=[],
+        )
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        state.update(
+            stage="audit", stageStatus="running", targetBaseSha="a" * 40, integrationSha=head,
+            requirementsHash=common.git_blob_identity(root, head, "requirements.md"), planHash=plan_hash,
+            taskDefinitionHash=task_hash, bugDefinitionHash=bug_hash,
+        )
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        common.write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
+        common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
+
+        with (
+            patch.object(audit_loop, "assert_prerequisites"),
+            patch.object(audit_loop, "require_final_evidence") as final_evidence,
+            patch.object(audit_loop, "complete_project_cleanup") as cleanup,
+            self.assertRaisesRegex(common.BraceError, "bug ledger definitions changed"),
+        ):
+            audit_loop.run(root)
+        final_evidence.assert_not_called()
+        cleanup.assert_not_called()
 
     def test_frozen_role_rejects_audit_worktree_mutation(self) -> None:
         root, _, config = self.make_repository()
