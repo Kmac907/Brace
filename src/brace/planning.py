@@ -79,7 +79,7 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
                 for line in pending
                 if len(line) > 3
                 and line[3:].replace("\\", "/") not in {"requirements.md", "plan.md"}
-                and not is_untracked_review_support(line)
+                and not is_untracked_review_support(root, line)
             ]
             if unexpected:
                 raise BraceError("Planning found unrelated uncommitted work: " + ", ".join(unexpected))

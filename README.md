@@ -50,8 +50,8 @@ final validation ─► project PR ─► main ─► cleanup
 | Stage | Agents | Durable output | Completion condition |
 | --- | --- | --- | --- |
 | Planning | Planner | `plan.md`, `tasks.json`, planning summary | Every active requirement has a valid task |
-| Build | Builders and verifier | Task commits, PR identities, build summary | Every active task is verified and integrated |
-| Audit | Auditor, bug fixers, and verifier | `bugs.json`, fix commits, audit summary | Every finding is resolved and final validation passes |
+| Build | Builders, two independent adversarial reviewers, and integration verifier | Task commits, exact-SHA review records, PR identities, build summary | Every active task has two exact-SHA approvals and is integrated |
+| Audit | Auditor, bug fixers, two independent adversarial reviewers, and final verifier | `bugs.json`, fix commits, exact-SHA review records, audit summary | Every fix has two exact-SHA approvals, every finding is resolved, and final validation passes |
 
 Agents never communicate directly. Brace gives each agent one immutable assignment and carries its schema-validated result to the next role.
 

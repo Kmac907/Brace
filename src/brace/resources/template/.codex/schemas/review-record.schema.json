@@ -39,7 +39,10 @@
       "format": "date-time"
     },
     "result": {
-      "$ref": "reviewer-result.schema.json"
+      "oneOf": [
+        {"$ref": "reviewer-result.schema.json"},
+        {"$ref": "verifier-result.schema.json"}
+      ]
     }
   },
   "additionalProperties": false

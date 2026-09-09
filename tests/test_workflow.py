@@ -113,6 +113,33 @@ class WorkflowTests(RepositoryTestCase):
 
         self.assertFalse(paths.state.exists())
 
+    def test_modified_legacy_support_is_rejected_during_planning(self) -> None:
+        root, _, config = self.prepare_legacy_project()
+        paths = common.initialize_state_files(root, config)
+        (paths.prompts / "reviewer.md").write_text("untrusted prompt\n", encoding="utf-8")
+
+        with (
+            patch.object(planning_loop, "assert_prerequisites"),
+            patch.object(planning_loop, "invoke_role", return_value=self.planner_result()),
+            self.assertRaisesRegex(common.BraceError, "unrelated uncommitted work.*reviewer.md"),
+        ):
+            planning_loop.run(root)
+
+    def test_modified_legacy_support_is_rejected_during_completed_reset(self) -> None:
+        root, _, config = self.prepare_legacy_project()
+        paths = common.initialize_state_files(root, config)
+        (paths.prompts / "reviewer.md").write_text("untrusted prompt\n", encoding="utf-8")
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        state.update(
+            stage="complete",
+            stageStatus="complete",
+            finalMergeSha=self.git(root, "rev-parse", "HEAD"),
+        )
+        common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
+
+        with self.assertRaisesRegex(common.BraceError, "must be clean"):
+            common.reset_completed_workflow(root, config, state)
+
     def test_planning_canonicalizes_model_identities_without_retry(self) -> None:
         root, _, _ = self.prepare()
         result = self.planner_result()

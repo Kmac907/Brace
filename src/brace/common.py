@@ -489,7 +489,10 @@ def initialize_state_files(root: str | Path, config: dict[str, Any]) -> Paths:
     try:
         current_review_schema = read_json(review_schema)
         _project_output_schema(review_schema)
-        current = current_review_schema["properties"]["result"]["$ref"] == "reviewer-result.schema.json"
+        result_schemas = current_review_schema["properties"]["result"]["oneOf"]
+        current = {
+            schema.get("$ref") for schema in result_schemas if isinstance(schema, dict)
+        } == {"reviewer-result.schema.json", "verifier-result.schema.json"} and len(result_schemas) == 2
     except (BraceError, KeyError, OSError, TypeError, UnicodeError):
         current = False
     if not current:
@@ -506,8 +509,15 @@ def initialize_state_files(root: str | Path, config: dict[str, Any]) -> Paths:
     return paths
 
 
-def is_untracked_review_support(status_line: str) -> bool:
-    return status_line.startswith("?? ") and status_line[3:].replace("\\", "/") in REVIEW_SUPPORT_PATHS
+def is_untracked_review_support(root: str | Path, status_line: str) -> bool:
+    relative = status_line[3:].replace("\\", "/")
+    if not status_line.startswith("?? ") or relative not in REVIEW_SUPPORT_PATHS:
+        return False
+    packaged = Path(str(files("brace").joinpath("resources", "template", *relative.split("/"))))
+    try:
+        return (Path(root) / relative).read_bytes() == packaged.read_bytes()
+    except OSError:
+        return False
 
 
 def assert_state_identity(state: dict[str, Any], root: str | Path, config: dict[str, Any]) -> None:
@@ -602,6 +612,8 @@ def read_review_result(paths: Paths, identity: str, attempt: int, reviewer: int,
     if not path.is_file():
         return None
     record = read_json(path, paths.schemas / "review-record.schema.json")
+    if "ponytailVerdict" not in record["result"]:
+        return None
     expected = (identity, attempt, reviewer, base_sha, candidate_sha)
     actual = tuple(record[name] for name in ("identity", "attempt", "reviewer", "baseSha", "candidateSha"))
     return record if actual == expected else None
@@ -625,7 +637,15 @@ def write_review_result(
         "baseSha": base_sha, "candidateSha": candidate_sha, "completedAt": utc_now(), "result": result,
     }
     validate_json(record, paths.schemas / "review-record.schema.json")
-    write_immutable_json(review_path(paths, identity, attempt, reviewer), record)
+    path = review_path(paths, identity, attempt, reviewer)
+    if path.is_file():
+        existing = read_json(path, paths.schemas / "review-record.schema.json")
+        expected = (identity, attempt, reviewer, base_sha, candidate_sha)
+        actual = tuple(existing[name] for name in ("identity", "attempt", "reviewer", "baseSha", "candidateSha"))
+        if "ponytailVerdict" not in existing["result"] and actual == expected:
+            write_immutable_json(path.with_name(f"{path.stem}.legacy.json"), existing)
+            path.unlink()
+    write_immutable_json(path, record)
     return record
 
 
@@ -642,7 +662,7 @@ def reset_completed_workflow(root: str | Path, config: dict[str, Any], state: di
     if not re.fullmatch(r"[0-9a-f]{40}", str(state.get("finalMergeSha") or "")):
         raise BraceError("Completed workflow is missing its verified final merge SHA.")
     changes = run_native("git", ["-C", root, "status", "--porcelain", "--untracked-files=all"]).lines
-    if any(not is_untracked_review_support(line) for line in changes):
+    if any(not is_untracked_review_support(root, line) for line in changes):
         raise BraceError("The repository must be clean before starting a new workflow.")
     base = worktree_base(root, config)
     if base.is_dir() and any(base.iterdir()):

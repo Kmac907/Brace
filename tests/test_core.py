@@ -684,6 +684,36 @@ class CoreTests(RepositoryTestCase):
             with self.subTest(completed_at=completed_at), self.assertRaisesRegex(common.BraceError, error):
                 common.read_review_result(paths, "TASK-0001", 2, 1, base, candidate)
 
+    def test_legacy_review_record_is_retained_before_fresh_review(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        base, candidate = "a" * 40, "b" * 40
+        required = ["python -m unittest"]
+        legacy_schema = common.read_json(paths.schemas / "review-record.schema.json")
+        legacy_schema["properties"]["result"] = {"$ref": "verifier-result.schema.json"}
+        common.write_text_atomic(paths.schemas / "review-record.schema.json", common.pretty_json(legacy_schema))
+        legacy_record = {
+            "schemaVersion": "1.0", "identity": "TASK-0001", "attempt": 1, "reviewer": 1,
+            "baseSha": base, "candidateSha": candidate, "completedAt": common.utc_now(),
+            "result": {
+                "approved": True, "summary": "approved", "findings": [],
+                "checks": [{"command": required[0], "result": "passed", "evidence": "legacy check passed"}],
+                "blocker": None,
+            },
+        }
+        path = common.review_path(paths, "TASK-0001", 1, 1)
+        common.write_immutable_json(path, legacy_record)
+
+        common.initialize_state_files(root, config)
+
+        self.assertIsNone(common.read_review_result(paths, "TASK-0001", 1, 1, base, candidate))
+        current = self.reviewer_result() | {
+            "checks": [{"command": required[0], "result": "passed", "evidence": "current check passed"}]
+        }
+        common.write_review_result(paths, "TASK-0001", 1, 1, base, candidate, current, required)
+        self.assertEqual(common.read_review_result(paths, "TASK-0001", 1, 1, base, candidate)["result"], current)
+        self.assertEqual(common.read_json(path.with_name(f"{path.stem}.legacy.json")), legacy_record)
+
     def test_dual_reviews_start_independently_with_identical_exact_candidate_context(self) -> None:
         root, _, config = self.make_repository()
         paths = common.initialize_state_files(root, config)
@@ -776,14 +806,17 @@ class CoreTests(RepositoryTestCase):
         (paths.prompts / "reviewer.md").unlink(missing_ok=True)
         (paths.schemas / "reviewer-result.schema.json").unlink()
         review_schema = common.read_json(paths.schemas / "review-record.schema.json")
-        review_schema["properties"]["result"]["$ref"] = "verifier-result.schema.json"
+        review_schema["properties"]["result"] = {"$ref": "verifier-result.schema.json"}
         common.write_text_atomic(paths.schemas / "review-record.schema.json", common.pretty_json(review_schema))
 
         common.initialize_state_files(root, config)
 
         self.assertTrue((paths.prompts / "reviewer.md").is_file())
         self.assertTrue((paths.schemas / "reviewer-result.schema.json").is_file())
-        self.assertEqual(common.read_json(paths.schemas / "review-record.schema.json")["properties"]["result"]["$ref"], "reviewer-result.schema.json")
+        self.assertEqual(
+            {schema["$ref"] for schema in common.read_json(paths.schemas / "review-record.schema.json")["properties"]["result"]["oneOf"]},
+            {"reviewer-result.schema.json", "verifier-result.schema.json"},
+        )
 
         (paths.prompts / "reviewer.md").write_text("custom reviewer prompt\n", encoding="utf-8")
         custom_schema = common.read_json(paths.schemas / "reviewer-result.schema.json") | {"description": "custom reviewer schema"}
@@ -803,7 +836,10 @@ class CoreTests(RepositoryTestCase):
         common.initialize_state_files(root, config)
         self.assertTrue(common.read_text(paths.prompts / "reviewer.md").strip())
         common._project_output_schema(paths.schemas / "reviewer-result.schema.json")
-        self.assertEqual(common.read_json(paths.schemas / "review-record.schema.json")["properties"]["result"]["$ref"], "reviewer-result.schema.json")
+        self.assertEqual(
+            {schema["$ref"] for schema in common.read_json(paths.schemas / "review-record.schema.json")["properties"]["result"]["oneOf"]},
+            {"reviewer-result.schema.json", "verifier-result.schema.json"},
+        )
 
     def test_review_worktree_recovery_mutation_and_cleanup(self) -> None:
         root, _, config = self.make_repository()

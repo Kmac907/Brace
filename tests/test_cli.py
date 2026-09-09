@@ -162,3 +162,8 @@ class CliTests(unittest.TestCase):
         ):
             self.assertTrue((template / relative).is_file(), relative)
         self.assertFalse((template / ".codex" / "scripts").exists())
+        self.assertIn("two independent adversarial reviewers", (template / ".codex" / "AGENTS.md").read_text(encoding="utf-8"))
+        self.assertIn(
+            "two independent adversarial reviewers",
+            (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8"),
+        )
