@@ -152,11 +152,15 @@ class CliTests(RepositoryTestCase):
         root, _, config = self.make_repository()
         paths = common.initialize_state_files(root, config)
         state = common.read_json(paths.state, paths.schemas / "state.schema.json")
-        state.update(stage="build", stageStatus="running")
-        common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
         task = self.task() | {"status": "active", "attemptCount": 2, "lastError": "second reviewer interrupted"}
+        task_hash = common.definition_hash([task], "task")
+        plan_hash = "gitblob:" + "a" * 40
+        state.update(
+            stage="build", stageStatus="running", planHash=plan_hash, taskDefinitionHash=task_hash,
+        )
         tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
-        tasks.update(status="active", tasks=[task])
+        tasks.update(status="active", planHash=plan_hash, definitionHash=task_hash, tasks=[task])
+        common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
         common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
         common.write_immutable_json(common.attempt_path(paths, "assignment", task["taskId"], 2), {
             "schemaVersion": "1.0", "identity": task["taskId"], "attempt": 2,
@@ -217,14 +221,84 @@ class CliTests(RepositoryTestCase):
         state = common.read_json(paths.state, paths.schemas / "state.schema.json")
         task = self.task()
         task_hash = common.definition_hash([task], "task")
+        plan_hash = "gitblob:" + "a" * 40
         tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
-        tasks.update(status="ready", definitionHash=task_hash, tasks=[task])
-        state["taskDefinitionHash"] = task_hash
-        tasks["tasks"][0]["title"] = "altered after planning"
+        tasks.update(status="ready", planHash="gitblob:" + "b" * 40, definitionHash=task_hash, tasks=[task])
+        state.update(planHash=plan_hash, taskDefinitionHash=task_hash)
         common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
         common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
-        with self.assertRaisesRegex(BraceError, "task ledger definitions changed"):
+        with (
+            patch.object(common.time, "sleep"),
+            self.assertRaisesRegex(BraceError, "tasks.json plan hash differs"),
+        ):
             common.show_repository_status(root)
+
+        tasks["planHash"] = plan_hash
+        tasks["tasks"][0]["title"] = "altered after planning"
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        with (
+            patch.object(common.time, "sleep"),
+            self.assertRaisesRegex(BraceError, "task ledger definitions changed"),
+        ):
+            common.show_repository_status(root)
+
+    def test_status_rejects_unfrozen_ledger_entries(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        tasks.update(status="ready", tasks=[self.task()])
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        with patch.object(common.time, "sleep"):
+            with self.assertRaisesRegex(BraceError, "task ledger"):
+                common.show_repository_status(root)
+
+        tasks.update(status="not_planned", tasks=[])
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        bug = {
+            "bugId": "BUG-0001", "title": "BUG-0001", "severity": "medium", "category": "correctness",
+            "status": "verified", "disposition": "not_reproducible", "requirementIds": ["REQ-ONE"],
+            "description": "one defect", "evidence": "reproduction", "actualBehavior": "wrong",
+            "requiredBehavior": "right", "impact": "incorrect output", "requiredCorrection": "correct it",
+            "acceptanceTest": "output is right", "dependencies": [], "allowedPaths": ["src/**"],
+            "exclusiveResources": [], "attemptCount": 0, "branch": None, "worktree": None, "baseSha": None,
+            "resultSha": None, "pullRequest": None, "lastError": None, "amendmentId": None,
+            "dispositionEvidence": "not reproduced",
+        }
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        bugs.update(status="complete", bugs=[bug])
+        common.write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
+        with patch.object(common.time, "sleep"):
+            with self.assertRaisesRegex(BraceError, "bug ledger"):
+                common.show_repository_status(root)
+
+    def test_status_retries_cross_file_writer_interleaving(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        task = self.task()
+        task_hash = common.definition_hash([task], "task")
+        plan_hash = "gitblob:" + "a" * 40
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        tasks.update(status="ready", planHash=plan_hash, definitionHash=task_hash, tasks=[task])
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        completed_state = state | {
+            "stage": "build", "stageStatus": "not_started", "planHash": plan_hash,
+            "taskDefinitionHash": task_hash,
+        }
+        output = io.StringIO()
+        terminal = Console(file=output, force_terminal=False, color_system=None, width=120)
+
+        def finish_cross_file_write(_: float) -> None:
+            common.write_json_atomic(paths.state, completed_state, paths.schemas / "state.schema.json")
+
+        with (
+            common.WorkflowLock(paths.lock),
+            patch.object(common.time, "sleep", side_effect=finish_cross_file_write) as sleep,
+            patch.object(ui, "console", terminal),
+        ):
+            common.show_repository_status(root)
+        sleep.assert_called_once()
+        self.assertIn("0/1 complete", output.getvalue())
 
     def test_runtime_version_uses_package_metadata(self) -> None:
         self.assertEqual(__version__, version("brace"))

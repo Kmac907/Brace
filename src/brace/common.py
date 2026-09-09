@@ -24,6 +24,8 @@ from urllib.parse import unquote, urlsplit
 MAXIMUM_RESULT_BYTES = 1024 * 1024
 MAXIMUM_LOG_BYTES = 2 * 1024 * 1024
 AGENT_HEARTBEAT_SECONDS = 30
+STATUS_SNAPSHOT_ATTEMPTS = 20
+STATUS_SNAPSHOT_RETRY_SECONDS = 0.05
 REVIEW_SUPPORT_PATHS = {
     ".codex/prompts/reviewer.md",
     ".codex/schemas/closure-record.schema.json",
@@ -1563,21 +1565,57 @@ def show_status(
     render_status(state, tasks, bugs, active_started)
 
 
+def _assert_status_ledger_identity(state: dict[str, Any], ledger: dict[str, Any], kind: str) -> None:
+    if state[f"{kind}DefinitionHash"] is None and ledger["definitionHash"] is None:
+        empty = (
+            ledger["status"] == ("not_planned" if kind == "task" else "not_audited")
+            and not ledger[f"{kind}s"]
+            and (kind != "task" or ledger["planHash"] is None and state["planHash"] is None)
+            and (kind != "bug" or ledger["auditCycle"] == 0 and ledger["auditSha"] is None)
+        )
+        if empty:
+            return
+        raise BraceError(f"{kind} ledger contains entries before its definitions were frozen.")
+    assert_ledger_identity(state, ledger, kind)
+
+
+def _read_status_snapshot(paths: Paths) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    schemas = paths.schemas
+    error: BraceError | None = None
+    for attempt in range(STATUS_SNAPSHOT_ATTEMPTS):
+        first = (
+            read_json(paths.state, schemas / "state.schema.json"),
+            read_json(paths.tasks, schemas / "tasks.schema.json"),
+            read_json(paths.bugs, schemas / "bugs.schema.json"),
+        )
+        second = (
+            read_json(paths.state, schemas / "state.schema.json"),
+            read_json(paths.tasks, schemas / "tasks.schema.json"),
+            read_json(paths.bugs, schemas / "bugs.schema.json"),
+        )
+        try:
+            if first != second:
+                raise BraceError("Brace state changed while status was being read.")
+            state, tasks, bugs = second
+            _assert_status_ledger_identity(state, tasks, "task")
+            _assert_status_ledger_identity(state, bugs, "bug")
+            return state, tasks, bugs
+        except BraceError as exc:
+            error = exc
+            if attempt + 1 < STATUS_SNAPSHOT_ATTEMPTS:
+                time.sleep(STATUS_SNAPSHOT_RETRY_SECONDS)
+    raise error or BraceError("Unable to obtain a coherent Brace status snapshot.")
+
+
 def show_repository_status(repository: str | Path = ".") -> None:
     root = repository_root(repository)
     paths = Paths(root)
     if not paths.state.is_file():
         raise BraceError(f"Brace is not initialized in {root}.")
     try:
-        state = read_json(paths.state, paths.schemas / "state.schema.json")
-        tasks = read_json(paths.tasks, paths.schemas / "tasks.schema.json")
-        bugs = read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        state, tasks, bugs = _read_status_snapshot(paths)
         if Path(state["repositoryRoot"]).resolve() != root:
             raise BraceError("Recorded repository root does not match the requested repository.")
-        if state["taskDefinitionHash"] is not None or tasks["definitionHash"] is not None:
-            assert_ledger_identity(state, tasks, "task")
-        if state["bugDefinitionHash"] is not None or bugs["definitionHash"] is not None:
-            assert_ledger_identity(state, bugs, "bug")
         active_started: dict[str, datetime] = {}
         for identity_key, ledger_key, ledger in (("taskId", "tasks", tasks), ("bugId", "bugs", bugs)):
             for item in (entry for entry in ledger[ledger_key] if entry["status"] == "active"):
