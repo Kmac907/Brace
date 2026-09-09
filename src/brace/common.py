@@ -24,6 +24,7 @@ MAXIMUM_RESULT_BYTES = 1024 * 1024
 MAXIMUM_LOG_BYTES = 2 * 1024 * 1024
 REVIEW_SUPPORT_PATHS = {
     ".codex/prompts/reviewer.md",
+    ".codex/schemas/closure-record.schema.json",
     ".codex/schemas/review-record.schema.json",
     ".codex/schemas/reviewer-result.schema.json",
 }
@@ -462,11 +463,12 @@ def update_state_schema(root: str | Path, paths: Paths) -> None:
             write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
     if paths.bugs.is_file():
         bugs = read_json(paths.bugs)
-        if bugs.get("schemaVersion") in {"1.0", "1.1"}:
+        if bugs.get("schemaVersion") in {"1.0", "1.1", "1.2"}:
             for bug in bugs["bugs"]:
                 _add_missing(bug, "amendmentId", None)
                 _add_missing(bug, "dispositionEvidence", None)
-            bugs["schemaVersion"] = "1.2"
+            _add_missing(bugs, "auditCycle", 1 if bugs.get("auditSha") else 0)
+            bugs["schemaVersion"] = "1.3"
             write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
 
 
@@ -497,6 +499,22 @@ def initialize_state_files(root: str | Path, config: dict[str, Any]) -> Paths:
         current = False
     if not current:
         write_text_atomic(review_schema, read_text(support / "schemas" / "review-record.schema.json"))
+    closure_schema = paths.schemas / "closure-record.schema.json"
+    try:
+        current_closure_schema = read_json(closure_schema)
+        _project_output_schema(closure_schema)
+        current = (
+            set(current_closure_schema["required"])
+            == {"schemaVersion", "kind", "cycle", "candidateSha", "completedAt", "result"}
+            and current_closure_schema["properties"]["schemaVersion"]["const"] == "1.0"
+            and set(current_closure_schema["properties"]["kind"]["enum"]) == {"audit", "validation"}
+            and {schema.get("$ref") for schema in current_closure_schema["properties"]["result"]["oneOf"]}
+            == {"audit-result.schema.json", "verifier-result.schema.json"}
+        )
+    except (BraceError, KeyError, OSError, TypeError, UnicodeError):
+        current = False
+    if not current:
+        write_text_atomic(closure_schema, read_text(support / "schemas" / "closure-record.schema.json"))
     for directory in (paths.logs, paths.assignments, paths.results):
         directory.mkdir(parents=True, exist_ok=True)
     if not paths.state.is_file():
@@ -504,7 +522,7 @@ def initialize_state_files(root: str | Path, config: dict[str, Any]) -> Paths:
     if not paths.tasks.is_file():
         write_json_atomic(paths.tasks, {"schemaVersion": "1.1", "revision": 0, "planHash": None, "definitionHash": None, "status": "not_planned", "tasks": []}, paths.schemas / "tasks.schema.json")
     if not paths.bugs.is_file():
-        write_json_atomic(paths.bugs, {"schemaVersion": "1.2", "revision": 0, "auditSha": None, "definitionHash": None, "status": "not_audited", "bugs": []}, paths.schemas / "bugs.schema.json")
+        write_json_atomic(paths.bugs, {"schemaVersion": "1.3", "revision": 0, "auditCycle": 0, "auditSha": None, "definitionHash": None, "status": "not_audited", "bugs": []}, paths.schemas / "bugs.schema.json")
     update_state_schema(root, paths)
     return paths
 
@@ -926,15 +944,15 @@ def _worktree_registered(root: str | Path, worktree: str | Path) -> bool:
     )
 
 
-def assert_review_worktree(worktree: str | Path, candidate_sha: str) -> None:
+def assert_read_only_worktree(worktree: str | Path, candidate_sha: str) -> None:
     assert_review_shas(candidate_sha, candidate_sha)
     path = Path(worktree).resolve()
     if Path(run_native("git", ["-C", path, "rev-parse", "--show-toplevel"]).output.strip()).resolve() != path:
-        raise BraceError(f"Reviewer worktree root changed: {path}")
+        raise BraceError(f"Read-only worktree root changed: {path}")
     if run_native("git", ["-C", path, "branch", "--show-current"]).output.strip():
-        raise BraceError(f"Reviewer worktree is not detached: {path}")
+        raise BraceError(f"Read-only worktree is not detached: {path}")
     if run_native("git", ["-C", path, "rev-parse", "HEAD"]).output.strip() != candidate_sha:
-        raise BraceError(f"Reviewer worktree HEAD changed: {path}")
+        raise BraceError(f"Read-only worktree HEAD changed: {path}")
     dirty = run_native("git", ["-C", path, "status", "--porcelain", "--untracked-files=all", "--ignored"]).output.strip()
     tracked_directories: set[str] = set()
     for tracked in run_native("git", ["-C", path, "ls-files", "-z"]).output.split("\0"):
@@ -944,7 +962,11 @@ def assert_review_worktree(worktree: str | Path, candidate_sha: str) -> None:
         tracked_directories.update("/".join(parts[:depth]) for depth in range(1, len(parts) + 1))
     unexpected_directory = next((entry for entry in path.rglob("*") if entry.is_dir() and entry.relative_to(path).as_posix() not in tracked_directories), None)
     if dirty or unexpected_directory:
-        raise BraceError(f"Reviewer worktree contains changes: {path}")
+        raise BraceError(f"Read-only worktree contains changes: {path}")
+
+
+def assert_review_worktree(worktree: str | Path, candidate_sha: str) -> None:
+    assert_read_only_worktree(worktree, candidate_sha)
 
 
 def new_review_worktree(root: str | Path, config: dict[str, Any], identity: str, attempt: int, reviewer: int, candidate_sha: str) -> Path:
@@ -963,7 +985,10 @@ def new_review_worktree(root: str | Path, config: dict[str, Any], identity: str,
 
 
 def _assert_review_checks(result: dict[str, Any], required: Iterable[str], identity: str, reviewer: int) -> None:
-    passed = {check["command"] for check in result["checks"] if check["result"] == "passed"}
+    passed = {
+        check["command"] for check in result["checks"]
+        if check["result"] == "passed" and check["evidence"].strip()
+    }
     missing = [check for check in required if check not in passed]
     if missing:
         raise BraceError(f"{identity} reviewer {reviewer} is missing passed evidence for required checks: {', '.join(missing)}")
@@ -1484,9 +1509,16 @@ def new_audit_worktree(root: str | Path, config: dict[str, Any], reference: str)
     base = worktree_base(root, config)
     base.mkdir(parents=True, exist_ok=True)
     path = (base / "AUDIT").resolve()
+    if path.parent != base or path.name != "AUDIT":
+        raise BraceError(f"Refusing unexpected audit worktree: {path}")
     if path.is_dir():
         run_native("git", ["-C", root, "worktree", "remove", "--force", "--", path])
-    run_native("git", ["-C", root, "worktree", "add", "--detach", "--", path, reference])
+    elif _worktree_registered(root, path):
+        run_native("git", ["-C", root, "worktree", "remove", "--force", "--", path])
+    candidate_sha = run_native("git", ["-C", root, "rev-parse", reference]).output.strip()
+    assert_review_shas(candidate_sha, candidate_sha)
+    run_native("git", ["-C", root, "worktree", "add", "--detach", "--", path, candidate_sha])
+    assert_read_only_worktree(path, candidate_sha)
     return path
 
 

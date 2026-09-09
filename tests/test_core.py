@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import copy
 import json
 import os
 import shutil
@@ -12,6 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from brace import audit as audit_loop
 from brace import common, project_manager
 from support import RepositoryTestCase
 
@@ -632,6 +634,13 @@ class CoreTests(RepositoryTestCase):
             "affectedTaskIds": ["TASK-0001"], "affectedBugIds": [], "resumeStage": "build", "attemptCount": 1,
         })
         common.write_json_atomic(paths.state.with_name("referenced.json"), state, paths.schemas / "state.schema.json")
+        legacy_bugs = common.read_json(paths.bugs)
+        legacy_bugs["schemaVersion"] = "1.2"
+        legacy_bugs.pop("auditCycle")
+        common.write_text_atomic(paths.bugs, common.pretty_json(legacy_bugs))
+        common.update_state_schema(root, paths)
+        migrated_bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        self.assertEqual((migrated_bugs["schemaVersion"], migrated_bugs["auditCycle"]), ("1.3", 0))
 
     def test_verifier_rejection_allows_findings_without_blocker(self) -> None:
         root, _, config = self.make_repository()
@@ -683,6 +692,322 @@ class CoreTests(RepositoryTestCase):
             common.write_text_atomic(common.review_path(paths, "TASK-0001", 2, 1), common.pretty_json(malformed))
             with self.subTest(completed_at=completed_at), self.assertRaisesRegex(common.BraceError, error):
                 common.read_review_result(paths, "TASK-0001", 2, 1, base, candidate)
+
+    def test_closure_records_are_immutable_resumable_and_candidate_bound(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        candidate, changed = "b" * 40, "c" * 40
+        result = {
+            "status": "completed", "summary": "clean", "bugs": [], "checks": [],
+            "missingEvidence": [], "blocker": None,
+        }
+
+        record = audit_loop.write_closure_result(paths, 1, "audit", candidate, result)
+
+        self.assertEqual(audit_loop.read_closure_result(paths, 1, "audit", candidate), record)
+        self.assertIsNone(audit_loop.read_closure_result(paths, 1, "audit", changed))
+        self.assertEqual(audit_loop.next_closure_cycle(paths, 0, candidate), 1)
+        self.assertEqual(audit_loop.next_closure_cycle(paths, 0, changed), 2)
+        with self.assertRaisesRegex(common.BraceError, "Immutable attempt record"):
+            audit_loop.write_closure_result(paths, 1, "audit", candidate, result | {"summary": "different"})
+        incomplete = result | {"missingEvidence": ["required platform unavailable"]}
+        audit_loop.write_closure_result(paths, 2, "audit", candidate, incomplete)
+        self.assertEqual(audit_loop.next_closure_cycle(paths, 1, candidate), 3)
+        blocked = result | {
+            "status": "blocked",
+            "blocker": dict(project_manager.structured_blocker("provider unavailable", "audit", None), kind="operational"),
+        }
+        audit_loop.write_closure_result(paths, 3, "audit", candidate, blocked)
+        self.assertEqual(audit_loop.next_closure_cycle(paths, 2, candidate), 4)
+
+    def test_closure_findings_append_without_rewriting_history(self) -> None:
+        def finding(identity: str, dependencies: list[str] | None = None) -> dict:
+            return {
+                "bugId": identity, "title": "Defect", "severity": "medium", "category": "correctness",
+                "requirementIds": ["REQ-ONE"], "description": "A defect", "evidence": "Focused reproduction",
+                "actualBehavior": "wrong", "requiredBehavior": "right", "impact": "incorrect output",
+                "requiredCorrection": "Correct output", "acceptanceTest": "output is right",
+                "dependencies": dependencies or [], "allowedPaths": ["src/**"], "exclusiveResources": [],
+            }
+
+        prior = audit_loop.persisted_bug(finding("BUG-0001"))
+        prior.update(status="verified", disposition="fixed")
+        combined = audit_loop.append_findings([prior], [finding("BUG-0001")])
+
+        self.assertIs(combined[0], prior)
+        self.assertEqual((combined[0]["bugId"], combined[0]["status"]), ("BUG-0001", "verified"))
+        self.assertEqual((combined[1]["bugId"], combined[1]["status"]), ("BUG-0002", "open"))
+        with self.assertRaisesRegex(common.BraceError, "Duplicate provisional bug identity"):
+            audit_loop.append_findings([prior], [finding("BUG-0001"), finding("BUG-0001")])
+        with self.assertRaisesRegex(common.BraceError, "depends on unknown bug"):
+            audit_loop.append_findings([prior], [finding("BUG-0001", ["BUG-9999"])])
+
+    def test_torn_bug_ledger_write_recovers_from_exact_audit_record(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        candidate = self.git(root, "rev-parse", "HEAD")
+        finding = {
+            "bugId": "BUG-0018", "title": "Defect", "severity": "medium", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "A defect", "evidence": "Focused reproduction",
+            "actualBehavior": "wrong", "requiredBehavior": "right", "impact": "incorrect output",
+            "requiredCorrection": "Correct output", "acceptanceTest": "output is right",
+            "dependencies": [], "allowedPaths": ["src/**"], "exclusiveResources": [],
+        }
+        audit_result = {
+            "status": "completed", "summary": "one finding", "bugs": [finding], "checks": [],
+            "missingEvidence": [], "blocker": None,
+        }
+        audit_loop.write_closure_result(paths, 1, "audit", candidate, audit_result, [])
+        persisted = audit_loop.append_findings([], [dict(finding)])
+        bug_hash = common.definition_hash(persisted, "bug")
+        bugs.update(auditCycle=1, auditSha=candidate, definitionHash=bug_hash, status="ready", bugs=persisted)
+        common.write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
+        record_before = common.read_text(audit_loop.closure_path(paths, 1, "audit"))
+
+        self.assertTrue(audit_loop.recover_bug_definition_state(state, bugs, paths))
+
+        recovered = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        self.assertEqual(recovered["bugDefinitionHash"], bug_hash)
+        common.assert_ledger_identity(recovered, bugs, "bug")
+        self.assertEqual(common.read_text(audit_loop.closure_path(paths, 1, "audit")), record_before)
+        self.assertFalse(audit_loop.recover_bug_definition_state(recovered, bugs, paths))
+
+    def test_torn_bug_ledger_recovery_rejects_fabricated_operational_state(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        candidate = self.git(root, "rev-parse", "HEAD")
+        finding = {
+            "bugId": "BUG-0018", "title": "Defect", "severity": "medium", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "A defect", "evidence": "Focused reproduction",
+            "actualBehavior": "wrong", "requiredBehavior": "right", "impact": "incorrect output",
+            "requiredCorrection": "Correct output", "acceptanceTest": "output is right",
+            "dependencies": [], "allowedPaths": ["src/**"], "exclusiveResources": [],
+        }
+        audit_loop.write_closure_result(paths, 1, "audit", candidate, {
+            "status": "completed", "summary": "one finding", "bugs": [finding], "checks": [],
+            "missingEvidence": [], "blocker": None,
+        })
+        persisted = audit_loop.append_findings([], [dict(finding)])
+        persisted[0].update(
+            status="verified", disposition="fixed", dispositionEvidence="fabricated", attemptCount=1,
+            branch="worktree/BUG-0001", worktree=str(self.base / "fabricated"),
+            baseSha="a" * 40, resultSha="b" * 40, lastError="fabricated",
+            pullRequest={
+                "id": "1", "url": "https://example.invalid/1", "state": "merged", "repository": "owner/repo",
+                "head": "worktree/BUG-0001", "headSha": "b" * 40, "base": "brace/integration",
+                "baseSha": "a" * 40, "mergeSha": "c" * 40,
+            },
+        )
+        bug_hash = common.definition_hash(persisted, "bug")
+        bugs.update(auditCycle=1, auditSha=candidate, definitionHash=bug_hash, status="ready", bugs=persisted)
+        common.validate_json(bugs, paths.schemas / "bugs.schema.json")
+
+        self.assertFalse(audit_loop.recover_bug_definition_state(state, bugs, paths))
+        self.assertIsNone(state["bugDefinitionHash"])
+
+    def test_torn_bug_ledger_recovery_authenticates_preexisting_operational_state(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        candidate = self.git(root, "rev-parse", "HEAD")
+        prior_finding = {
+            "bugId": "BUG-0001", "title": "Prior defect", "severity": "medium", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "Prior defect", "evidence": "Prior reproduction",
+            "actualBehavior": "wrong", "requiredBehavior": "right", "impact": "incorrect output",
+            "requiredCorrection": "Correct output", "acceptanceTest": "prior output is right",
+            "dependencies": [], "allowedPaths": ["src/**"], "exclusiveResources": [],
+        }
+        prior = audit_loop.persisted_bug(prior_finding)
+        prior.update(status="verified", disposition="fixed", dispositionEvidence="regression passed", attemptCount=1)
+        state["bugDefinitionHash"] = common.definition_hash([prior], "bug")
+        finding = dict(prior_finding, bugId="BUG-0018", title="New defect", description="New defect")
+        record = audit_loop.write_closure_result(paths, 2, "audit", candidate, {
+            "status": "completed", "summary": "one finding", "bugs": [finding], "checks": [],
+            "missingEvidence": [], "blocker": None,
+        }, [prior])
+        tampered = copy.deepcopy(prior)
+        tampered.update(disposition="not_reproducible", dispositionEvidence="fabricated")
+        audit_loop.assert_audit_prior_state(record, [prior])
+        with self.assertRaisesRegex(common.BraceError, "pre-audit bug state"):
+            audit_loop.assert_audit_prior_state(record, [tampered])
+        persisted = audit_loop.append_findings([tampered], [dict(finding)])
+        bug_hash = common.definition_hash(persisted, "bug")
+        bugs.update(auditCycle=2, auditSha=candidate, definitionHash=bug_hash, status="ready", bugs=persisted)
+        common.validate_json(bugs, paths.schemas / "bugs.schema.json")
+
+        self.assertFalse(audit_loop.recover_bug_definition_state(state, bugs, paths))
+        self.assertEqual(state["bugDefinitionHash"], common.definition_hash([prior], "bug"))
+
+        persisted = audit_loop.append_findings([copy.deepcopy(prior)], [dict(finding)])
+        bugs.update(definitionHash=common.definition_hash(persisted, "bug"), bugs=persisted)
+        self.assertTrue(audit_loop.recover_bug_definition_state(state, bugs, paths))
+
+        bugs["bugs"][1].update(
+            status="verified", disposition="not_reproducible", dispositionEvidence="focused reproduction passed",
+        )
+        self.assertIsNone(audit_loop.clean_audit_result(paths, bugs, candidate))
+        self.assertEqual(audit_loop.next_closure_cycle(paths, 2, candidate), 3)
+        self.assertEqual(audit_loop.required_final_checks({"tasks": []}, bugs), ["prior output is right"])
+
+        audit_loop.write_closure_result(paths, 3, "audit", candidate, {
+            "status": "completed", "summary": "clean", "bugs": [], "checks": [],
+            "missingEvidence": [], "blocker": None,
+        }, bugs["bugs"])
+        clean = {"auditCycle": 3, "bugs": bugs["bugs"]}
+        self.assertIsNotNone(audit_loop.clean_audit_result(paths, clean, candidate))
+        changed = copy.deepcopy(bugs["bugs"])
+        changed[0] = tampered
+        with self.assertRaisesRegex(common.BraceError, "pre-audit bug state"):
+            audit_loop.clean_audit_result(paths, clean | {"bugs": changed}, candidate)
+
+    def test_merged_recovery_rejects_changed_bug_identity_before_final_evidence(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        head = self.git(root, "rev-parse", "HEAD")
+        plan_hash = common.git_blob_identity(root, head, "plan.md")
+        task = self.task() | {"status": "integrated"}
+        task_hash = common.definition_hash([task], "task")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        tasks.update(revision=1, planHash=plan_hash, definitionHash=task_hash, status="complete", tasks=[task])
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        bug_hash = common.definition_hash([], "bug")
+        bugs.update(
+            revision=1, auditCycle=1, auditSha=head, definitionHash="sha256:" + "f" * 64,
+            status="complete", bugs=[],
+        )
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        state.update(
+            stage="audit", stageStatus="running", targetBaseSha="a" * 40, integrationSha=head,
+            requirementsHash=common.git_blob_identity(root, head, "requirements.md"), planHash=plan_hash,
+            taskDefinitionHash=task_hash, bugDefinitionHash=bug_hash,
+        )
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        common.write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
+        common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
+
+        with (
+            patch.object(audit_loop, "assert_prerequisites"),
+            patch.object(audit_loop, "require_final_evidence") as final_evidence,
+            patch.object(audit_loop, "complete_project_cleanup") as cleanup,
+            self.assertRaisesRegex(common.BraceError, "bug ledger definitions changed"),
+        ):
+            audit_loop.run(root)
+        final_evidence.assert_not_called()
+        cleanup.assert_not_called()
+
+    def test_frozen_role_rejects_audit_worktree_mutation(self) -> None:
+        root, _, config = self.make_repository()
+        candidate = self.git(root, "rev-parse", "HEAD")
+        worktree = common.new_audit_worktree(root, config, candidate)
+
+        def mutate(repository, cwd, role, context, schema, sandbox):
+            (Path(cwd) / "mutation.txt").write_text("changed\n", encoding="utf-8")
+            return {}
+
+        try:
+            self.assertEqual(self.git(worktree, "branch", "--show-current"), "")
+            self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), candidate)
+            with patch.object(audit_loop, "invoke_role", side_effect=mutate), self.assertRaisesRegex(common.BraceError, "contains changes"):
+                audit_loop.invoke_frozen_role(root, worktree, candidate, "auditor", "audit", "audit-result.schema.json")
+        finally:
+            common.remove_audit_worktree(root, config)
+
+    def test_audit_worktree_rejects_redirected_path_and_recovers_stale_registration(self) -> None:
+        root, _, config = self.make_repository()
+        candidate = self.git(root, "rev-parse", "HEAD")
+        base = common.worktree_base(root, config)
+        base.mkdir(parents=True)
+        outside = self.base / "outside"
+        outside.mkdir()
+        redirected = base / "AUDIT"
+        if os.name == "nt":
+            process = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(redirected), str(outside)],
+                capture_output=True, text=True, encoding="utf-8", check=False,
+            )
+            if process.returncode != 0:
+                self.skipTest(f"Directory junction unavailable: {process.stderr.strip()}")
+        else:
+            redirected.symlink_to(outside, target_is_directory=True)
+        try:
+            with self.assertRaisesRegex(common.BraceError, "unexpected audit worktree"):
+                common.new_audit_worktree(root, config, candidate)
+            self.assertTrue(outside.is_dir())
+        finally:
+            os.rmdir(redirected) if os.name == "nt" else redirected.unlink()
+
+        interrupted = common.new_audit_worktree(root, config, candidate)
+        shutil.rmtree(interrupted)
+        self.assertTrue(common._worktree_registered(root, interrupted))
+        recovered = common.new_audit_worktree(root, config, candidate)
+        try:
+            self.assertEqual(recovered, interrupted)
+            self.assertEqual(self.git(recovered, "rev-parse", "HEAD"), candidate)
+        finally:
+            common.remove_audit_worktree(root, config)
+
+    def test_final_merge_evidence_requires_clean_exact_sha_and_two_approvals(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        base, candidate = "a" * 40, "b" * 40
+        state = {"targetBaseSha": base, "integrationSha": candidate}
+        tasks = {"tasks": [self.task()]}
+        bugs = {"status": "complete", "auditCycle": 2, "auditSha": candidate, "bugs": []}
+        validation = {
+            "approved": True, "summary": "approved", "findings": [],
+            "checks": [{"command": "python -m unittest", "result": "passed", "evidence": "suite passed"}],
+            "blocker": None,
+        }
+        audit_loop.write_closure_result(paths, 2, "validation", candidate, validation)
+        item = audit_loop.final_review_item(state, tasks, bugs)
+        for reviewer, approved in ((1, True), (2, False)):
+            result = self.reviewer_result(approved) | {
+                "checks": [{"command": "python -m unittest", "result": "passed", "evidence": "suite passed"}]
+            }
+            common.write_review_result(paths, "TASK-0000", 2, reviewer, base, candidate, result, item["checks"])
+
+        with self.assertRaisesRegex(common.BraceError, "no durable zero-finding closure audit"):
+            audit_loop.require_final_evidence(paths, state, tasks, bugs)
+        audit_loop.write_closure_result(paths, 2, "audit", candidate, {
+            "status": "completed", "summary": "clean", "bugs": [], "checks": [],
+            "missingEvidence": [], "blocker": None,
+        })
+        with self.assertRaisesRegex(common.BraceError, "rejected by adversarial review"):
+            audit_loop.require_final_evidence(paths, state, tasks, bugs)
+        self.assertEqual(audit_loop.previous_final_findings(paths, state, bugs), [self.reviewer_result(False)["findings"][0]])
+        with self.assertRaisesRegex(common.BraceError, "no clean closure audit"):
+            audit_loop.require_final_evidence(paths, state | {"integrationSha": "c" * 40}, tasks, bugs)
+
+    def test_final_validation_requires_deterministic_contract_checks(self) -> None:
+        tasks = {"tasks": [self.task(), self.task("TASK-0002") | {"checks": ["python -m unittest", "docs check"]}]}
+        bugs = {"bugs": [{"acceptanceTest": "bug regression", "disposition": "fixed"}]}
+        required = audit_loop.required_final_checks(tasks, bugs)
+        self.assertEqual(required, ["python -m unittest", "docs check", "bug regression"])
+        with self.assertRaisesRegex(common.BraceError, "missing passed evidence.*docs check.*bug regression"):
+            audit_loop.assert_final_validation({
+                "findings": [], "checks": [{"command": "python -m unittest", "result": "passed", "evidence": "passed"}]
+            }, required)
+        audit_loop.assert_final_validation({
+            "findings": [], "checks": [{"command": command, "result": "passed", "evidence": "passed"} for command in required]
+        }, required)
+        with self.assertRaisesRegex(common.BraceError, "reported findings"):
+            audit_loop.assert_final_validation({
+                "findings": ["regression"],
+                "checks": [{"command": command, "result": "passed", "evidence": "passed"} for command in required],
+            }, required)
+        with self.assertRaisesRegex(common.BraceError, "missing passed evidence.*docs check"):
+            audit_loop.assert_final_validation({
+                "findings": [],
+                "checks": [
+                    {"command": command, "result": "passed", "evidence": " " if command == "docs check" else "passed"}
+                    for command in required
+                ],
+            }, required)
 
     def test_legacy_review_record_is_retained_before_fresh_review(self) -> None:
         root, _, config = self.make_repository()
@@ -788,6 +1113,12 @@ class CoreTests(RepositoryTestCase):
                 with self.subTest(identity=identity, status=status), self.assertRaisesRegex(common.BraceError, "missing passed evidence"):
                     common.write_review_result(paths, identity, 1, 1, base, candidate, result, [required])
                 self.assertFalse(common.review_path(paths, identity, 1, 1).exists())
+            blank = self.reviewer_result() | {
+                "checks": [{"command": required, "result": "passed", "evidence": " \t"}]
+            }
+            with self.assertRaisesRegex(common.BraceError, "missing passed evidence"):
+                common.write_review_result(paths, identity, 1, 1, base, candidate, blank, [required])
+            self.assertFalse(common.review_path(paths, identity, 1, 1).exists())
             passed = self.reviewer_result() | {
                 "checks": [{"command": required, "result": "passed", "evidence": "check passed"}]
             }
@@ -804,6 +1135,7 @@ class CoreTests(RepositoryTestCase):
         root, _, config = self.make_repository()
         paths = common.Paths(root)
         (paths.prompts / "reviewer.md").unlink(missing_ok=True)
+        (paths.schemas / "closure-record.schema.json").unlink()
         (paths.schemas / "reviewer-result.schema.json").unlink()
         review_schema = common.read_json(paths.schemas / "review-record.schema.json")
         review_schema["properties"]["result"] = {"$ref": "verifier-result.schema.json"}
@@ -812,6 +1144,7 @@ class CoreTests(RepositoryTestCase):
         common.initialize_state_files(root, config)
 
         self.assertTrue((paths.prompts / "reviewer.md").is_file())
+        self.assertTrue((paths.schemas / "closure-record.schema.json").is_file())
         self.assertTrue((paths.schemas / "reviewer-result.schema.json").is_file())
         self.assertEqual(
             {schema["$ref"] for schema in common.read_json(paths.schemas / "review-record.schema.json")["properties"]["result"]["oneOf"]},
@@ -823,16 +1156,20 @@ class CoreTests(RepositoryTestCase):
         common.write_text_atomic(paths.schemas / "reviewer-result.schema.json", common.pretty_json(custom_schema))
         custom_record_schema = common.read_json(paths.schemas / "review-record.schema.json") | {"description": "custom review record schema"}
         common.write_text_atomic(paths.schemas / "review-record.schema.json", common.pretty_json(custom_record_schema))
+        custom_closure_schema = common.read_json(paths.schemas / "closure-record.schema.json") | {"description": "custom closure record schema"}
+        common.write_text_atomic(paths.schemas / "closure-record.schema.json", common.pretty_json(custom_closure_schema))
         common.initialize_state_files(root, config)
         self.assertEqual((paths.prompts / "reviewer.md").read_text(encoding="utf-8"), "custom reviewer prompt\n")
         self.assertEqual(common.read_json(paths.schemas / "reviewer-result.schema.json")["description"], "custom reviewer schema")
         self.assertEqual(common.read_json(paths.schemas / "review-record.schema.json")["description"], "custom review record schema")
+        self.assertEqual(common.read_json(paths.schemas / "closure-record.schema.json")["description"], "custom closure record schema")
 
         (paths.prompts / "reviewer.md").write_bytes(b"\xff")
         common.write_text_atomic(paths.schemas / "reviewer-result.schema.json", "{")
         common.write_text_atomic(paths.schemas / "review-record.schema.json", common.pretty_json({
             "properties": {"result": {"$ref": "reviewer-result.schema.json"}}
         }))
+        common.write_text_atomic(paths.schemas / "closure-record.schema.json", common.pretty_json({"type": "object"}))
         common.initialize_state_files(root, config)
         self.assertTrue(common.read_text(paths.prompts / "reviewer.md").strip())
         common._project_output_schema(paths.schemas / "reviewer-result.schema.json")
@@ -840,6 +1177,7 @@ class CoreTests(RepositoryTestCase):
             {schema["$ref"] for schema in common.read_json(paths.schemas / "review-record.schema.json")["properties"]["result"]["oneOf"]},
             {"reviewer-result.schema.json", "verifier-result.schema.json"},
         )
+        self.assertEqual(common.read_json(paths.schemas / "closure-record.schema.json")["properties"]["schemaVersion"]["const"], "1.0")
 
     def test_review_worktree_recovery_mutation_and_cleanup(self) -> None:
         root, _, config = self.make_repository()

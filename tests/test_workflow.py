@@ -58,6 +58,7 @@ class WorkflowTests(RepositoryTestCase):
             root,
             "rm",
             ".codex/prompts/reviewer.md",
+            ".codex/schemas/closure-record.schema.json",
             ".codex/schemas/reviewer-result.schema.json",
             ".codex/schemas/review-record.schema.json",
         )
@@ -93,6 +94,7 @@ class WorkflowTests(RepositoryTestCase):
             {line[3:].replace("\\", "/") for line in pending},
             {
                 ".codex/prompts/reviewer.md",
+                ".codex/schemas/closure-record.schema.json",
                 ".codex/schemas/reviewer-result.schema.json",
                 ".codex/schemas/review-record.schema.json",
             },
@@ -247,7 +249,11 @@ class WorkflowTests(RepositoryTestCase):
             common.write_immutable_json(common.attempt_path(paths, "result", item["taskId"], item["attemptCount"]), record)
             return record
 
-        verifier = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
+        verifier = {
+            "approved": True, "summary": "approved", "findings": [],
+            "checks": [{"command": "test -f src/product.txt", "result": "passed", "evidence": "file exists"}],
+            "blocker": None,
+        }
 
         def fake_publish(repository, worktree, configuration, item, kind):
             base = self.git(root, "rev-parse", f"origin/{configuration['integrationBranch']}")
@@ -274,9 +280,25 @@ class WorkflowTests(RepositoryTestCase):
         self.assertEqual(state["stage"], "audit")
 
         audit_result = {"status": "completed", "summary": "no bugs", "bugs": [], "checks": [], "missingEvidence": [], "blocker": None}
+        audit_contexts: list[str] = []
+        final_review_calls = 0
+        validation_calls = 0
 
         def fake_audit_role(repository, worktree, role, context, schema, sandbox):
-            return audit_result if role == "auditor" else verifier
+            nonlocal validation_calls
+            if role == "auditor":
+                audit_contexts.append(context)
+                return audit_result
+            validation_calls += 1
+            if validation_calls == 1:
+                return verifier | {"approved": False, "summary": "failed", "findings": ["required checks failed"], "checks": []}
+            return verifier | {"checks": []} if validation_calls == 2 else verifier
+
+        def fake_final_reviews(repository, state_paths, item, kind):
+            nonlocal final_review_calls
+            final_review_calls += 1
+            results = (self.reviewer_result(), self.reviewer_result(False)) if final_review_calls == 1 else None
+            return self.persist_reviews(state_paths, item, kind, results)
 
         def fake_new_pr(repository, configuration, head, base, expected_head, expected_base, title, body):
             return {
@@ -292,15 +314,31 @@ class WorkflowTests(RepositoryTestCase):
         with (
             patch.object(audit_loop, "assert_prerequisites"),
             patch.object(audit_loop, "invoke_role", side_effect=fake_audit_role),
-            patch.object(audit_loop, "new_pull_request", side_effect=fake_new_pr),
+            patch.object(audit_loop, "run_reviews", side_effect=fake_final_reviews),
+            patch.object(audit_loop, "new_pull_request", side_effect=fake_new_pr) as project_pr,
             patch.object(audit_loop, "complete_pull_request", side_effect=fake_complete),
         ):
+            with self.assertRaisesRegex(common.BraceError, "Final validation failed: required checks failed"):
+                audit_loop.run(root)
+            with self.assertRaisesRegex(common.BraceError, "missing passed evidence.*test -f src/product.txt"):
+                audit_loop.run(root)
             self.assertEqual(audit_loop.run(root), "complete")
 
         state = common.read_json(paths.state, paths.schemas / "state.schema.json")
         bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
         self.assertEqual(state["stage"], "complete")
         self.assertEqual(bugs["status"], "complete")
+        self.assertEqual(bugs["auditCycle"], 4)
+        self.assertEqual(validation_calls, 4)
+        self.assertEqual(final_review_calls, 2)
+        self.assertEqual(project_pr.call_count, 1)
+        self.assertIn("src/product.txt:1", audit_contexts[3])
+        self.assertEqual(len(list(paths.results.glob("TASK-0000-attempt-*-review-*.json"))), 4)
+        self.assertTrue((paths.results / "CLOSURE-attempt-001-audit.json").is_file())
+        self.assertTrue((paths.results / "CLOSURE-attempt-002-audit.json").is_file())
+        self.assertTrue((paths.results / "CLOSURE-attempt-003-audit.json").is_file())
+        self.assertTrue((paths.results / "CLOSURE-attempt-004-audit.json").is_file())
+        self.assertTrue((paths.results / "CLOSURE-attempt-004-validation.json").is_file())
         self.assertTrue(paths.build_summary.is_file())
         self.assertTrue(paths.audit_summary.is_file())
         self.assertFalse(Path(config["worktreeRoot"]).exists())
@@ -411,7 +449,14 @@ class WorkflowTests(RepositoryTestCase):
         paths = common.Paths(root)
         approved = self.reviewer_result()
         rejected = self.reviewer_result(False)
-        verifier = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
+        verifier = {
+            "approved": True, "summary": "approved", "findings": [],
+            "checks": [
+                {"command": "test -f src/product.txt", "result": "passed", "evidence": "file exists"},
+                {"command": "output is correct", "result": "passed", "evidence": "regression passed"},
+            ],
+            "blocker": None,
+        }
         rejected_shas = {}
 
         def fake_assignment(repository, worktree, item, kind, state_paths):
@@ -487,14 +532,22 @@ class WorkflowTests(RepositoryTestCase):
         }
         bug_verifications = 0
 
+        audit_calls = 0
+
         def fake_audit_role(repository, worktree, role, context, schema, sandbox):
-            nonlocal bug_verifications
+            nonlocal audit_calls
             if role == "auditor":
-                return audit_result
+                audit_calls += 1
+                return audit_result if audit_calls == 1 else {
+                    "status": "completed", "summary": "clean closure", "checks": [],
+                    "missingEvidence": [], "blocker": None, "bugs": [],
+                }
             return verifier
 
         def fake_bug_reviews(repository, state_paths, item, kind):
             nonlocal bug_verifications
+            if kind == "task":
+                return self.persist_reviews(state_paths, item, kind)
             bug_verifications += 1
             if bug_verifications == 1:
                 raise RuntimeError("legacy bug review interrupted")
@@ -529,7 +582,11 @@ class WorkflowTests(RepositoryTestCase):
             self.assertEqual(audit_loop.run(root), "complete")
 
         bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
         bug = bugs["bugs"][0]
+        self.assertEqual(audit_calls, 2)
+        self.assertEqual(bugs["auditCycle"], 2)
+        self.assertEqual(bugs["auditSha"], state["integrationSha"])
         self.assertEqual(bug["attemptCount"], 2)
         self.assertEqual(bug_verifications, 3)
         self.assertEqual(len(list(paths.results.glob("BUG-0001-attempt-*-review-*.json"))), 4)

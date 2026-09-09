@@ -199,6 +199,7 @@
   "required": [
     "schemaVersion",
     "revision",
+    "auditCycle",
     "auditSha",
     "definitionHash",
     "status",
@@ -206,9 +207,13 @@
   ],
   "properties": {
     "schemaVersion": {
-      "const": "1.2"
+      "const": "1.3"
     },
     "revision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "auditCycle": {
       "type": "integer",
       "minimum": 0
     },
