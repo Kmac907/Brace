@@ -4,7 +4,7 @@ import argparse
 from collections.abc import Sequence
 
 from . import __version__, audit, bootstrap, build, planning
-from .common import BraceError
+from .common import BraceError, show_repository_status
 from .ui import error, traceback
 
 
@@ -25,6 +25,9 @@ def parser() -> argparse.ArgumentParser:
 
     audit_command = commands.add_parser("audit", help="Audit, repair, validate, and complete the project.")
     audit_command.add_argument("repository", nargs="?", default=".")
+
+    status_command = commands.add_parser("status", help="Show the current workflow state without changing it.")
+    status_command.add_argument("repository", nargs="?", default=".")
     return result
 
 
@@ -37,6 +40,8 @@ def _dispatch(args: argparse.Namespace) -> None:
         next_stage = build.run(args.repository)
         while next_stage == "build":
             next_stage = build.run(args.repository)
+    elif args.command == "status":
+        show_repository_status(args.repository)
     else:
         next_stage = audit.run(args.repository)
         while next_stage == "build":
