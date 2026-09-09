@@ -130,6 +130,29 @@ class CliTests(unittest.TestCase):
             lines,
         )
 
+    def test_ci_workflow_runs_locked_checks_without_publishing(self) -> None:
+        workflows = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+        workflow = (workflows / "ci.yml").read_text(encoding="utf-8")
+        release = (workflows / "release.yml").read_text(encoding="utf-8")
+        for required in (
+            "  pull_request:\n  push:\n    branches: [main]",
+            "permissions:\n  contents: read",
+            "os: [ubuntu-latest, windows-latest]",
+            "runs-on: ${{ matrix.os }}",
+            "run: uv python install 3.11",
+            "run: uv run --locked python -m compileall -q src tests",
+            "run: uv run --locked python -m unittest discover -s tests -v",
+            "run: uv run --locked brace --help",
+            "enable-cache: false",
+        ):
+            self.assertIn(required, workflow)
+        self.assertEqual(
+            [line.strip() for line in workflow.splitlines() if "setup-uv@" in line or line.strip().startswith("version:")],
+            [line.strip() for line in release.splitlines() if "setup-uv@" in line or line.strip().startswith("version:")],
+        )
+        for forbidden in ("uv build", "uv version", "git tag", "git push", "gh release", "publish", "upload", "retention-days"):
+            self.assertNotIn(forbidden, workflow)
+
     def test_bundled_template_is_complete_and_has_no_scripts(self) -> None:
         template = bootstrap.bundled_template()
         for relative in (
