@@ -541,6 +541,40 @@ def read_attempt_result(paths: Paths, identity: str, attempt: int) -> dict[str, 
     return read_json(path) if path.is_file() else None
 
 
+def review_path(paths: Paths, identity: str, attempt: int, reviewer: int) -> Path:
+    if not re.fullmatch(r"(?:TASK|BUG)-\d{4}", identity) or attempt < 1 or reviewer not in (1, 2):
+        raise BraceError(f"Invalid review identity: {identity} attempt {attempt} reviewer {reviewer}")
+    return paths.results / f"{identity}-attempt-{attempt:03d}-review-{reviewer:02d}.json"
+
+
+def assert_review_shas(base_sha: str, candidate_sha: str) -> None:
+    if not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (base_sha, candidate_sha)):
+        raise BraceError("Review base and candidate must be exact Git SHAs.")
+
+
+def read_review_result(paths: Paths, identity: str, attempt: int, reviewer: int, base_sha: str, candidate_sha: str) -> dict[str, Any] | None:
+    assert_review_shas(base_sha, candidate_sha)
+    path = review_path(paths, identity, attempt, reviewer)
+    if not path.is_file():
+        return None
+    record = read_json(path, paths.schemas / "review-record.schema.json")
+    expected = (identity, attempt, reviewer, base_sha, candidate_sha)
+    actual = tuple(record[name] for name in ("identity", "attempt", "reviewer", "baseSha", "candidateSha"))
+    return record if actual == expected else None
+
+
+def write_review_result(paths: Paths, identity: str, attempt: int, reviewer: int, base_sha: str, candidate_sha: str, result: dict[str, Any]) -> dict[str, Any]:
+    assert_review_shas(base_sha, candidate_sha)
+    validate_json(result, paths.schemas / "verifier-result.schema.json")
+    record = {
+        "schemaVersion": "1.0", "identity": identity, "attempt": attempt, "reviewer": reviewer,
+        "baseSha": base_sha, "candidateSha": candidate_sha, "completedAt": utc_now(), "result": result,
+    }
+    validate_json(record, paths.schemas / "review-record.schema.json")
+    write_immutable_json(review_path(paths, identity, attempt, reviewer), record)
+    return record
+
+
 def worktree_base(root: str | Path, config: dict[str, Any]) -> Path:
     configured = config.get("worktreeRoot")
     parent = Path(configured).resolve() if configured else Path(tempfile.gettempdir()) / "brace"
@@ -800,6 +834,60 @@ def remove_worktree(root: str | Path, config: dict[str, Any], identity: str, bra
         run_native("git", ["-C", root, "worktree", "remove", "--force", "--", path])
     if run_native("git", ["-C", root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], allowed_exit_codes=(0, 1)).returncode == 0:
         run_native("git", ["-C", root, "branch", "-D", "--", branch])
+    remove_empty_worktree_containers(root, config)
+
+
+def review_worktree_path(root: str | Path, config: dict[str, Any], identity: str, attempt: int, reviewer: int) -> Path:
+    review_path(Paths(root), identity, attempt, reviewer)
+    return (worktree_base(root, config) / f"{identity}-attempt-{attempt:03d}-review-{reviewer:02d}").resolve()
+
+
+def assert_review_worktree(worktree: str | Path, candidate_sha: str) -> None:
+    assert_review_shas(candidate_sha, candidate_sha)
+    path = Path(worktree).resolve()
+    if Path(run_native("git", ["-C", path, "rev-parse", "--show-toplevel"]).output.strip()).resolve() != path:
+        raise BraceError(f"Reviewer worktree root changed: {path}")
+    if run_native("git", ["-C", path, "branch", "--show-current"]).output.strip():
+        raise BraceError(f"Reviewer worktree is not detached: {path}")
+    if run_native("git", ["-C", path, "rev-parse", "HEAD"]).output.strip() != candidate_sha:
+        raise BraceError(f"Reviewer worktree HEAD changed: {path}")
+    if run_native("git", ["-C", path, "status", "--porcelain", "--untracked-files=all"]).output.strip():
+        raise BraceError(f"Reviewer worktree contains changes: {path}")
+
+
+def new_review_worktree(root: str | Path, config: dict[str, Any], identity: str, attempt: int, reviewer: int, candidate_sha: str) -> Path:
+    assert_review_shas(candidate_sha, candidate_sha)
+    path = review_worktree_path(root, config, identity, attempt, reviewer)
+    base = worktree_base(root, config)
+    if path.parent != base:
+        raise BraceError(f"Refusing unexpected reviewer worktree path: {path}")
+    if not path.exists():
+        base.mkdir(parents=True, exist_ok=True)
+        run_native("git", ["-C", root, "worktree", "add", "--detach", "--", path, candidate_sha])
+    assert_review_worktree(path, candidate_sha)
+    return path
+
+
+def run_review(root: str | Path, paths: Paths, identity: str, attempt: int, reviewer: int, base_sha: str, candidate_sha: str, context: str) -> dict[str, Any]:
+    existing = read_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha)
+    if existing is not None:
+        return existing
+    worktree = new_review_worktree(root, get_configuration(root), identity, attempt, reviewer, candidate_sha)
+    assert_review_worktree(worktree, candidate_sha)
+    result = invoke_role(root, worktree, "verifier", context, "verifier-result.schema.json", "read-only")
+    assert_review_worktree(worktree, candidate_sha)
+    return write_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha, result)
+
+
+def remove_review_worktree(root: str | Path, config: dict[str, Any], paths: Paths, identity: str, attempt: int, reviewer: int, base_sha: str, candidate_sha: str) -> None:
+    path = review_worktree_path(root, config, identity, attempt, reviewer)
+    if path.parent != worktree_base(root, config) or path.name != f"{identity}-attempt-{attempt:03d}-review-{reviewer:02d}":
+        raise BraceError(f"Refusing unexpected reviewer worktree path: {path}")
+    if read_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha) is None:
+        raise BraceError(f"Cannot remove reviewer worktree without its matching durable result: {path}")
+    if path.is_dir():
+        assert_review_worktree(path, candidate_sha)
+        run_native("git", ["-C", root, "worktree", "remove", "--", path])
     remove_empty_worktree_containers(root, config)
 
 
