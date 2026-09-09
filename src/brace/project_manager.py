@@ -401,7 +401,9 @@ def invoke_pm_resolution(
         run_native("git", ["-C", amendment["worktree"], "push", "--set-upstream", config["remote"], amendment["branch"]])
         run_native("git", ["-C", root, "fetch", config["remote"], "--prune"])
         base = run_native("git", ["-C", root, "rev-parse", f"{config['remote']}/{config['integrationBranch']}"]).output.strip()
-        amendment["pullRequest"] = new_pull_request(root, config, amendment["branch"], config["integrationBranch"], amendment["resultSha"], base, f"{identity} project contract amendment", result["summary"])
+        if base != amendment["baseSha"]:
+            raise BraceError(f"Integration base changed after verification of {identity}.")
+        amendment["pullRequest"] = new_pull_request(root, config, amendment["branch"], config["integrationBranch"], amendment["resultSha"], amendment["baseSha"], f"{identity} project contract amendment", result["summary"])
         amendment["status"] = "submitted"
         save_state(state, paths)
 
@@ -409,7 +411,7 @@ def invoke_pm_resolution(
         pr = get_pull_request(root, config, amendment["branch"], config["integrationBranch"], amendment["resultSha"], amendment["pullRequest"]["id"])
         if pr is None:
             raise BraceError("Unable to reconcile the amendment pull request.")
-        merged = complete_pull_request(root, config, pr)
+        merged = complete_pull_request(root, config, pr, amendment["resultSha"], amendment["baseSha"])
         amendment.update(pullRequest=merged, status="integrated")
         state["integrationSha"] = merged["mergeSha"]
         state["acceptedIntegrationShas"] = list(dict.fromkeys([*state["acceptedIntegrationShas"], merged["mergeSha"]]))

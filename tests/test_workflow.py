@@ -284,7 +284,8 @@ class WorkflowTests(RepositoryTestCase):
                 "head": head, "headSha": expected_head, "base": base, "baseSha": expected_base, "mergeSha": None,
             }
 
-        def fake_complete(repository, configuration, pull_request):
+        def fake_complete(repository, configuration, pull_request, expected_head, expected_base):
+            self.assertEqual((expected_head, expected_base), (pull_request["headSha"], pull_request["baseSha"]))
             self.git(root, "push", "origin", f"{pull_request['headSha']}:refs/heads/{configuration['targetBranch']}")
             return {**pull_request, "state": "merged", "mergeSha": pull_request["headSha"]}
 
@@ -506,7 +507,8 @@ class WorkflowTests(RepositoryTestCase):
                 "head": head, "headSha": expected_head, "base": base, "baseSha": expected_base, "mergeSha": None,
             }
 
-        def fake_complete(repository, configuration, pull_request):
+        def fake_complete(repository, configuration, pull_request, expected_head, expected_base):
+            self.assertEqual((expected_head, expected_base), (pull_request["headSha"], pull_request["baseSha"]))
             self.git(root, "push", "origin", f"{pull_request['headSha']}:refs/heads/{configuration['targetBranch']}")
             return {**pull_request, "state": "merged", "mergeSha": pull_request["headSha"]}
 

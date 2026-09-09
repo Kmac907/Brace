@@ -147,7 +147,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 existing = get_pull_request(root, config, task["branch"], config["integrationBranch"], task["resultSha"])
                 if existing:
                     from .common import complete_pull_request
-                    merged = complete_pull_request(root, config, existing)
+                    merged = complete_pull_request(root, config, existing, task["resultSha"], task["baseSha"])
                     task.update(pullRequest=merged, status="integrated", lastError=None)
                     state["integrationSha"] = merged["mergeSha"]
                     save_ledger(tasks, paths)
