@@ -23,6 +23,7 @@ from .common import (
     ensure_integration_branch,
     get_configuration,
     get_pull_request,
+    has_matching_review_results,
     initialize_state_files,
     invoke_role,
     new_audit_worktree,
@@ -33,13 +34,16 @@ from .common import (
     read_attempt_result,
     read_json,
     recover_committed_attempt,
+    require_approved_reviews,
     reset_rejected_assignment,
     remove_audit_worktree,
     remove_empty_worktree_containers,
     remove_merged_assignment,
     remove_worktree,
     repository_root,
+    review_failure,
     run_assignment,
+    run_reviews,
     run_native,
     save_state,
     select_ready_items,
@@ -229,7 +233,11 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     bug["status"] = "result_ready"
                 else:
                     bug.update(status="open", lastError="Interrupted before a durable result or commit was produced." if record is None else record["error"])
-            for bug in (item for item in bugs["bugs"] if item["status"] in {"ready_to_publish", "result_ready"} and item.get("resultSha")):
+            for bug in (item for item in bugs["bugs"] if item["status"] == "ready_to_publish" and item.get("resultSha")):
+                if not has_matching_review_results(paths, bug, "bug"):
+                    bug.update(status="result_ready", lastError=None)
+                    continue
+                require_approved_reviews(paths, bug, "bug")
                 existing = get_pull_request(root, config, bug["branch"], config["integrationBranch"], bug["resultSha"])
                 if existing:
                     merged = complete_pull_request(root, config, existing)
@@ -277,36 +285,47 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                             if result["commitSha"] != commit["Head"]:
                                 raise BraceError("Fixer result commit SHA does not match worktree HEAD.")
                             bug["resultSha"] = commit["Head"]
-                        verification = invoke_role(root, bug["worktree"], "verifier", f"Verify only this {context_label}:\n{pretty_json(bug)}\n{pretty_json(result)}", "verifier-result.schema.json", "read-only")
-                        if not verification["approved"]:
-                            blocker = structured_blocker(verification["blocker"], "audit", bug["bugId"])
-                            if is_semantic_blocker(blocker):
-                                return _handle_semantic(root, config, state, paths, tasks, bugs, "verification", bug["bugId"], blocker, input_reader)
-                            message = f"{context_label.capitalize()} was rejected: " + "; ".join(verification["findings"])
-                            if bug.get("resultSha"):
-                                reset_rejected_assignment(root, config, bug, "bug")
-                                bug["resultSha"] = None
-                            bug.update(status="open", lastError=message)
-                            continue
-                        _checks(root, config, state, tasks, bugs)
-                        if result["status"] == "not_reproducible":
-                            bug.update(disposition="not_reproducible", status="verified", lastError=None)
-                            remove_worktree(root, config, bug["bugId"], bug["branch"])
                         else:
-                            bug.update(disposition="fixed", status="ready_to_publish")
-                            save_ledger(bugs, paths)
+                            candidate = run_native("git", ["-C", bug["worktree"], "rev-parse", "HEAD"]).output.strip()
+                            if candidate != bug["baseSha"]:
+                                raise BraceError("Not-reproducible disposition modified the bug worktree.")
                     except Exception as error:
-                        if state.get("activeAmendment"):
-                            raise
-                        if bug.get("resultSha") and bug.get("disposition") != "fixed":
+                        if bug.get("resultSha"):
                             reset_rejected_assignment(root, config, bug, "bug")
                             bug["resultSha"] = None
-                        bug["status"] = "ready_to_publish" if bug.get("disposition") == "fixed" and bug.get("resultSha") else "open"
+                        bug.update(status="open", lastError=str(error))
+                        continue
+                    review_item = bug if bug.get("resultSha") else {**bug, "resultSha": candidate}
+                    try:
+                        reviews = run_reviews(root, paths, review_item, "bug")
+                    except Exception as error:
                         bug["lastError"] = str(error)
+                        save_ledger(bugs, paths)
+                        raise
+                    if not all(review["result"]["approved"] for review in reviews):
+                        for review in reviews:
+                            blocker = structured_blocker(review["result"]["blocker"], "audit", bug["bugId"])
+                            if is_semantic_blocker(blocker):
+                                return _handle_semantic(root, config, state, paths, tasks, bugs, "review", bug["bugId"], blocker, input_reader)
+                        message = review_failure(reviews)
+                        if bug.get("resultSha"):
+                            reset_rejected_assignment(root, config, bug, "bug")
+                            bug["resultSha"] = None
+                        bug.update(status="open", lastError=message)
+                        continue
+                    require_approved_reviews(paths, review_item, "bug")
+                    _checks(root, config, state, tasks, bugs)
+                    if result["status"] == "not_reproducible":
+                        bug.update(disposition="not_reproducible", status="verified", lastError=None)
+                        remove_worktree(root, config, bug["bugId"], bug["branch"])
+                    else:
+                        bug.update(disposition="fixed", status="ready_to_publish", lastError=None)
+                        save_ledger(bugs, paths)
                 save_ledger(bugs, paths)
 
                 for bug in (item for item in bugs["bugs"] if item["status"] == "ready_to_publish"):
                     _checks(root, config, state, tasks, bugs)
+                    require_approved_reviews(paths, bug, "bug")
                     state["integrationSha"] = ensure_integration_branch(root, config, state, known_merges(tasks, bugs))
                     merged = publish_assignment(root, bug["worktree"], config, bug, "bug")
                     bug.update(pullRequest=merged, status="verified", lastError=None)

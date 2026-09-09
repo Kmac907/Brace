@@ -13,13 +13,20 @@ import tempfile
 import time
 import uuid
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
 MAXIMUM_RESULT_BYTES = 1024 * 1024
 MAXIMUM_LOG_BYTES = 2 * 1024 * 1024
+REVIEW_SUPPORT_PATHS = {
+    ".codex/prompts/reviewer.md",
+    ".codex/schemas/review-record.schema.json",
+    ".codex/schemas/reviewer-result.schema.json",
+}
 SEMANTIC_BLOCKERS = {
     "missing_information",
     "contract_conflict",
@@ -465,6 +472,31 @@ def update_state_schema(root: str | Path, paths: Paths) -> None:
 
 def initialize_state_files(root: str | Path, config: dict[str, Any]) -> Paths:
     paths = Paths(root)
+    support = Path(str(files("brace").joinpath("resources", "template", ".codex")))
+    reviewer_prompt = paths.prompts / "reviewer.md"
+    try:
+        valid_prompt = bool(read_text(reviewer_prompt).strip())
+    except (BraceError, OSError, UnicodeError):
+        valid_prompt = False
+    if not valid_prompt:
+        write_text_atomic(reviewer_prompt, read_text(support / "prompts" / "reviewer.md"))
+    reviewer_schema = paths.schemas / "reviewer-result.schema.json"
+    try:
+        _project_output_schema(reviewer_schema)
+    except (BraceError, OSError, UnicodeError):
+        write_text_atomic(reviewer_schema, read_text(support / "schemas" / "reviewer-result.schema.json"))
+    review_schema = paths.schemas / "review-record.schema.json"
+    try:
+        current_review_schema = read_json(review_schema)
+        _project_output_schema(review_schema)
+        result_schemas = current_review_schema["properties"]["result"]["oneOf"]
+        current = {
+            schema.get("$ref") for schema in result_schemas if isinstance(schema, dict)
+        } == {"reviewer-result.schema.json", "verifier-result.schema.json"} and len(result_schemas) == 2
+    except (BraceError, KeyError, OSError, TypeError, UnicodeError):
+        current = False
+    if not current:
+        write_text_atomic(review_schema, read_text(support / "schemas" / "review-record.schema.json"))
     for directory in (paths.logs, paths.assignments, paths.results):
         directory.mkdir(parents=True, exist_ok=True)
     if not paths.state.is_file():
@@ -475,6 +507,17 @@ def initialize_state_files(root: str | Path, config: dict[str, Any]) -> Paths:
         write_json_atomic(paths.bugs, {"schemaVersion": "1.2", "revision": 0, "auditSha": None, "definitionHash": None, "status": "not_audited", "bugs": []}, paths.schemas / "bugs.schema.json")
     update_state_schema(root, paths)
     return paths
+
+
+def is_untracked_review_support(root: str | Path, status_line: str) -> bool:
+    relative = status_line[3:].replace("\\", "/")
+    if not status_line.startswith("?? ") or relative not in REVIEW_SUPPORT_PATHS:
+        return False
+    packaged = Path(str(files("brace").joinpath("resources", "template", *relative.split("/"))))
+    try:
+        return (Path(root) / relative).read_bytes() == packaged.read_bytes()
+    except OSError:
+        return False
 
 
 def assert_state_identity(state: dict[str, Any], root: str | Path, config: dict[str, Any]) -> None:
@@ -569,20 +612,40 @@ def read_review_result(paths: Paths, identity: str, attempt: int, reviewer: int,
     if not path.is_file():
         return None
     record = read_json(path, paths.schemas / "review-record.schema.json")
+    if "ponytailVerdict" not in record["result"]:
+        return None
     expected = (identity, attempt, reviewer, base_sha, candidate_sha)
     actual = tuple(record[name] for name in ("identity", "attempt", "reviewer", "baseSha", "candidateSha"))
     return record if actual == expected else None
 
 
-def write_review_result(paths: Paths, identity: str, attempt: int, reviewer: int, base_sha: str, candidate_sha: str, result: dict[str, Any]) -> dict[str, Any]:
+def write_review_result(
+    paths: Paths,
+    identity: str,
+    attempt: int,
+    reviewer: int,
+    base_sha: str,
+    candidate_sha: str,
+    result: dict[str, Any],
+    required_checks: Iterable[str],
+) -> dict[str, Any]:
     assert_review_shas(base_sha, candidate_sha)
-    validate_json(result, paths.schemas / "verifier-result.schema.json")
+    validate_json(result, paths.schemas / "reviewer-result.schema.json")
+    _assert_review_checks(result, required_checks, identity, reviewer)
     record = {
         "schemaVersion": "1.0", "identity": identity, "attempt": attempt, "reviewer": reviewer,
         "baseSha": base_sha, "candidateSha": candidate_sha, "completedAt": utc_now(), "result": result,
     }
     validate_json(record, paths.schemas / "review-record.schema.json")
-    write_immutable_json(review_path(paths, identity, attempt, reviewer), record)
+    path = review_path(paths, identity, attempt, reviewer)
+    if path.is_file():
+        existing = read_json(path, paths.schemas / "review-record.schema.json")
+        expected = (identity, attempt, reviewer, base_sha, candidate_sha)
+        actual = tuple(existing[name] for name in ("identity", "attempt", "reviewer", "baseSha", "candidateSha"))
+        if "ponytailVerdict" not in existing["result"] and actual == expected:
+            write_immutable_json(path.with_name(f"{path.stem}.legacy.json"), existing)
+            path.unlink()
+    write_immutable_json(path, record)
     return record
 
 
@@ -598,7 +661,8 @@ def reset_completed_workflow(root: str | Path, config: dict[str, Any], state: di
         raise BraceError("Only a completed workflow may be replaced.")
     if not re.fullmatch(r"[0-9a-f]{40}", str(state.get("finalMergeSha") or "")):
         raise BraceError("Completed workflow is missing its verified final merge SHA.")
-    if run_native("git", ["-C", root, "status", "--porcelain", "--untracked-files=all"]).output.strip():
+    changes = run_native("git", ["-C", root, "status", "--porcelain", "--untracked-files=all"]).lines
+    if any(not is_untracked_review_support(root, line) for line in changes):
         raise BraceError("The repository must be clean before starting a new workflow.")
     base = worktree_base(root, config)
     if base.is_dir() and any(base.iterdir()):
@@ -898,15 +962,85 @@ def new_review_worktree(root: str | Path, config: dict[str, Any], identity: str,
     return path
 
 
-def run_review(root: str | Path, paths: Paths, identity: str, attempt: int, reviewer: int, base_sha: str, candidate_sha: str, context: str) -> dict[str, Any]:
+def _assert_review_checks(result: dict[str, Any], required: Iterable[str], identity: str, reviewer: int) -> None:
+    passed = {check["command"] for check in result["checks"] if check["result"] == "passed"}
+    missing = [check for check in required if check not in passed]
+    if missing:
+        raise BraceError(f"{identity} reviewer {reviewer} is missing passed evidence for required checks: {', '.join(missing)}")
+
+
+def run_review(root: str | Path, paths: Paths, identity: str, attempt: int, reviewer: int, base_sha: str, candidate_sha: str, context: str, required_checks: Iterable[str] = ()) -> dict[str, Any]:
     existing = read_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha)
     if existing is not None:
+        _assert_review_checks(existing["result"], required_checks, identity, reviewer)
         return existing
     worktree = new_review_worktree(root, get_configuration(root), identity, attempt, reviewer, candidate_sha)
     assert_review_worktree(worktree, candidate_sha)
-    result = invoke_role(root, worktree, "verifier", context, "verifier-result.schema.json", "read-only")
+    result = invoke_role(root, worktree, "reviewer", context, "reviewer-result.schema.json", "read-only")
     assert_review_worktree(worktree, candidate_sha)
-    return write_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha, result)
+    return write_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha, result, required_checks)
+
+
+def run_reviews(root: str | Path, paths: Paths, item: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+    identity = item["taskId" if kind == "task" else "bugId"]
+    attempt = int(item["attemptCount"])
+    base_sha, candidate_sha = item["baseSha"], item["resultSha"]
+    assert_review_shas(base_sha, candidate_sha)
+    fields = (
+        ("taskId", "title", "description", "requirementIds", "planSections", "dependencies", "allowedPaths", "exclusiveResources", "acceptanceCriteria", "checks")
+        if kind == "task"
+        else ("bugId", "title", "severity", "category", "requirementIds", "description", "evidence", "actualBehavior", "requiredBehavior", "impact", "requiredCorrection", "acceptanceTest", "dependencies", "allowedPaths", "exclusiveResources")
+    )
+    context = pretty_json({
+        "reviewKind": kind,
+        "assignment": {name: item[name] for name in fields},
+        "baseSha": base_sha,
+        "candidateSha": candidate_sha,
+        "requirementsMarkdown": read_git_text(root, candidate_sha, "requirements.md"),
+        "planMarkdown": read_git_text(root, candidate_sha, "plan.md"),
+        "baseToCandidateDiff": run_native("git", ["-C", root, "diff", "--no-ext-diff", f"{base_sha}..{candidate_sha}", "--"]).output,
+    })
+    config = get_configuration(root)
+    required_checks = item["checks"] if kind == "task" else [item["acceptanceTest"]]
+    for reviewer in (1, 2):
+        if read_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha) is None:
+            new_review_worktree(root, config, identity, attempt, reviewer, candidate_sha)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(run_review, root, paths, identity, attempt, reviewer, base_sha, candidate_sha, context, required_checks) for reviewer in (1, 2)]
+        records = [future.result() for future in futures]
+    for reviewer in (1, 2):
+        remove_review_worktree(root, config, paths, identity, attempt, reviewer, base_sha, candidate_sha)
+    return records
+
+
+def require_approved_reviews(paths: Paths, item: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+    identity = item["taskId" if kind == "task" else "bugId"]
+    values = [read_review_result(paths, identity, int(item["attemptCount"]), reviewer, item["baseSha"], item["resultSha"]) for reviewer in (1, 2)]
+    if any(record is None for record in values):
+        raise BraceError(f"{identity} is missing a matching durable reviewer result.")
+    records = [record for record in values if record is not None]
+    if not all(record["result"]["approved"] for record in records):
+        raise BraceError(f"{identity} was rejected by adversarial review.")
+    required = item["checks"] if kind == "task" else [item["acceptanceTest"]]
+    for record in records:
+        _assert_review_checks(record["result"], required, identity, record["reviewer"])
+    return records
+
+
+def has_matching_review_results(paths: Paths, item: dict[str, Any], kind: str) -> bool:
+    identity = item["taskId" if kind == "task" else "bugId"]
+    return all(
+        read_review_result(paths, identity, int(item["attemptCount"]), reviewer, item["baseSha"], item["resultSha"]) is not None
+        for reviewer in (1, 2)
+    )
+
+
+def review_failure(records: Iterable[dict[str, Any]]) -> str:
+    findings = [
+        f"{finding['severity']} {finding['location']}: {finding['actualBehavior']}"
+        for record in records for finding in record["result"]["findings"]
+    ]
+    return "Adversarial review failed: " + "; ".join(findings or ["reviewer reported a semantic blocker"])
 
 
 def remove_review_worktree(root: str | Path, config: dict[str, Any], paths: Paths, identity: str, attempt: int, reviewer: int, base_sha: str, candidate_sha: str) -> None:
