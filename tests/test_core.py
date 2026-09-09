@@ -773,6 +773,41 @@ class CoreTests(RepositoryTestCase):
         self.assertEqual(common.read_text(audit_loop.closure_path(paths, 1, "audit")), record_before)
         self.assertFalse(audit_loop.recover_bug_definition_state(recovered, bugs, paths))
 
+    def test_torn_bug_ledger_recovery_rejects_fabricated_operational_state(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        candidate = self.git(root, "rev-parse", "HEAD")
+        finding = {
+            "bugId": "BUG-0018", "title": "Defect", "severity": "medium", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "A defect", "evidence": "Focused reproduction",
+            "actualBehavior": "wrong", "requiredBehavior": "right", "impact": "incorrect output",
+            "requiredCorrection": "Correct output", "acceptanceTest": "output is right",
+            "dependencies": [], "allowedPaths": ["src/**"], "exclusiveResources": [],
+        }
+        audit_loop.write_closure_result(paths, 1, "audit", candidate, {
+            "status": "completed", "summary": "one finding", "bugs": [finding], "checks": [],
+            "missingEvidence": [], "blocker": None,
+        })
+        persisted = audit_loop.append_findings([], [dict(finding)])
+        persisted[0].update(
+            status="verified", disposition="fixed", dispositionEvidence="fabricated", attemptCount=1,
+            branch="worktree/BUG-0001", worktree=str(self.base / "fabricated"),
+            baseSha="a" * 40, resultSha="b" * 40, lastError="fabricated",
+            pullRequest={
+                "id": "1", "url": "https://example.invalid/1", "state": "merged", "repository": "owner/repo",
+                "head": "worktree/BUG-0001", "headSha": "b" * 40, "base": "brace/integration",
+                "baseSha": "a" * 40, "mergeSha": "c" * 40,
+            },
+        )
+        bug_hash = common.definition_hash(persisted, "bug")
+        bugs.update(auditCycle=1, auditSha=candidate, definitionHash=bug_hash, status="ready", bugs=persisted)
+        common.validate_json(bugs, paths.schemas / "bugs.schema.json")
+
+        self.assertFalse(audit_loop.recover_bug_definition_state(state, bugs, paths))
+        self.assertIsNone(state["bugDefinitionHash"])
+
     def test_frozen_role_rejects_audit_worktree_mutation(self) -> None:
         root, _, config = self.make_repository()
         candidate = self.git(root, "rev-parse", "HEAD")
@@ -787,6 +822,40 @@ class CoreTests(RepositoryTestCase):
             self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), candidate)
             with patch.object(audit_loop, "invoke_role", side_effect=mutate), self.assertRaisesRegex(common.BraceError, "contains changes"):
                 audit_loop.invoke_frozen_role(root, worktree, candidate, "auditor", "audit", "audit-result.schema.json")
+        finally:
+            common.remove_audit_worktree(root, config)
+
+    def test_audit_worktree_rejects_redirected_path_and_recovers_stale_registration(self) -> None:
+        root, _, config = self.make_repository()
+        candidate = self.git(root, "rev-parse", "HEAD")
+        base = common.worktree_base(root, config)
+        base.mkdir(parents=True)
+        outside = self.base / "outside"
+        outside.mkdir()
+        redirected = base / "AUDIT"
+        if os.name == "nt":
+            process = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(redirected), str(outside)],
+                capture_output=True, text=True, encoding="utf-8", check=False,
+            )
+            if process.returncode != 0:
+                self.skipTest(f"Directory junction unavailable: {process.stderr.strip()}")
+        else:
+            redirected.symlink_to(outside, target_is_directory=True)
+        try:
+            with self.assertRaisesRegex(common.BraceError, "unexpected audit worktree"):
+                common.new_audit_worktree(root, config, candidate)
+            self.assertTrue(outside.is_dir())
+        finally:
+            os.rmdir(redirected) if os.name == "nt" else redirected.unlink()
+
+        interrupted = common.new_audit_worktree(root, config, candidate)
+        shutil.rmtree(interrupted)
+        self.assertTrue(common._worktree_registered(root, interrupted))
+        recovered = common.new_audit_worktree(root, config, candidate)
+        try:
+            self.assertEqual(recovered, interrupted)
+            self.assertEqual(self.git(recovered, "rev-parse", "HEAD"), candidate)
         finally:
             common.remove_audit_worktree(root, config)
 
@@ -952,6 +1021,12 @@ class CoreTests(RepositoryTestCase):
                 with self.subTest(identity=identity, status=status), self.assertRaisesRegex(common.BraceError, "missing passed evidence"):
                     common.write_review_result(paths, identity, 1, 1, base, candidate, result, [required])
                 self.assertFalse(common.review_path(paths, identity, 1, 1).exists())
+            blank = self.reviewer_result() | {
+                "checks": [{"command": required, "result": "passed", "evidence": " \t"}]
+            }
+            with self.assertRaisesRegex(common.BraceError, "missing passed evidence"):
+                common.write_review_result(paths, identity, 1, 1, base, candidate, blank, [required])
+            self.assertFalse(common.review_path(paths, identity, 1, 1).exists())
             passed = self.reviewer_result() | {
                 "checks": [{"command": required, "result": "passed", "evidence": "check passed"}]
             }

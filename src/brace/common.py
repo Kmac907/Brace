@@ -985,7 +985,10 @@ def new_review_worktree(root: str | Path, config: dict[str, Any], identity: str,
 
 
 def _assert_review_checks(result: dict[str, Any], required: Iterable[str], identity: str, reviewer: int) -> None:
-    passed = {check["command"] for check in result["checks"] if check["result"] == "passed"}
+    passed = {
+        check["command"] for check in result["checks"]
+        if check["result"] == "passed" and check["evidence"].strip()
+    }
     missing = [check for check in required if check not in passed]
     if missing:
         raise BraceError(f"{identity} reviewer {reviewer} is missing passed evidence for required checks: {', '.join(missing)}")
@@ -1506,7 +1509,11 @@ def new_audit_worktree(root: str | Path, config: dict[str, Any], reference: str)
     base = worktree_base(root, config)
     base.mkdir(parents=True, exist_ok=True)
     path = (base / "AUDIT").resolve()
+    if path.parent != base or path.name != "AUDIT":
+        raise BraceError(f"Refusing unexpected audit worktree: {path}")
     if path.is_dir():
+        run_native("git", ["-C", root, "worktree", "remove", "--force", "--", path])
+    elif _worktree_registered(root, path):
         run_native("git", ["-C", root, "worktree", "remove", "--force", "--", path])
     candidate_sha = run_native("git", ["-C", root, "rev-parse", reference]).output.strip()
     assert_review_shas(candidate_sha, candidate_sha)

@@ -180,7 +180,8 @@ def recover_bug_definition_state(state: dict[str, Any], bugs: dict[str, Any], pa
     prior_hash = definition_hash(prefix, "bug")
     if state.get("bugDefinitionHash") not in ({prior_hash} if prefix else {None, prior_hash}):
         return False
-    if definition_hash(append_findings(copy.deepcopy(prefix), findings), "bug") != actual:
+    replayed = append_findings(copy.deepcopy(prefix), findings)
+    if replayed != bugs["bugs"] or definition_hash(replayed, "bug") != actual:
         return False
     state["bugDefinitionHash"] = actual
     save_state(state, paths)
