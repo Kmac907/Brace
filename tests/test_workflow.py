@@ -35,7 +35,9 @@ class WorkflowTests(RepositoryTestCase):
         chosen = tuple(result | {"checks": [{"command": command, "result": "passed", "evidence": "focused check passed"} for command in required]} for result in chosen)
         return [
             common.read_review_result(paths, identity, item["attemptCount"], reviewer, item["baseSha"], item["resultSha"])
-            or common.write_review_result(paths, identity, item["attemptCount"], reviewer, item["baseSha"], item["resultSha"], result)
+            or common.write_review_result(
+                paths, identity, item["attemptCount"], reviewer, item["baseSha"], item["resultSha"], result, required
+            )
             for reviewer, result in enumerate(chosen, 1)
         ]
 
@@ -47,6 +49,19 @@ class WorkflowTests(RepositoryTestCase):
         shutil.copy2(source_template / ".codex" / "AGENTS.md", root / ".codex" / "AGENTS.md")
         self.git(root, "add", ".")
         self.git(root, "commit", "-m", "workflow files")
+        self.git(root, "push", "origin", "main")
+        return root, remote, config
+
+    def prepare_legacy_project(self) -> tuple[Path, Path, dict]:
+        root, remote, config = self.prepare()
+        self.git(
+            root,
+            "rm",
+            ".codex/prompts/reviewer.md",
+            ".codex/schemas/reviewer-result.schema.json",
+            ".codex/schemas/review-record.schema.json",
+        )
+        self.git(root, "commit", "-m", "simulate v0.2.8 support")
         self.git(root, "push", "origin", "main")
         return root, remote, config
 
@@ -67,6 +82,36 @@ class WorkflowTests(RepositoryTestCase):
     def plan(self, root: Path) -> None:
         with patch.object(planning_loop, "assert_prerequisites"), patch.object(planning_loop, "invoke_role", return_value=self.planner_result()):
             planning_loop.run(root)
+
+    def test_legacy_support_restoration_does_not_block_planning(self) -> None:
+        root, _, _ = self.prepare_legacy_project()
+
+        self.plan(root)
+
+        pending = self.git(root, "status", "--porcelain", "--untracked-files=all").splitlines()
+        self.assertEqual(
+            {line[3:].replace("\\", "/") for line in pending},
+            {
+                ".codex/prompts/reviewer.md",
+                ".codex/schemas/reviewer-result.schema.json",
+                ".codex/schemas/review-record.schema.json",
+            },
+        )
+
+    def test_legacy_support_restoration_does_not_block_completed_reset(self) -> None:
+        root, _, config = self.prepare_legacy_project()
+        paths = common.initialize_state_files(root, config)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        state.update(
+            stage="complete",
+            stageStatus="complete",
+            finalMergeSha=self.git(root, "rev-parse", "HEAD"),
+        )
+        common.write_json_atomic(paths.state, state, paths.schemas / "state.schema.json")
+
+        common.reset_completed_workflow(root, config, state)
+
+        self.assertFalse(paths.state.exists())
 
     def test_planning_canonicalizes_model_identities_without_retry(self) -> None:
         root, _, _ = self.prepare()
@@ -275,7 +320,16 @@ class WorkflowTests(RepositoryTestCase):
             self.assertEqual(active, ["Reviewing TASK-0001 (attempt 2)"])
             if verification_calls == 1:
                 first = self.reviewer_result() | {"checks": [{"command": item["checks"][0], "result": "passed", "evidence": "focused check passed"}]}
-                common.write_review_result(paths, item["taskId"], item["attemptCount"], 1, item["baseSha"], item["resultSha"], first)
+                common.write_review_result(
+                    paths,
+                    item["taskId"],
+                    item["attemptCount"],
+                    1,
+                    item["baseSha"],
+                    item["resultSha"],
+                    first,
+                    item["checks"],
+                )
                 raise RuntimeError("second reviewer interrupted")
             return self.persist_reviews(paths, item, kind)
 

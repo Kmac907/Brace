@@ -17,6 +17,7 @@ from .common import (
     get_configuration,
     git_blob_identity,
     initialize_state_files,
+    is_untracked_review_support,
     invoke_role,
     normalize_task_references,
     read_json,
@@ -72,8 +73,14 @@ def run(repository: str | Path = ".", start_new_workflow: bool = False) -> None:
             remote_sha = run_native("git", ["-C", root, "rev-parse", f"{config['remote']}/{config['targetBranch']}"]).output.strip()
             if local_sha != remote_sha:
                 raise BraceError("Local target branch must exactly match its remote before planning.")
-            pending = [line[3:].replace("\\", "/") for line in run_native("git", ["-C", root, "status", "--porcelain", "--untracked-files=all"]).lines if len(line) > 3]
-            unexpected = [path for path in pending if path not in {"requirements.md", "plan.md"}]
+            pending = run_native("git", ["-C", root, "status", "--porcelain", "--untracked-files=all"]).lines
+            unexpected = [
+                line[3:].replace("\\", "/")
+                for line in pending
+                if len(line) > 3
+                and line[3:].replace("\\", "/") not in {"requirements.md", "plan.md"}
+                and not is_untracked_review_support(line)
+            ]
             if unexpected:
                 raise BraceError("Planning found unrelated uncommitted work: " + ", ".join(unexpected))
 

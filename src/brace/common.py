@@ -22,6 +22,11 @@ from urllib.parse import unquote, urlsplit
 
 MAXIMUM_RESULT_BYTES = 1024 * 1024
 MAXIMUM_LOG_BYTES = 2 * 1024 * 1024
+REVIEW_SUPPORT_PATHS = {
+    ".codex/prompts/reviewer.md",
+    ".codex/schemas/review-record.schema.json",
+    ".codex/schemas/reviewer-result.schema.json",
+}
 SEMANTIC_BLOCKERS = {
     "missing_information",
     "contract_conflict",
@@ -501,6 +506,10 @@ def initialize_state_files(root: str | Path, config: dict[str, Any]) -> Paths:
     return paths
 
 
+def is_untracked_review_support(status_line: str) -> bool:
+    return status_line.startswith("?? ") and status_line[3:].replace("\\", "/") in REVIEW_SUPPORT_PATHS
+
+
 def assert_state_identity(state: dict[str, Any], root: str | Path, config: dict[str, Any]) -> None:
     root = Path(root).resolve()
     if Path(state["repositoryRoot"]).resolve() != root:
@@ -598,9 +607,19 @@ def read_review_result(paths: Paths, identity: str, attempt: int, reviewer: int,
     return record if actual == expected else None
 
 
-def write_review_result(paths: Paths, identity: str, attempt: int, reviewer: int, base_sha: str, candidate_sha: str, result: dict[str, Any]) -> dict[str, Any]:
+def write_review_result(
+    paths: Paths,
+    identity: str,
+    attempt: int,
+    reviewer: int,
+    base_sha: str,
+    candidate_sha: str,
+    result: dict[str, Any],
+    required_checks: Iterable[str],
+) -> dict[str, Any]:
     assert_review_shas(base_sha, candidate_sha)
     validate_json(result, paths.schemas / "reviewer-result.schema.json")
+    _assert_review_checks(result, required_checks, identity, reviewer)
     record = {
         "schemaVersion": "1.0", "identity": identity, "attempt": attempt, "reviewer": reviewer,
         "baseSha": base_sha, "candidateSha": candidate_sha, "completedAt": utc_now(), "result": result,
@@ -622,7 +641,8 @@ def reset_completed_workflow(root: str | Path, config: dict[str, Any], state: di
         raise BraceError("Only a completed workflow may be replaced.")
     if not re.fullmatch(r"[0-9a-f]{40}", str(state.get("finalMergeSha") or "")):
         raise BraceError("Completed workflow is missing its verified final merge SHA.")
-    if run_native("git", ["-C", root, "status", "--porcelain", "--untracked-files=all"]).output.strip():
+    changes = run_native("git", ["-C", root, "status", "--porcelain", "--untracked-files=all"]).lines
+    if any(not is_untracked_review_support(line) for line in changes):
         raise BraceError("The repository must be clean before starting a new workflow.")
     base = worktree_base(root, config)
     if base.is_dir() and any(base.iterdir()):
@@ -938,8 +958,7 @@ def run_review(root: str | Path, paths: Paths, identity: str, attempt: int, revi
     assert_review_worktree(worktree, candidate_sha)
     result = invoke_role(root, worktree, "reviewer", context, "reviewer-result.schema.json", "read-only")
     assert_review_worktree(worktree, candidate_sha)
-    _assert_review_checks(result, required_checks, identity, reviewer)
-    return write_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha, result)
+    return write_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha, result, required_checks)
 
 
 def run_reviews(root: str | Path, paths: Paths, item: dict[str, Any], kind: str) -> list[dict[str, Any]]:

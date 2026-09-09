@@ -667,8 +667,8 @@ class CoreTests(RepositoryTestCase):
         candidate = "b" * 40
         approved = self.reviewer_result()
 
-        first = common.write_review_result(paths, "TASK-0001", 2, 1, base, candidate, approved)
-        second = common.write_review_result(paths, "TASK-0001", 2, 2, base, candidate, approved)
+        first = common.write_review_result(paths, "TASK-0001", 2, 1, base, candidate, approved, [])
+        second = common.write_review_result(paths, "TASK-0001", 2, 2, base, candidate, approved, [])
 
         self.assertEqual(common.review_path(paths, "TASK-0001", 2, 1).name, "TASK-0001-attempt-002-review-01.json")
         self.assertNotEqual(common.review_path(paths, "TASK-0001", 2, 1), common.review_path(paths, "TASK-0001", 2, 2))
@@ -738,7 +738,11 @@ class CoreTests(RepositoryTestCase):
         base, candidate = "a" * 40, "b" * 40
         for identity in ("TASK-0001", "BUG-0001"):
             for reviewer in (1, 2):
-                common.write_review_result(paths, identity, 1, reviewer, base, candidate, self.reviewer_result())
+                common.write_immutable_json(common.review_path(paths, identity, 1, reviewer), {
+                    "schemaVersion": "1.0", "identity": identity, "attempt": 1, "reviewer": reviewer,
+                    "baseSha": base, "candidateSha": candidate, "completedAt": common.utc_now(),
+                    "result": self.reviewer_result(),
+                })
         task = self.task() | {"attemptCount": 1, "baseSha": base, "resultSha": candidate}
         bug = {"bugId": "BUG-0001", "attemptCount": 1, "baseSha": base, "resultSha": candidate, "acceptanceTest": "python -m unittest bug"}
         with self.assertRaisesRegex(common.BraceError, "missing passed evidence.*python -m unittest"):
@@ -746,11 +750,25 @@ class CoreTests(RepositoryTestCase):
         with self.assertRaisesRegex(common.BraceError, "missing passed evidence.*python -m unittest bug"):
             common.require_approved_reviews(paths, bug, "bug")
 
+        for identity, required in (("TASK-0002", "task check"), ("BUG-0002", "bug check")):
+            for status in (None, "failed", "skipped"):
+                result = self.reviewer_result(status is None)
+                if status:
+                    result["checks"] = [{"command": required, "result": status, "evidence": f"check {status}"}]
+                with self.subTest(identity=identity, status=status), self.assertRaisesRegex(common.BraceError, "missing passed evidence"):
+                    common.write_review_result(paths, identity, 1, 1, base, candidate, result, [required])
+                self.assertFalse(common.review_path(paths, identity, 1, 1).exists())
+            passed = self.reviewer_result() | {
+                "checks": [{"command": required, "result": "passed", "evidence": "check passed"}]
+            }
+            common.write_review_result(paths, identity, 1, 1, base, candidate, passed, [required])
+            self.assertTrue(common.review_path(paths, identity, 1, 1).is_file())
+
         actual = self.git(root, "rev-parse", "HEAD")
         with patch.object(common, "invoke_role", return_value=self.reviewer_result()):
             with self.assertRaisesRegex(common.BraceError, "missing passed evidence.*required check"):
-                common.run_review(root, paths, "TASK-0002", 1, 1, actual, actual, "review", ["required check"])
-        self.assertFalse(common.review_path(paths, "TASK-0002", 1, 1).exists())
+                common.run_review(root, paths, "TASK-0003", 1, 1, actual, actual, "review", ["required check"])
+        self.assertFalse(common.review_path(paths, "TASK-0003", 1, 1).exists())
 
     def test_state_initialization_restores_reviewer_support_for_existing_project(self) -> None:
         root, _, config = self.make_repository()
@@ -820,7 +838,7 @@ class CoreTests(RepositoryTestCase):
         with self.assertRaisesRegex(common.BraceError, "contains changes"):
             common.assert_review_worktree(worktree, candidate)
         (worktree / ".ignored").rmdir()
-        common.write_review_result(paths, "BUG-0001", 1, 1, base, candidate, approved)
+        common.write_review_result(paths, "BUG-0001", 1, 1, base, candidate, approved, [])
         common.remove_review_worktree(root, config, paths, "BUG-0001", 1, 1, base, candidate)
         self.assertFalse(worktree.exists())
 
@@ -854,11 +872,11 @@ class CoreTests(RepositoryTestCase):
         shutil.rmtree(interrupted)
         self.assertTrue(common._worktree_registered(root, interrupted))
         self.assertEqual(common.new_review_worktree(root, config, "TASK-0001", 1, 1, candidate), interrupted)
-        common.write_review_result(paths, "TASK-0001", 1, 1, base, candidate, approved)
+        common.write_review_result(paths, "TASK-0001", 1, 1, base, candidate, approved, [])
         common.remove_review_worktree(root, config, paths, "TASK-0001", 1, 1, base, candidate)
 
         completed = common.new_review_worktree(root, config, "TASK-0001", 1, 2, candidate)
-        common.write_review_result(paths, "TASK-0001", 1, 2, base, candidate, approved)
+        common.write_review_result(paths, "TASK-0001", 1, 2, base, candidate, approved, [])
         shutil.rmtree(completed)
         common.remove_review_worktree(root, config, paths, "TASK-0001", 1, 2, base, candidate)
         self.assertFalse(common._worktree_registered(root, completed))
