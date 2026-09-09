@@ -153,9 +153,11 @@ def clean_audit_result(paths: Any, bugs: dict[str, Any], candidate_sha: str) -> 
     record = read_closure_result(paths, bugs["auditCycle"], "audit", candidate_sha)
     if record is None:
         return None
-    assert_audit_prior_state(record, bugs["bugs"])
     result = record["result"]
-    return result if result["status"] == "completed" and not result["bugs"] and not result["missingEvidence"] else None
+    if result["status"] != "completed" or result["bugs"] or result["missingEvidence"]:
+        return None
+    assert_audit_prior_state(record, bugs["bugs"])
+    return result
 
 
 def required_final_checks(tasks: dict[str, Any], bugs: dict[str, Any]) -> list[str]:

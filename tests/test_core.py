@@ -847,14 +847,23 @@ class CoreTests(RepositoryTestCase):
         bugs.update(definitionHash=common.definition_hash(persisted, "bug"), bugs=persisted)
         self.assertTrue(audit_loop.recover_bug_definition_state(state, bugs, paths))
 
+        bugs["bugs"][1].update(
+            status="verified", disposition="not_reproducible", dispositionEvidence="focused reproduction passed",
+        )
+        self.assertIsNone(audit_loop.clean_audit_result(paths, bugs, candidate))
+        self.assertEqual(audit_loop.next_closure_cycle(paths, 2, candidate), 3)
+        self.assertEqual(audit_loop.required_final_checks({"tasks": []}, bugs), ["prior output is right"])
+
         audit_loop.write_closure_result(paths, 3, "audit", candidate, {
             "status": "completed", "summary": "clean", "bugs": [], "checks": [],
             "missingEvidence": [], "blocker": None,
-        }, [prior])
-        clean = {"auditCycle": 3, "bugs": [prior]}
+        }, bugs["bugs"])
+        clean = {"auditCycle": 3, "bugs": bugs["bugs"]}
         self.assertIsNotNone(audit_loop.clean_audit_result(paths, clean, candidate))
+        changed = copy.deepcopy(bugs["bugs"])
+        changed[0] = tampered
         with self.assertRaisesRegex(common.BraceError, "pre-audit bug state"):
-            audit_loop.clean_audit_result(paths, clean | {"bugs": [tampered]}, candidate)
+            audit_loop.clean_audit_result(paths, clean | {"bugs": changed}, candidate)
 
     def test_merged_recovery_rejects_changed_bug_identity_before_final_evidence(self) -> None:
         root, _, config = self.make_repository()
