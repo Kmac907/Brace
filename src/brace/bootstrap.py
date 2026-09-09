@@ -4,6 +4,7 @@ import argparse
 import json
 import re
 import shutil
+import sys
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -17,6 +18,9 @@ class BootstrapError(RuntimeError):
     pass
 
 
+DEFAULT_CONCURRENCY = 3
+
+
 def bundled_template() -> Path:
     return Path(str(files("brace").joinpath("resources", "template")))
 
@@ -25,6 +29,23 @@ def required(value: str | None, prompt: str) -> str:
     result = (value or ask(prompt)).strip()
     if not result:
         raise BootstrapError(f"{prompt} is required.")
+    return result
+
+
+def concurrency_ceiling(value: int | None, role: str) -> int:
+    if value is None:
+        if not sys.stdin.isatty():
+            return DEFAULT_CONCURRENCY
+        value = ask(
+            f"Maximum concurrent {role} (1-32 safety ceiling; dependency/conflict scheduling may choose fewer)",
+            default=str(DEFAULT_CONCURRENCY),
+        )
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise BootstrapError(f"Maximum concurrent {role} must be a whole number between 1 and 32.") from exc
+    if not 1 <= result <= 32:
+        raise BootstrapError(f"Maximum concurrent {role} must be between 1 and 32.")
     return result
 
 
@@ -143,6 +164,10 @@ def bootstrap(args: argparse.Namespace) -> None:
         target = (Path(args.parent_directory).resolve() / args.project_name).resolve()
         if target.is_dir() and any(target.iterdir()):
             raise BootstrapError(f"Destination is not empty: {target}")
+
+    args.maximum_concurrent_builders = concurrency_ceiling(args.maximum_concurrent_builders, "builders")
+    args.maximum_concurrent_fixers = concurrency_ceiling(args.maximum_concurrent_fixers, "fixers")
+    if not use_existing:
         target.mkdir(parents=True, exist_ok=True)
 
     if args.provider == "github":
@@ -233,8 +258,14 @@ def add_arguments(result: argparse.ArgumentParser) -> None:
     result.add_argument("--github-owner")
     result.add_argument("--azure-organization")
     result.add_argument("--azure-project")
-    result.add_argument("--maximum-concurrent-builders", type=int, choices=range(1, 33), default=3)
-    result.add_argument("--maximum-concurrent-fixers", type=int, choices=range(1, 33), default=3)
+    result.add_argument(
+        "--maximum-concurrent-builders", type=int, choices=range(1, 33), metavar="1..32",
+        help="Builder safety ceiling; dependency/conflict scheduling may choose fewer (default: 3).",
+    )
+    result.add_argument(
+        "--maximum-concurrent-fixers", type=int, choices=range(1, 33), metavar="1..32",
+        help="Fixer safety ceiling; dependency/conflict scheduling may choose fewer (default: 3).",
+    )
     result.add_argument("--worktree-root")
     result.add_argument("--git-user-name")
     result.add_argument("--git-user-email")

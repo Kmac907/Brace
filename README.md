@@ -101,6 +101,8 @@ brace init \
   --provider github
 ```
 
+Interactive setup also asks for builder and fixer safety ceilings from 1 through 32. Both default to 3. These values cap each scheduling wave; dependencies and overlapping paths or resources can make the actual wave smaller. Unattended setup can use `--maximum-concurrent-builders` and `--maximum-concurrent-fixers`. The selected ceilings are frozen in `.codex/workflow.json` for that workflow.
+
 An existing repository must be clean, checked out on its remote default branch, exactly synchronized with `origin`, and must not already contain `.codex`. Existing project documentation is preserved.
 
 `brace init` runs with your account permissions and can create repositories and push commits. Pin the installation URL to a reviewed tag or commit when reproducibility matters.
@@ -207,8 +209,8 @@ Edit `.codex/workflow.json` before planning begins. Brace freezes it when workfl
 | `provider` | `github` or `azure_devops` |
 | `targetBranch` | Final project pull-request target |
 | `integrationBranch` | Coordinator-owned integration branch |
-| `maximumConcurrentBuilders` | Parallel task limit |
-| `maximumConcurrentFixers` | Parallel bug-fix limit |
+| `maximumConcurrentBuilders` | Builder safety ceiling (1..32, default 3); dependency/conflict scheduling may choose fewer |
+| `maximumConcurrentFixers` | Fixer safety ceiling (1..32, default 3); dependency/conflict scheduling may choose fewer |
 | `maximumTaskAttempts` | Retry limit per task |
 | `maximumBugAttempts` | Retry limit per bug |
 | `maximumPlanningQuestionRounds` | Interactive planning limit |
