@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -662,13 +663,20 @@ class CoreTests(RepositoryTestCase):
         self.assertIsNone(common.read_review_result(paths, "TASK-0001", 2, 1, base, "c" * 40))
         self.assertEqual(len(list(paths.results.glob("TASK-0001-attempt-002-review-*.json"))), 2)
 
+        malformed = common.read_json(common.review_path(paths, "TASK-0001", 2, 1))
+        malformed["completedAt"] = "not-a-date-time"
+        common.write_text_atomic(common.review_path(paths, "TASK-0001", 2, 1), common.pretty_json(malformed))
+        with self.assertRaisesRegex(common.BraceError, "date-time"):
+            common.read_review_result(paths, "TASK-0001", 2, 1, base, candidate)
+
     def test_review_worktree_recovery_mutation_and_cleanup(self) -> None:
         root, _, config = self.make_repository()
         paths = common.initialize_state_files(root, config)
         base = self.git(root, "rev-parse", "HEAD")
         candidate_file = root / "candidate.txt"
         candidate_file.write_text("candidate\n", encoding="utf-8")
-        self.git(root, "add", "candidate.txt")
+        (root / ".gitignore").write_text(".ignored/\n", encoding="utf-8")
+        self.git(root, "add", "candidate.txt", ".gitignore")
         self.git(root, "commit", "-m", "candidate")
         candidate = self.git(root, "rev-parse", "HEAD")
         approved = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
@@ -684,6 +692,12 @@ class CoreTests(RepositoryTestCase):
         with self.assertRaisesRegex(common.BraceError, "contains changes"):
             common.assert_review_worktree(worktree, candidate)
         (worktree / "untracked.txt").unlink()
+        (worktree / ".ignored").mkdir()
+        (worktree / ".ignored" / "mutation.txt").write_text("ignored\n", encoding="utf-8")
+        with self.assertRaisesRegex(common.BraceError, "contains changes"):
+            common.assert_review_worktree(worktree, candidate)
+        (worktree / ".ignored" / "mutation.txt").unlink()
+        (worktree / ".ignored").rmdir()
         common.write_review_result(paths, "BUG-0001", 1, 1, base, candidate, approved)
         common.remove_review_worktree(root, config, paths, "BUG-0001", 1, 1, base, candidate)
         self.assertFalse(worktree.exists())
@@ -707,6 +721,25 @@ class CoreTests(RepositoryTestCase):
             invoke.assert_called_once()
         common.remove_review_worktree(root, config, paths, "BUG-0001", 1, 2, base, candidate)
         self.assertFalse(second_worktree.exists())
+
+    def test_review_worktree_recovers_and_cleans_stale_registration(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        base = candidate = self.git(root, "rev-parse", "HEAD")
+        approved = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
+
+        interrupted = common.new_review_worktree(root, config, "TASK-0001", 1, 1, candidate)
+        shutil.rmtree(interrupted)
+        self.assertTrue(common._worktree_registered(root, interrupted))
+        self.assertEqual(common.new_review_worktree(root, config, "TASK-0001", 1, 1, candidate), interrupted)
+        common.write_review_result(paths, "TASK-0001", 1, 1, base, candidate, approved)
+        common.remove_review_worktree(root, config, paths, "TASK-0001", 1, 1, base, candidate)
+
+        completed = common.new_review_worktree(root, config, "TASK-0001", 1, 2, candidate)
+        common.write_review_result(paths, "TASK-0001", 1, 2, base, candidate, approved)
+        shutil.rmtree(completed)
+        common.remove_review_worktree(root, config, paths, "TASK-0001", 1, 2, base, candidate)
+        self.assertFalse(common._worktree_registered(root, completed))
 
     def test_unknown_integration_commit_is_rejected(self) -> None:
         root, remote, config = self.make_repository()

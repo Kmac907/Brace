@@ -232,7 +232,16 @@ def validate_json(value: Any, schema_path: str | Path) -> None:
             schema = document
     validator_class = jsonschema.validators.validator_for(schema)
     validator_class.check_schema(schema)
-    errors = sorted(validator_class(schema, registry=registry).iter_errors(value), key=lambda error: list(error.path))
+    format_checker = jsonschema.FormatChecker()
+
+    @format_checker.checks("date-time", raises=ValueError)
+    def valid_datetime(candidate: str) -> bool:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})", candidate):
+            return False
+        normalized = candidate[:-1] + "+00:00" if candidate[-1].lower() == "z" else candidate
+        return datetime.fromisoformat(normalized).tzinfo is not None
+
+    errors = sorted(validator_class(schema, registry=registry, format_checker=format_checker).iter_errors(value), key=lambda error: list(error.path))
     if errors:
         raise BraceError(f"JSON does not satisfy schema {path}: {errors[0].message}")
 
@@ -842,6 +851,15 @@ def review_worktree_path(root: str | Path, config: dict[str, Any], identity: str
     return (worktree_base(root, config) / f"{identity}-attempt-{attempt:03d}-review-{reviewer:02d}").resolve()
 
 
+def _worktree_registered(root: str | Path, worktree: str | Path) -> bool:
+    expected = Path(worktree).resolve()
+    return any(
+        Path(line.removeprefix("worktree ")).resolve() == expected
+        for line in run_native("git", ["-C", root, "worktree", "list", "--porcelain"]).lines
+        if line.startswith("worktree ")
+    )
+
+
 def assert_review_worktree(worktree: str | Path, candidate_sha: str) -> None:
     assert_review_shas(candidate_sha, candidate_sha)
     path = Path(worktree).resolve()
@@ -851,7 +869,7 @@ def assert_review_worktree(worktree: str | Path, candidate_sha: str) -> None:
         raise BraceError(f"Reviewer worktree is not detached: {path}")
     if run_native("git", ["-C", path, "rev-parse", "HEAD"]).output.strip() != candidate_sha:
         raise BraceError(f"Reviewer worktree HEAD changed: {path}")
-    if run_native("git", ["-C", path, "status", "--porcelain", "--untracked-files=all"]).output.strip():
+    if run_native("git", ["-C", path, "status", "--porcelain", "--untracked-files=all", "--ignored"]).output.strip():
         raise BraceError(f"Reviewer worktree contains changes: {path}")
 
 
@@ -862,6 +880,8 @@ def new_review_worktree(root: str | Path, config: dict[str, Any], identity: str,
     if path.parent != base:
         raise BraceError(f"Refusing unexpected reviewer worktree path: {path}")
     if not path.exists():
+        if _worktree_registered(root, path):
+            run_native("git", ["-C", root, "worktree", "remove", "--force", "--", path])
         base.mkdir(parents=True, exist_ok=True)
         run_native("git", ["-C", root, "worktree", "add", "--detach", "--", path, candidate_sha])
     assert_review_worktree(path, candidate_sha)
@@ -885,9 +905,13 @@ def remove_review_worktree(root: str | Path, config: dict[str, Any], paths: Path
         raise BraceError(f"Refusing unexpected reviewer worktree path: {path}")
     if read_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha) is None:
         raise BraceError(f"Cannot remove reviewer worktree without its matching durable result: {path}")
-    if path.is_dir():
+    exists = path.is_dir()
+    if exists:
         assert_review_worktree(path, candidate_sha)
-        run_native("git", ["-C", root, "worktree", "remove", "--", path])
+    if _worktree_registered(root, path):
+        run_native("git", ["-C", root, "worktree", "remove", *([] if exists else ["--force"]), "--", path])
+    if _worktree_registered(root, path):
+        raise BraceError(f"Reviewer worktree registration remains after cleanup: {path}")
     remove_empty_worktree_containers(root, config)
 
 
