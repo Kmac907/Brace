@@ -826,12 +826,15 @@ class CoreTests(RepositoryTestCase):
         prior.update(status="verified", disposition="fixed", dispositionEvidence="regression passed", attemptCount=1)
         state["bugDefinitionHash"] = common.definition_hash([prior], "bug")
         finding = dict(prior_finding, bugId="BUG-0018", title="New defect", description="New defect")
-        audit_loop.write_closure_result(paths, 2, "audit", candidate, {
+        record = audit_loop.write_closure_result(paths, 2, "audit", candidate, {
             "status": "completed", "summary": "one finding", "bugs": [finding], "checks": [],
             "missingEvidence": [], "blocker": None,
         }, [prior])
         tampered = copy.deepcopy(prior)
         tampered.update(disposition="not_reproducible", dispositionEvidence="fabricated")
+        audit_loop.assert_audit_prior_state(record, [prior])
+        with self.assertRaisesRegex(common.BraceError, "pre-audit bug state"):
+            audit_loop.assert_audit_prior_state(record, [tampered])
         persisted = audit_loop.append_findings([tampered], [dict(finding)])
         bug_hash = common.definition_hash(persisted, "bug")
         bugs.update(auditCycle=2, auditSha=candidate, definitionHash=bug_hash, status="ready", bugs=persisted)
@@ -843,6 +846,15 @@ class CoreTests(RepositoryTestCase):
         persisted = audit_loop.append_findings([copy.deepcopy(prior)], [dict(finding)])
         bugs.update(definitionHash=common.definition_hash(persisted, "bug"), bugs=persisted)
         self.assertTrue(audit_loop.recover_bug_definition_state(state, bugs, paths))
+
+        audit_loop.write_closure_result(paths, 3, "audit", candidate, {
+            "status": "completed", "summary": "clean", "bugs": [], "checks": [],
+            "missingEvidence": [], "blocker": None,
+        }, [prior])
+        clean = {"auditCycle": 3, "bugs": [prior]}
+        self.assertIsNotNone(audit_loop.clean_audit_result(paths, clean, candidate))
+        with self.assertRaisesRegex(common.BraceError, "pre-audit bug state"):
+            audit_loop.clean_audit_result(paths, clean | {"bugs": [tampered]}, candidate)
 
     def test_merged_recovery_rejects_changed_bug_identity_before_final_evidence(self) -> None:
         root, _, config = self.make_repository()

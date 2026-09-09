@@ -132,6 +132,13 @@ def write_closure_result(paths: Any, cycle: int, kind: str, candidate_sha: str, 
     return record
 
 
+def assert_audit_prior_state(record: dict[str, Any], bugs: list[dict[str, Any]]) -> None:
+    evidence = [check for check in record["result"]["checks"] if check.startswith(PRIOR_BUG_STATE_PREFIX)]
+    if evidence == [PRIOR_BUG_STATE_PREFIX + object_hash(bugs)] or (not bugs and not evidence):
+        return
+    raise BraceError("Audit closure record does not match the complete pre-audit bug state.")
+
+
 def next_closure_cycle(paths: Any, previous_cycle: int, candidate_sha: str) -> int:
     cycle = previous_cycle + 1
     while closure_path(paths, cycle, "audit").is_file():
@@ -146,6 +153,7 @@ def clean_audit_result(paths: Any, bugs: dict[str, Any], candidate_sha: str) -> 
     record = read_closure_result(paths, bugs["auditCycle"], "audit", candidate_sha)
     if record is None:
         return None
+    assert_audit_prior_state(record, bugs["bugs"])
     result = record["result"]
     return result if result["status"] == "completed" and not result["bugs"] and not result["missingEvidence"] else None
 
@@ -188,8 +196,9 @@ def recover_bug_definition_state(state: dict[str, Any], bugs: dict[str, Any], pa
     prior_hash = definition_hash(prefix, "bug")
     if state.get("bugDefinitionHash") not in ({prior_hash} if prefix else {None, prior_hash}):
         return False
-    prior_state_checks = [check for check in record["result"]["checks"] if check.startswith(PRIOR_BUG_STATE_PREFIX)]
-    if prior_state_checks != [PRIOR_BUG_STATE_PREFIX + object_hash(prefix)] and (prefix or prior_state_checks):
+    try:
+        assert_audit_prior_state(record, prefix)
+    except BraceError:
         return False
     replayed = append_findings(copy.deepcopy(prefix), findings)
     if replayed != bugs["bugs"] or definition_hash(replayed, "bug") != actual:
@@ -371,6 +380,7 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                     with status(f"Running closure audit cycle {cycle}"):
                         audit_result = invoke_frozen_role(root, audit_worktree, state["integrationSha"], "auditor", f"Run a fresh comprehensive closure audit of exact integration commit {state['integrationSha']} against the complete approved requirements and plan. This is closure cycle {cycle}. Return only newly supported findings for this candidate; the existing immutable bug history contains {len(bugs['bugs'])} entries. Independently reconcile these findings from the preceding final reviewers after both completed: {pretty_json(review_findings)}. Do not edit the worktree.", "audit-result.schema.json")
                     audit_record = write_closure_result(paths, cycle, "audit", state["integrationSha"], audit_result, bugs["bugs"])
+                assert_audit_prior_state(audit_record, bugs["bugs"])
                 audit_result = audit_record["result"]
                 if audit_result["status"] == "completed" and audit_result["missingEvidence"]:
                     raise BraceError("Closure audit is incomplete: " + "; ".join(audit_result["missingEvidence"]))
