@@ -1157,7 +1157,7 @@ def _pull_request_record(value: dict[str, Any], provider: str, repository: str) 
     return {"id": str(value["pullRequestId"]), "url": str(value["url"]), "state": str(value["status"]).lower(), "repository": repository, "head": source, "headSha": str(value["lastMergeSourceCommit"]["commitId"]), "base": target, "baseSha": str(value["lastMergeTargetCommit"]["commitId"]), "mergeSha": str(merge["commitId"]) if merge else None}
 
 
-def get_pull_request(root: str | Path, config: dict[str, Any], head: str, base: str, expected_head_sha: str | None = None, pull_request_id: str | None = None) -> dict[str, Any] | None:
+def get_pull_request(root: str | Path, config: dict[str, Any], head: str, base: str, expected_head_sha: str | None = None, pull_request_id: str | None = None, expected_base_sha: str | None = None) -> dict[str, Any] | None:
     repository = get_repository_identity(root, config)
     if config["provider"] == "github":
         output = run_native("gh", ["pr", "list", "--repo", repository, "--state", "all", "--head", head, "--base", base, "--limit", "50", "--json", "number,url,state,headRefName,headRefOid,baseRefName,baseRefOid,mergeCommit"], root).output
@@ -1172,13 +1172,18 @@ def get_pull_request(root: str | Path, config: dict[str, Any], head: str, base: 
         if not exact and any(record["state"] in {"open", "active"} for record in records):
             raise BraceError(f"An open pull request for {head} has a different head SHA.")
         records = exact
+    if expected_base_sha:
+        exact = [record for record in records if record["baseSha"] == expected_base_sha]
+        if not exact and any(record["state"] in {"open", "active"} for record in records):
+            raise BraceError(f"An open pull request for {head} has a different base SHA.")
+        records = exact
     if len(records) > 1:
         raise BraceError(f"Multiple pull requests match exact assignment {head} -> {base}.")
     return records[0] if records else None
 
 
 def new_pull_request(root: str | Path, config: dict[str, Any], head: str, base: str, expected_head_sha: str, expected_base_sha: str, title: str, body: str) -> dict[str, Any]:
-    existing = get_pull_request(root, config, head, base, expected_head_sha)
+    existing = get_pull_request(root, config, head, base, expected_head_sha, expected_base_sha=expected_base_sha)
     if existing:
         return existing
     run_native("git", ["-C", root, "fetch", config["remote"], "--prune"])
@@ -1192,21 +1197,76 @@ def new_pull_request(root: str | Path, config: dict[str, Any], head: str, base: 
     else:
         azure = config["azureDevOps"]
         run_native("az", ["repos", "pr", "create", "--organization", azure["organization"], "--project", azure["project"], "--repository", azure["repository"], "--source-branch", head, "--target-branch", base, "--title", title, "--description", body, "--output", "none"], root)
-    created = get_pull_request(root, config, head, base, expected_head_sha)
+    created = get_pull_request(root, config, head, base, expected_head_sha, expected_base_sha=expected_base_sha)
     if not created:
         raise BraceError("Provider did not return the newly created exact pull request.")
     created["baseSha"] = expected_base_sha
     return created
 
 
-def complete_pull_request(root: str | Path, config: dict[str, Any], pull_request: dict[str, Any]) -> dict[str, Any]:
+def _assert_pull_request_identity(current: dict[str, Any] | None, expected: dict[str, Any], expected_head_sha: str, expected_base_sha: str) -> dict[str, Any]:
+    if current is None:
+        raise BraceError(f"Provider did not return pull request {expected['id']}.")
+    identities = {
+        "repository": expected["repository"], "id": str(expected["id"]),
+        "head": expected["head"], "headSha": expected_head_sha,
+        "base": expected["base"], "baseSha": expected_base_sha,
+    }
+    mismatched = [field for field, value in identities.items() if str(current.get(field)) != str(value)]
+    if mismatched:
+        raise BraceError("Pull request identity changed before merge: " + ", ".join(mismatched))
+    return current
+
+
+def _wait_for_required_checks(root: str | Path, config: dict[str, Any], pull_request: dict[str, Any]) -> None:
+    if config["provider"] == "github":
+        result = run_native(
+            "gh",
+            ["pr", "checks", pull_request["id"], "--repo", pull_request["repository"], "--required", "--watch", "--fail-fast"],
+            root,
+            allowed_exit_codes=(0, 1, 8),
+        )
+        no_checks = result.returncode == 1 and result.output.lstrip().lower().startswith("no checks reported")
+        if result.returncode != 0 and not no_checks:
+            raise BraceError(f"Required GitHub checks did not pass for pull request {pull_request['id']}.\n{result.output}")
+        return
+    azure = config["azureDevOps"]
+    output = run_native(
+        "az",
+        ["repos", "pr", "policy", "list", "--organization", azure["organization"], "--id", pull_request["id"], "--output", "json"],
+        root,
+    ).output
+    try:
+        policies = json.loads(output or "[]")
+    except json.JSONDecodeError as exc:
+        raise BraceError("Azure DevOps returned malformed pull-request policy data.") from exc
+    if not isinstance(policies, list) or any(
+        not isinstance(policy, dict) or not isinstance(policy.get("isBlocking"), bool) or not isinstance(policy.get("status"), str)
+        for policy in policies
+    ):
+        raise BraceError("Azure DevOps returned malformed pull-request policy data.")
+    incomplete = [str(policy.get("displayName") or policy.get("evaluationId") or "unnamed") for policy in policies if policy["isBlocking"] and policy["status"].lower() != "approved"]
+    if incomplete:
+        raise BraceError("Blocking Azure DevOps policies did not pass: " + ", ".join(incomplete))
+
+
+def complete_pull_request(root: str | Path, config: dict[str, Any], pull_request: dict[str, Any], expected_head_sha: str, expected_base_sha: str) -> dict[str, Any]:
     if pull_request["repository"] != get_repository_identity(root, config):
         raise BraceError("Pull request repository identity does not match this workflow.")
     if pull_request["state"] not in {"merged", "completed"}:
         if pull_request["state"] not in {"open", "active"}:
             raise BraceError(f"Pull request {pull_request['id']} cannot be merged from state {pull_request['state']}.")
+        current = get_pull_request(root, config, pull_request["head"], pull_request["base"], expected_head_sha, pull_request["id"], expected_base_sha)
+        current = _assert_pull_request_identity(current, pull_request, expected_head_sha, expected_base_sha)
+        if current["state"] not in {"open", "active"}:
+            raise BraceError(f"Pull request {pull_request['id']} cannot be merged from state {current['state']}.")
+        _wait_for_required_checks(root, config, current)
+        current = get_pull_request(root, config, pull_request["head"], pull_request["base"], expected_head_sha, pull_request["id"], expected_base_sha)
+        current = _assert_pull_request_identity(current, pull_request, expected_head_sha, expected_base_sha)
+        if current["state"] not in {"open", "active"}:
+            raise BraceError(f"Pull request {pull_request['id']} cannot be merged from state {current['state']}.")
         if config["provider"] == "github":
-            args = ["pr", "merge", pull_request["id"], "--repo", pull_request["repository"], "--squash"]
+            args = ["pr", "merge", pull_request["id"], "--repo", pull_request["repository"], "--squash", "--match-head-commit", expected_head_sha]
             if config.get("deleteMergedBranches"):
                 args.append("--delete-branch")
             run_native("gh", args, root)
@@ -1216,14 +1276,19 @@ def complete_pull_request(root: str | Path, config: dict[str, Any], pull_request
             if config.get("deleteMergedBranches"):
                 args += ["--delete-source-branch", "true"]
             run_native("az", args, root)
-    merged = get_pull_request(root, config, pull_request["head"], pull_request["base"], pull_request["headSha"], pull_request["id"])
+    merged = get_pull_request(root, config, pull_request["head"], pull_request["base"], expected_head_sha, pull_request["id"])
     if not merged or merged["state"] not in {"merged", "completed"} or not merged.get("mergeSha"):
         raise BraceError("Provider did not return a verifiable merged pull request.")
+    if any(str(merged.get(field)) != str(value) for field, value in {"repository": pull_request["repository"], "id": pull_request["id"], "head": pull_request["head"], "headSha": expected_head_sha, "base": pull_request["base"]}.items()):
+        raise BraceError("Merged pull request identity does not match the reviewed candidate.")
     run_native("git", ["-C", root, "fetch", config["remote"], "--prune"])
     base_sha = run_native("git", ["-C", root, "rev-parse", f"{config['remote']}/{pull_request['base']}"]).output.strip()
+    merge_parent = run_native("git", ["-C", root, "rev-parse", f"{merged['mergeSha']}^1"]).output.strip()
+    if merge_parent != expected_base_sha:
+        raise BraceError("Provider merge result does not have the reviewed base as its first parent.")
     if run_native("git", ["-C", root, "merge-base", "--is-ancestor", merged["mergeSha"], base_sha], allowed_exit_codes=(0, 1)).returncode != 0:
         raise BraceError("Remote base does not contain the provider merge result.")
-    merged["baseSha"] = pull_request["baseSha"]
+    merged["baseSha"] = expected_base_sha
     return merged
 
 
@@ -1233,8 +1298,10 @@ def publish_assignment(root: str | Path, worktree: str | Path, config: dict[str,
     run_native("git", ["-C", worktree, "push", "--set-upstream", config["remote"], branch])
     run_native("git", ["-C", root, "fetch", config["remote"], "--prune"])
     base_sha = run_native("git", ["-C", root, "rev-parse", f"{config['remote']}/{config['integrationBranch']}"]).output.strip()
-    pull_request = new_pull_request(root, config, branch, config["integrationBranch"], item["resultSha"], base_sha, f"{identity} {item['title']}", f"Brace {kind} {identity}")
-    return complete_pull_request(root, config, pull_request)
+    if base_sha != item["baseSha"]:
+        raise BraceError(f"Integration base changed after review of {identity}.")
+    pull_request = new_pull_request(root, config, branch, config["integrationBranch"], item["resultSha"], item["baseSha"], f"{identity} {item['title']}", f"Brace {kind} {identity}")
+    return complete_pull_request(root, config, pull_request, item["resultSha"], item["baseSha"])
 
 
 def remove_merged_assignment(root: str | Path, config: dict[str, Any], identity: str, branch: str, pull_request: dict[str, Any]) -> None:

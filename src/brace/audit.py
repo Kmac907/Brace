@@ -175,7 +175,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 final_pr = get_pull_request(root, config, config["integrationBranch"], config["targetBranch"], state["integrationSha"])
                 if not final_pr or final_pr["state"] not in {"merged", "completed"}:
                     raise BraceError("Target branch advanced without the exact workflow project pull request.")
-                final_pr = complete_pull_request(root, config, final_pr)
+                final_pr = complete_pull_request(root, config, final_pr, state["integrationSha"], state["targetBaseSha"])
                 complete_project_cleanup(root, config, tasks, bugs, final_pr["mergeSha"])
                 state.update(stage="complete", stageStatus="complete", finalMergeSha=final_pr["mergeSha"], blocker=None)
                 save_state(state, paths)
@@ -240,7 +240,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 require_approved_reviews(paths, bug, "bug")
                 existing = get_pull_request(root, config, bug["branch"], config["integrationBranch"], bug["resultSha"])
                 if existing:
-                    merged = complete_pull_request(root, config, existing)
+                    merged = complete_pull_request(root, config, existing, bug["resultSha"], bug["baseSha"])
                     bug.update(pullRequest=merged, status="verified", lastError=None)
                     state["integrationSha"] = merged["mergeSha"]
                     save_ledger(bugs, paths)
@@ -392,7 +392,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
             if head_sha != state["integrationSha"]:
                 raise BraceError("Integration changed during final validation.")
             project_pr = new_pull_request(root, config, config["integrationBranch"], config["targetBranch"], head_sha, state["targetBaseSha"], "Complete project implementation", f"Completed Brace project and verified {len(bugs['bugs'])} audit findings at {head_sha}.")
-            project_pr = complete_pull_request(root, config, project_pr)
+            project_pr = complete_pull_request(root, config, project_pr, head_sha, state["targetBaseSha"])
             final_sha = project_pr["mergeSha"]
             complete_project_cleanup(root, config, tasks, bugs, final_sha)
             state.update(stage="complete", stageStatus="complete", finalMergeSha=final_sha, blocker=None)
