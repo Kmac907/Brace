@@ -663,11 +663,11 @@ class CoreTests(RepositoryTestCase):
         self.assertIsNone(common.read_review_result(paths, "TASK-0001", 2, 1, base, "c" * 40))
         self.assertEqual(len(list(paths.results.glob("TASK-0001-attempt-002-review-*.json"))), 2)
 
-        malformed = common.read_json(common.review_path(paths, "TASK-0001", 2, 1))
-        malformed["completedAt"] = "not-a-date-time"
-        common.write_text_atomic(common.review_path(paths, "TASK-0001", 2, 1), common.pretty_json(malformed))
-        with self.assertRaisesRegex(common.BraceError, "date-time"):
-            common.read_review_result(paths, "TASK-0001", 2, 1, base, candidate)
+        for completed_at, error in (("not-a-date-time", "date-time"), (123, "string")):
+            malformed = dict(first, completedAt=completed_at)
+            common.write_text_atomic(common.review_path(paths, "TASK-0001", 2, 1), common.pretty_json(malformed))
+            with self.subTest(completed_at=completed_at), self.assertRaisesRegex(common.BraceError, error):
+                common.read_review_result(paths, "TASK-0001", 2, 1, base, candidate)
 
     def test_review_worktree_recovery_mutation_and_cleanup(self) -> None:
         root, _, config = self.make_repository()

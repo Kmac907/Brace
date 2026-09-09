@@ -235,7 +235,9 @@ def validate_json(value: Any, schema_path: str | Path) -> None:
     format_checker = jsonschema.FormatChecker()
 
     @format_checker.checks("date-time", raises=ValueError)
-    def valid_datetime(candidate: str) -> bool:
+    def valid_datetime(candidate: Any) -> bool:
+        if not isinstance(candidate, str):
+            return True
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})", candidate):
             return False
         normalized = candidate[:-1] + "+00:00" if candidate[-1].lower() == "z" else candidate
