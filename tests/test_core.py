@@ -663,7 +663,7 @@ class CoreTests(RepositoryTestCase):
         self.assertIsNone(common.read_review_result(paths, "TASK-0001", 2, 1, base, "c" * 40))
         self.assertEqual(len(list(paths.results.glob("TASK-0001-attempt-002-review-*.json"))), 2)
 
-        for completed_at, error in (("not-a-date-time", "date-time"), (123, "string")):
+        for completed_at, error in (("not-a-date-time", "date-time"), ("2026-09-09T00:00:00+01:60", "date-time"), (123, "string")):
             malformed = dict(first, completedAt=completed_at)
             common.write_text_atomic(common.review_path(paths, "TASK-0001", 2, 1), common.pretty_json(malformed))
             with self.subTest(completed_at=completed_at), self.assertRaisesRegex(common.BraceError, error):
@@ -697,6 +697,10 @@ class CoreTests(RepositoryTestCase):
         with self.assertRaisesRegex(common.BraceError, "contains changes"):
             common.assert_review_worktree(worktree, candidate)
         (worktree / ".ignored" / "mutation.txt").unlink()
+        (worktree / ".ignored").rmdir()
+        (worktree / ".ignored").mkdir()
+        with self.assertRaisesRegex(common.BraceError, "contains changes"):
+            common.assert_review_worktree(worktree, candidate)
         (worktree / ".ignored").rmdir()
         common.write_review_result(paths, "BUG-0001", 1, 1, base, candidate, approved)
         common.remove_review_worktree(root, config, paths, "BUG-0001", 1, 1, base, candidate)

@@ -238,7 +238,7 @@ def validate_json(value: Any, schema_path: str | Path) -> None:
     def valid_datetime(candidate: Any) -> bool:
         if not isinstance(candidate, str):
             return True
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})", candidate):
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)", candidate):
             return False
         normalized = candidate[:-1] + "+00:00" if candidate[-1].lower() == "z" else candidate
         return datetime.fromisoformat(normalized).tzinfo is not None
@@ -871,7 +871,15 @@ def assert_review_worktree(worktree: str | Path, candidate_sha: str) -> None:
         raise BraceError(f"Reviewer worktree is not detached: {path}")
     if run_native("git", ["-C", path, "rev-parse", "HEAD"]).output.strip() != candidate_sha:
         raise BraceError(f"Reviewer worktree HEAD changed: {path}")
-    if run_native("git", ["-C", path, "status", "--porcelain", "--untracked-files=all", "--ignored"]).output.strip():
+    dirty = run_native("git", ["-C", path, "status", "--porcelain", "--untracked-files=all", "--ignored"]).output.strip()
+    tracked_directories: set[str] = set()
+    for tracked in run_native("git", ["-C", path, "ls-files", "-z"]).output.split("\0"):
+        if not tracked:
+            continue
+        parts = tracked.split("/")
+        tracked_directories.update("/".join(parts[:depth]) for depth in range(1, len(parts) + 1))
+    unexpected_directory = next((entry for entry in path.rglob("*") if entry.is_dir() and entry.relative_to(path).as_posix() not in tracked_directories), None)
+    if dirty or unexpected_directory:
         raise BraceError(f"Reviewer worktree contains changes: {path}")
 
 
