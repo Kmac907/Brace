@@ -468,17 +468,27 @@ def update_state_schema(root: str | Path, paths: Paths) -> None:
 def initialize_state_files(root: str | Path, config: dict[str, Any]) -> Paths:
     paths = Paths(root)
     support = Path(str(files("brace").joinpath("resources", "template", ".codex")))
-    for source, destination in (
-        (support / "prompts" / "reviewer.md", paths.prompts / "reviewer.md"),
-        (support / "schemas" / "reviewer-result.schema.json", paths.schemas / "reviewer-result.schema.json"),
-    ):
-        if not destination.is_file():
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
+    reviewer_prompt = paths.prompts / "reviewer.md"
+    try:
+        valid_prompt = bool(read_text(reviewer_prompt).strip())
+    except (BraceError, OSError, UnicodeError):
+        valid_prompt = False
+    if not valid_prompt:
+        write_text_atomic(reviewer_prompt, read_text(support / "prompts" / "reviewer.md"))
+    reviewer_schema = paths.schemas / "reviewer-result.schema.json"
+    try:
+        _project_output_schema(reviewer_schema)
+    except (BraceError, OSError, UnicodeError):
+        write_text_atomic(reviewer_schema, read_text(support / "schemas" / "reviewer-result.schema.json"))
     review_schema = paths.schemas / "review-record.schema.json"
-    if not review_schema.is_file() or read_json(review_schema)["properties"]["result"]["$ref"] == "verifier-result.schema.json":
-        review_schema.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(support / "schemas" / "review-record.schema.json", review_schema)
+    try:
+        current_review_schema = read_json(review_schema)
+        _project_output_schema(review_schema)
+        current = current_review_schema["properties"]["result"]["$ref"] == "reviewer-result.schema.json"
+    except (BraceError, KeyError, OSError, TypeError, UnicodeError):
+        current = False
+    if not current:
+        write_text_atomic(review_schema, read_text(support / "schemas" / "review-record.schema.json"))
     for directory in (paths.logs, paths.assignments, paths.results):
         directory.mkdir(parents=True, exist_ok=True)
     if not paths.state.is_file():
@@ -976,6 +986,14 @@ def require_approved_reviews(paths: Paths, item: dict[str, Any], kind: str) -> l
     for record in records:
         _assert_review_checks(record["result"], required, identity, record["reviewer"])
     return records
+
+
+def has_matching_review_results(paths: Paths, item: dict[str, Any], kind: str) -> bool:
+    identity = item["taskId" if kind == "task" else "bugId"]
+    return all(
+        read_review_result(paths, identity, int(item["attemptCount"]), reviewer, item["baseSha"], item["resultSha"]) is not None
+        for reviewer in (1, 2)
+    )
 
 
 def review_failure(records: Iterable[dict[str, Any]]) -> str:

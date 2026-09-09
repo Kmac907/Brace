@@ -23,6 +23,7 @@ from .common import (
     ensure_integration_branch,
     get_configuration,
     get_pull_request,
+    has_matching_review_results,
     initialize_state_files,
     invoke_role,
     new_audit_worktree,
@@ -233,6 +234,9 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 else:
                     bug.update(status="open", lastError="Interrupted before a durable result or commit was produced." if record is None else record["error"])
             for bug in (item for item in bugs["bugs"] if item["status"] == "ready_to_publish" and item.get("resultSha")):
+                if not has_matching_review_results(paths, bug, "bug"):
+                    bug.update(status="result_ready", lastError=None)
+                    continue
                 require_approved_reviews(paths, bug, "bug")
                 existing = get_pull_request(root, config, bug["branch"], config["integrationBranch"], bug["resultSha"])
                 if existing:

@@ -767,6 +767,26 @@ class CoreTests(RepositoryTestCase):
         self.assertTrue((paths.schemas / "reviewer-result.schema.json").is_file())
         self.assertEqual(common.read_json(paths.schemas / "review-record.schema.json")["properties"]["result"]["$ref"], "reviewer-result.schema.json")
 
+        (paths.prompts / "reviewer.md").write_text("custom reviewer prompt\n", encoding="utf-8")
+        custom_schema = common.read_json(paths.schemas / "reviewer-result.schema.json") | {"description": "custom reviewer schema"}
+        common.write_text_atomic(paths.schemas / "reviewer-result.schema.json", common.pretty_json(custom_schema))
+        custom_record_schema = common.read_json(paths.schemas / "review-record.schema.json") | {"description": "custom review record schema"}
+        common.write_text_atomic(paths.schemas / "review-record.schema.json", common.pretty_json(custom_record_schema))
+        common.initialize_state_files(root, config)
+        self.assertEqual((paths.prompts / "reviewer.md").read_text(encoding="utf-8"), "custom reviewer prompt\n")
+        self.assertEqual(common.read_json(paths.schemas / "reviewer-result.schema.json")["description"], "custom reviewer schema")
+        self.assertEqual(common.read_json(paths.schemas / "review-record.schema.json")["description"], "custom review record schema")
+
+        (paths.prompts / "reviewer.md").write_bytes(b"\xff")
+        common.write_text_atomic(paths.schemas / "reviewer-result.schema.json", "{")
+        common.write_text_atomic(paths.schemas / "review-record.schema.json", common.pretty_json({
+            "properties": {"result": {"$ref": "reviewer-result.schema.json"}}
+        }))
+        common.initialize_state_files(root, config)
+        self.assertTrue(common.read_text(paths.prompts / "reviewer.md").strip())
+        common._project_output_schema(paths.schemas / "reviewer-result.schema.json")
+        self.assertEqual(common.read_json(paths.schemas / "review-record.schema.json")["properties"]["result"]["$ref"], "reviewer-result.schema.json")
+
     def test_review_worktree_recovery_mutation_and_cleanup(self) -> None:
         root, _, config = self.make_repository()
         paths = common.initialize_state_files(root, config)

@@ -302,6 +302,9 @@ class WorkflowTests(RepositoryTestCase):
             with self.assertRaisesRegex(RuntimeError, "second reviewer interrupted"):
                 build_loop.run(root)
             self.assertEqual(active, [])
+            legacy_tasks = common.read_json(common.Paths(root).tasks, common.Paths(root).schemas / "tasks.schema.json")
+            legacy_tasks["tasks"][0]["status"] = "verified_ready"
+            build_loop.save_ledger(legacy_tasks, common.Paths(root))
             self.assertEqual(build_loop.run(root), "audit")
 
         self.assertEqual(active, [])
@@ -411,7 +414,9 @@ class WorkflowTests(RepositoryTestCase):
         def fake_bug_reviews(repository, state_paths, item, kind):
             nonlocal bug_verifications
             bug_verifications += 1
-            results = (approved, rejected) if bug_verifications == 1 else (approved, approved)
+            if bug_verifications == 1:
+                raise RuntimeError("legacy bug review interrupted")
+            results = (approved, rejected) if bug_verifications == 2 else (approved, approved)
             return self.persist_reviews(state_paths, item, kind, results)
 
         def fake_new_pr(repository, configuration, head, base, expected_head, expected_base, title, body):
@@ -433,12 +438,17 @@ class WorkflowTests(RepositoryTestCase):
             patch.object(audit_loop, "new_pull_request", side_effect=fake_new_pr),
             patch.object(audit_loop, "complete_pull_request", side_effect=fake_complete),
         ):
+            with self.assertRaisesRegex(RuntimeError, "legacy bug review interrupted"):
+                audit_loop.run(root)
+            legacy_bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+            legacy_bugs["bugs"][0].update(status="ready_to_publish", disposition="fixed")
+            audit_loop.save_ledger(legacy_bugs, paths)
             self.assertEqual(audit_loop.run(root), "complete")
 
         bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
         bug = bugs["bugs"][0]
         self.assertEqual(bug["attemptCount"], 2)
-        self.assertEqual(bug_verifications, 2)
+        self.assertEqual(bug_verifications, 3)
         self.assertEqual(len(list(paths.results.glob("BUG-0001-attempt-*-review-*.json"))), 4)
         self.assertEqual(bug_publish.call_count, 1)
         self.assertEqual(self.git(root, "merge-base", rejected_shas["bug"], bug["resultSha"]), bug["baseSha"])

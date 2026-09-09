@@ -19,6 +19,7 @@ from .common import (
     ensure_integration_branch,
     get_configuration,
     get_pull_request,
+    has_matching_review_results,
     initialize_state_files,
     invoke_role,
     new_audit_worktree,
@@ -139,6 +140,9 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     task.update(status="pending", lastError="Interrupted before a durable result or commit was produced." if record is None else record["error"])
 
             for task in (item for item in tasks["tasks"] if item["status"] in {"verified_ready", "submitted"} and item.get("resultSha")):
+                if not has_matching_review_results(paths, task, "task"):
+                    task.update(status="result_ready", lastError=None)
+                    continue
                 require_approved_reviews(paths, task, "task")
                 existing = get_pull_request(root, config, task["branch"], config["integrationBranch"], task["resultSha"])
                 if existing:
