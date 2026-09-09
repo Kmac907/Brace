@@ -51,7 +51,7 @@ final validation ─► project PR ─► main ─► cleanup
 | --- | --- | --- | --- |
 | Planning | Planner | `plan.md`, `tasks.json`, planning summary | Every active requirement has a valid task |
 | Build | Builders, two independent adversarial reviewers, and integration verifier | Task commits, exact-SHA review records, PR identities, build summary | Every active task has two exact-SHA approvals and is integrated |
-| Audit | Auditor, bug fixers, two independent adversarial reviewers, and final verifier | `bugs.json`, fix commits, exact-SHA review records, audit summary | Every fix has two exact-SHA approvals, every finding is resolved, and final validation passes |
+| Audit | Auditor, bug fixers, two independent adversarial reviewers, and final verifier | `bugs.json`, fix commits, exact-SHA closure/review records, audit summary | Every fix is followed by a clean closure cycle; two final exact-SHA reviews and validation pass |
 
 Agents never communicate directly. Brace gives each agent one immutable assignment and carries its schema-validated result to the next role.
 
@@ -133,7 +133,7 @@ The build loop reconciles persisted work, selects dependency-ready non-conflicti
 brace audit
 ```
 
-The audit loop reviews the exact integration commit once, freezes its findings in `.codex/bugs.json`, and runs up to `maximumConcurrentFixers` independent fixes. After all findings are verified, Brace validates the final integration branch, merges the project pull request, and removes owned worktrees and branches.
+The audit loop repeatedly reviews the exact integration commit, appends immutable findings to `.codex/bugs.json`, and runs up to `maximumConcurrentFixers` independent fixes. Every integrated correction forces a fresh closure cycle. Once a cycle is clean, Brace freezes that SHA, runs final validation and two independent reviews of the full original-baseline diff, merges the project pull request, and removes owned worktrees and branches.
 
 ## Git model
 

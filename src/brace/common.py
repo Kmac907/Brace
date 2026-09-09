@@ -24,6 +24,7 @@ MAXIMUM_RESULT_BYTES = 1024 * 1024
 MAXIMUM_LOG_BYTES = 2 * 1024 * 1024
 REVIEW_SUPPORT_PATHS = {
     ".codex/prompts/reviewer.md",
+    ".codex/schemas/closure-record.schema.json",
     ".codex/schemas/review-record.schema.json",
     ".codex/schemas/reviewer-result.schema.json",
 }
@@ -462,11 +463,12 @@ def update_state_schema(root: str | Path, paths: Paths) -> None:
             write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
     if paths.bugs.is_file():
         bugs = read_json(paths.bugs)
-        if bugs.get("schemaVersion") in {"1.0", "1.1"}:
+        if bugs.get("schemaVersion") in {"1.0", "1.1", "1.2"}:
             for bug in bugs["bugs"]:
                 _add_missing(bug, "amendmentId", None)
                 _add_missing(bug, "dispositionEvidence", None)
-            bugs["schemaVersion"] = "1.2"
+            _add_missing(bugs, "auditCycle", 1 if bugs.get("auditSha") else 0)
+            bugs["schemaVersion"] = "1.3"
             write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
 
 
@@ -497,6 +499,22 @@ def initialize_state_files(root: str | Path, config: dict[str, Any]) -> Paths:
         current = False
     if not current:
         write_text_atomic(review_schema, read_text(support / "schemas" / "review-record.schema.json"))
+    closure_schema = paths.schemas / "closure-record.schema.json"
+    try:
+        current_closure_schema = read_json(closure_schema)
+        _project_output_schema(closure_schema)
+        current = (
+            set(current_closure_schema["required"])
+            == {"schemaVersion", "kind", "cycle", "candidateSha", "completedAt", "result"}
+            and current_closure_schema["properties"]["schemaVersion"]["const"] == "1.0"
+            and set(current_closure_schema["properties"]["kind"]["enum"]) == {"audit", "validation"}
+            and {schema.get("$ref") for schema in current_closure_schema["properties"]["result"]["oneOf"]}
+            == {"audit-result.schema.json", "verifier-result.schema.json"}
+        )
+    except (BraceError, KeyError, OSError, TypeError, UnicodeError):
+        current = False
+    if not current:
+        write_text_atomic(closure_schema, read_text(support / "schemas" / "closure-record.schema.json"))
     for directory in (paths.logs, paths.assignments, paths.results):
         directory.mkdir(parents=True, exist_ok=True)
     if not paths.state.is_file():
@@ -504,7 +522,7 @@ def initialize_state_files(root: str | Path, config: dict[str, Any]) -> Paths:
     if not paths.tasks.is_file():
         write_json_atomic(paths.tasks, {"schemaVersion": "1.1", "revision": 0, "planHash": None, "definitionHash": None, "status": "not_planned", "tasks": []}, paths.schemas / "tasks.schema.json")
     if not paths.bugs.is_file():
-        write_json_atomic(paths.bugs, {"schemaVersion": "1.2", "revision": 0, "auditSha": None, "definitionHash": None, "status": "not_audited", "bugs": []}, paths.schemas / "bugs.schema.json")
+        write_json_atomic(paths.bugs, {"schemaVersion": "1.3", "revision": 0, "auditCycle": 0, "auditSha": None, "definitionHash": None, "status": "not_audited", "bugs": []}, paths.schemas / "bugs.schema.json")
     update_state_schema(root, paths)
     return paths
 

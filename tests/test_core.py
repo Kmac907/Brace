@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from brace import audit as audit_loop
 from brace import common, project_manager
 from support import RepositoryTestCase
 
@@ -632,6 +633,13 @@ class CoreTests(RepositoryTestCase):
             "affectedTaskIds": ["TASK-0001"], "affectedBugIds": [], "resumeStage": "build", "attemptCount": 1,
         })
         common.write_json_atomic(paths.state.with_name("referenced.json"), state, paths.schemas / "state.schema.json")
+        legacy_bugs = common.read_json(paths.bugs)
+        legacy_bugs["schemaVersion"] = "1.2"
+        legacy_bugs.pop("auditCycle")
+        common.write_text_atomic(paths.bugs, common.pretty_json(legacy_bugs))
+        common.update_state_schema(root, paths)
+        migrated_bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        self.assertEqual((migrated_bugs["schemaVersion"], migrated_bugs["auditCycle"]), ("1.3", 0))
 
     def test_verifier_rejection_allows_findings_without_blocker(self) -> None:
         root, _, config = self.make_repository()
@@ -683,6 +691,72 @@ class CoreTests(RepositoryTestCase):
             common.write_text_atomic(common.review_path(paths, "TASK-0001", 2, 1), common.pretty_json(malformed))
             with self.subTest(completed_at=completed_at), self.assertRaisesRegex(common.BraceError, error):
                 common.read_review_result(paths, "TASK-0001", 2, 1, base, candidate)
+
+    def test_closure_records_are_immutable_resumable_and_candidate_bound(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        candidate, changed = "b" * 40, "c" * 40
+        result = {
+            "status": "completed", "summary": "clean", "bugs": [], "checks": [],
+            "missingEvidence": [], "blocker": None,
+        }
+
+        record = audit_loop.write_closure_result(paths, 1, "audit", candidate, result)
+
+        self.assertEqual(audit_loop.read_closure_result(paths, 1, "audit", candidate), record)
+        self.assertIsNone(audit_loop.read_closure_result(paths, 1, "audit", changed))
+        self.assertEqual(audit_loop.next_closure_cycle(paths, 0, candidate), 1)
+        self.assertEqual(audit_loop.next_closure_cycle(paths, 0, changed), 2)
+        with self.assertRaisesRegex(common.BraceError, "Immutable attempt record"):
+            audit_loop.write_closure_result(paths, 1, "audit", candidate, result | {"summary": "different"})
+
+    def test_closure_findings_append_without_rewriting_history(self) -> None:
+        def finding(identity: str, dependencies: list[str] | None = None) -> dict:
+            return {
+                "bugId": identity, "title": "Defect", "severity": "medium", "category": "correctness",
+                "requirementIds": ["REQ-ONE"], "description": "A defect", "evidence": "Focused reproduction",
+                "actualBehavior": "wrong", "requiredBehavior": "right", "impact": "incorrect output",
+                "requiredCorrection": "Correct output", "acceptanceTest": "output is right",
+                "dependencies": dependencies or [], "allowedPaths": ["src/**"], "exclusiveResources": [],
+            }
+
+        prior = audit_loop.persisted_bug(finding("BUG-0001"))
+        prior.update(status="verified", disposition="fixed")
+        combined = audit_loop.append_findings([prior], [finding("BUG-0001")])
+
+        self.assertIs(combined[0], prior)
+        self.assertEqual((combined[0]["bugId"], combined[0]["status"]), ("BUG-0001", "verified"))
+        self.assertEqual((combined[1]["bugId"], combined[1]["status"]), ("BUG-0002", "open"))
+        with self.assertRaisesRegex(common.BraceError, "Duplicate provisional bug identity"):
+            audit_loop.append_findings([prior], [finding("BUG-0001"), finding("BUG-0001")])
+        with self.assertRaisesRegex(common.BraceError, "depends on unknown bug"):
+            audit_loop.append_findings([prior], [finding("BUG-0001", ["BUG-9999"])])
+
+    def test_final_merge_evidence_requires_clean_exact_sha_and_two_approvals(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        base, candidate = "a" * 40, "b" * 40
+        state = {"targetBaseSha": base, "integrationSha": candidate}
+        tasks = {"tasks": [self.task()]}
+        bugs = {"status": "complete", "auditCycle": 2, "auditSha": candidate, "bugs": []}
+        validation = {
+            "approved": True, "summary": "approved", "findings": [],
+            "checks": [{"command": "python -m unittest", "result": "passed", "evidence": "suite passed"}],
+            "blocker": None,
+        }
+        audit_loop.write_closure_result(paths, 2, "validation", candidate, validation)
+        item = audit_loop.final_review_item(state, tasks, bugs, validation)
+        for reviewer, approved in ((1, True), (2, False)):
+            result = self.reviewer_result(approved) | {
+                "checks": [{"command": "python -m unittest", "result": "passed", "evidence": "suite passed"}]
+            }
+            common.write_review_result(paths, "TASK-0000", 2, reviewer, base, candidate, result, item["checks"])
+
+        with self.assertRaisesRegex(common.BraceError, "rejected by adversarial review"):
+            audit_loop.require_final_evidence(paths, state, tasks, bugs)
+        self.assertEqual(audit_loop.previous_final_findings(paths, state, bugs), [self.reviewer_result(False)["findings"][0]])
+        with self.assertRaisesRegex(common.BraceError, "no clean closure audit"):
+            audit_loop.require_final_evidence(paths, state | {"integrationSha": "c" * 40}, tasks, bugs)
 
     def test_legacy_review_record_is_retained_before_fresh_review(self) -> None:
         root, _, config = self.make_repository()
@@ -804,6 +878,7 @@ class CoreTests(RepositoryTestCase):
         root, _, config = self.make_repository()
         paths = common.Paths(root)
         (paths.prompts / "reviewer.md").unlink(missing_ok=True)
+        (paths.schemas / "closure-record.schema.json").unlink()
         (paths.schemas / "reviewer-result.schema.json").unlink()
         review_schema = common.read_json(paths.schemas / "review-record.schema.json")
         review_schema["properties"]["result"] = {"$ref": "verifier-result.schema.json"}
@@ -812,6 +887,7 @@ class CoreTests(RepositoryTestCase):
         common.initialize_state_files(root, config)
 
         self.assertTrue((paths.prompts / "reviewer.md").is_file())
+        self.assertTrue((paths.schemas / "closure-record.schema.json").is_file())
         self.assertTrue((paths.schemas / "reviewer-result.schema.json").is_file())
         self.assertEqual(
             {schema["$ref"] for schema in common.read_json(paths.schemas / "review-record.schema.json")["properties"]["result"]["oneOf"]},
@@ -823,16 +899,20 @@ class CoreTests(RepositoryTestCase):
         common.write_text_atomic(paths.schemas / "reviewer-result.schema.json", common.pretty_json(custom_schema))
         custom_record_schema = common.read_json(paths.schemas / "review-record.schema.json") | {"description": "custom review record schema"}
         common.write_text_atomic(paths.schemas / "review-record.schema.json", common.pretty_json(custom_record_schema))
+        custom_closure_schema = common.read_json(paths.schemas / "closure-record.schema.json") | {"description": "custom closure record schema"}
+        common.write_text_atomic(paths.schemas / "closure-record.schema.json", common.pretty_json(custom_closure_schema))
         common.initialize_state_files(root, config)
         self.assertEqual((paths.prompts / "reviewer.md").read_text(encoding="utf-8"), "custom reviewer prompt\n")
         self.assertEqual(common.read_json(paths.schemas / "reviewer-result.schema.json")["description"], "custom reviewer schema")
         self.assertEqual(common.read_json(paths.schemas / "review-record.schema.json")["description"], "custom review record schema")
+        self.assertEqual(common.read_json(paths.schemas / "closure-record.schema.json")["description"], "custom closure record schema")
 
         (paths.prompts / "reviewer.md").write_bytes(b"\xff")
         common.write_text_atomic(paths.schemas / "reviewer-result.schema.json", "{")
         common.write_text_atomic(paths.schemas / "review-record.schema.json", common.pretty_json({
             "properties": {"result": {"$ref": "reviewer-result.schema.json"}}
         }))
+        common.write_text_atomic(paths.schemas / "closure-record.schema.json", common.pretty_json({"type": "object"}))
         common.initialize_state_files(root, config)
         self.assertTrue(common.read_text(paths.prompts / "reviewer.md").strip())
         common._project_output_schema(paths.schemas / "reviewer-result.schema.json")
@@ -840,6 +920,7 @@ class CoreTests(RepositoryTestCase):
             {schema["$ref"] for schema in common.read_json(paths.schemas / "review-record.schema.json")["properties"]["result"]["oneOf"]},
             {"reviewer-result.schema.json", "verifier-result.schema.json"},
         )
+        self.assertEqual(common.read_json(paths.schemas / "closure-record.schema.json")["properties"]["schemaVersion"]["const"], "1.0")
 
     def test_review_worktree_recovery_mutation_and_cleanup(self) -> None:
         root, _, config = self.make_repository()

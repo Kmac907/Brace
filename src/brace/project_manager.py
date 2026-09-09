@@ -444,7 +444,7 @@ def invoke_pm_resolution(
             if bugs_changed:
                 if not history.exists():
                     write_immutable_json(history, bugs)
-                bugs.update(schemaVersion="1.2", revision=bugs["revision"] + 1, auditSha=None, definitionHash=None, status="not_audited", bugs=[])
+                bugs.update(schemaVersion="1.3", revision=bugs["revision"] + 1, auditCycle=0, auditSha=None, definitionHash=None, status="not_audited", bugs=[])
                 write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
             state["bugDefinitionHash"] = None
         amendment.update(resumeStage=resume, status="applied")
