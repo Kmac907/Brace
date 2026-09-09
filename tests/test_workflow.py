@@ -31,6 +31,8 @@ class WorkflowTests(RepositoryTestCase):
     def persist_reviews(self, paths: common.Paths, item: dict, kind: str, results: tuple[dict, dict] | None = None) -> list[dict]:
         identity = item["taskId" if kind == "task" else "bugId"]
         chosen = results or (self.reviewer_result(), self.reviewer_result())
+        required = item["checks"] if kind == "task" else [item["acceptanceTest"]]
+        chosen = tuple(result | {"checks": [{"command": command, "result": "passed", "evidence": "focused check passed"} for command in required]} for result in chosen)
         return [
             common.read_review_result(paths, identity, item["attemptCount"], reviewer, item["baseSha"], item["resultSha"])
             or common.write_review_result(paths, identity, item["attemptCount"], reviewer, item["baseSha"], item["resultSha"], result)
@@ -272,7 +274,8 @@ class WorkflowTests(RepositoryTestCase):
             verification_calls += 1
             self.assertEqual(active, ["Reviewing TASK-0001 (attempt 2)"])
             if verification_calls == 1:
-                common.write_review_result(paths, item["taskId"], item["attemptCount"], 1, item["baseSha"], item["resultSha"], self.reviewer_result())
+                first = self.reviewer_result() | {"checks": [{"command": item["checks"][0], "result": "passed", "evidence": "focused check passed"}]}
+                common.write_review_result(paths, item["taskId"], item["attemptCount"], 1, item["baseSha"], item["resultSha"], first)
                 raise RuntimeError("second reviewer interrupted")
             return self.persist_reviews(paths, item, kind)
 

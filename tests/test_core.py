@@ -697,7 +697,8 @@ class CoreTests(RepositoryTestCase):
         barrier = threading.Barrier(2)
         contexts: list[str] = []
 
-        def fake_review(repository, state_paths, identity, attempt, reviewer, base_sha, candidate_sha, context):
+        def fake_review(repository, state_paths, identity, attempt, reviewer, base_sha, candidate_sha, context, required_checks):
+            self.assertEqual(required_checks, task["checks"])
             contexts.append(context)
             barrier.wait(timeout=2)
             return {
@@ -730,6 +731,41 @@ class CoreTests(RepositoryTestCase):
         incomplete = self.reviewer_result() | {"checks": [{"command": "docs check", "result": "skipped", "evidence": "tool unavailable"}]}
         with self.assertRaisesRegex(common.BraceError, "should not be valid"):
             common.validate_json(incomplete, paths.schemas / "reviewer-result.schema.json")
+
+    def test_approved_reviews_require_each_task_and_bug_check(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        base, candidate = "a" * 40, "b" * 40
+        for identity in ("TASK-0001", "BUG-0001"):
+            for reviewer in (1, 2):
+                common.write_review_result(paths, identity, 1, reviewer, base, candidate, self.reviewer_result())
+        task = self.task() | {"attemptCount": 1, "baseSha": base, "resultSha": candidate}
+        bug = {"bugId": "BUG-0001", "attemptCount": 1, "baseSha": base, "resultSha": candidate, "acceptanceTest": "python -m unittest bug"}
+        with self.assertRaisesRegex(common.BraceError, "missing passed evidence.*python -m unittest"):
+            common.require_approved_reviews(paths, task, "task")
+        with self.assertRaisesRegex(common.BraceError, "missing passed evidence.*python -m unittest bug"):
+            common.require_approved_reviews(paths, bug, "bug")
+
+        actual = self.git(root, "rev-parse", "HEAD")
+        with patch.object(common, "invoke_role", return_value=self.reviewer_result()):
+            with self.assertRaisesRegex(common.BraceError, "missing passed evidence.*required check"):
+                common.run_review(root, paths, "TASK-0002", 1, 1, actual, actual, "review", ["required check"])
+        self.assertFalse(common.review_path(paths, "TASK-0002", 1, 1).exists())
+
+    def test_state_initialization_restores_reviewer_support_for_existing_project(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.Paths(root)
+        (paths.prompts / "reviewer.md").unlink(missing_ok=True)
+        (paths.schemas / "reviewer-result.schema.json").unlink()
+        review_schema = common.read_json(paths.schemas / "review-record.schema.json")
+        review_schema["properties"]["result"]["$ref"] = "verifier-result.schema.json"
+        common.write_text_atomic(paths.schemas / "review-record.schema.json", common.pretty_json(review_schema))
+
+        common.initialize_state_files(root, config)
+
+        self.assertTrue((paths.prompts / "reviewer.md").is_file())
+        self.assertTrue((paths.schemas / "reviewer-result.schema.json").is_file())
+        self.assertEqual(common.read_json(paths.schemas / "review-record.schema.json")["properties"]["result"]["$ref"], "reviewer-result.schema.json")
 
     def test_review_worktree_recovery_mutation_and_cleanup(self) -> None:
         root, _, config = self.make_repository()

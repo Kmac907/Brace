@@ -15,6 +15,7 @@ import uuid
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -466,6 +467,18 @@ def update_state_schema(root: str | Path, paths: Paths) -> None:
 
 def initialize_state_files(root: str | Path, config: dict[str, Any]) -> Paths:
     paths = Paths(root)
+    support = Path(str(files("brace").joinpath("resources", "template", ".codex")))
+    for source, destination in (
+        (support / "prompts" / "reviewer.md", paths.prompts / "reviewer.md"),
+        (support / "schemas" / "reviewer-result.schema.json", paths.schemas / "reviewer-result.schema.json"),
+    ):
+        if not destination.is_file():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+    review_schema = paths.schemas / "review-record.schema.json"
+    if not review_schema.is_file() or read_json(review_schema)["properties"]["result"]["$ref"] == "verifier-result.schema.json":
+        review_schema.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(support / "schemas" / "review-record.schema.json", review_schema)
     for directory in (paths.logs, paths.assignments, paths.results):
         directory.mkdir(parents=True, exist_ok=True)
     if not paths.state.is_file():
@@ -899,14 +912,23 @@ def new_review_worktree(root: str | Path, config: dict[str, Any], identity: str,
     return path
 
 
-def run_review(root: str | Path, paths: Paths, identity: str, attempt: int, reviewer: int, base_sha: str, candidate_sha: str, context: str) -> dict[str, Any]:
+def _assert_review_checks(result: dict[str, Any], required: Iterable[str], identity: str, reviewer: int) -> None:
+    passed = {check["command"] for check in result["checks"] if check["result"] == "passed"}
+    missing = [check for check in required if check not in passed]
+    if missing:
+        raise BraceError(f"{identity} reviewer {reviewer} is missing passed evidence for required checks: {', '.join(missing)}")
+
+
+def run_review(root: str | Path, paths: Paths, identity: str, attempt: int, reviewer: int, base_sha: str, candidate_sha: str, context: str, required_checks: Iterable[str] = ()) -> dict[str, Any]:
     existing = read_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha)
     if existing is not None:
+        _assert_review_checks(existing["result"], required_checks, identity, reviewer)
         return existing
     worktree = new_review_worktree(root, get_configuration(root), identity, attempt, reviewer, candidate_sha)
     assert_review_worktree(worktree, candidate_sha)
     result = invoke_role(root, worktree, "reviewer", context, "reviewer-result.schema.json", "read-only")
     assert_review_worktree(worktree, candidate_sha)
+    _assert_review_checks(result, required_checks, identity, reviewer)
     return write_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha, result)
 
 
@@ -930,11 +952,12 @@ def run_reviews(root: str | Path, paths: Paths, item: dict[str, Any], kind: str)
         "baseToCandidateDiff": run_native("git", ["-C", root, "diff", "--no-ext-diff", f"{base_sha}..{candidate_sha}", "--"]).output,
     })
     config = get_configuration(root)
+    required_checks = item["checks"] if kind == "task" else [item["acceptanceTest"]]
     for reviewer in (1, 2):
         if read_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha) is None:
             new_review_worktree(root, config, identity, attempt, reviewer, candidate_sha)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(run_review, root, paths, identity, attempt, reviewer, base_sha, candidate_sha, context) for reviewer in (1, 2)]
+        futures = [pool.submit(run_review, root, paths, identity, attempt, reviewer, base_sha, candidate_sha, context, required_checks) for reviewer in (1, 2)]
         records = [future.result() for future in futures]
     for reviewer in (1, 2):
         remove_review_worktree(root, config, paths, identity, attempt, reviewer, base_sha, candidate_sha)
@@ -949,6 +972,9 @@ def require_approved_reviews(paths: Paths, item: dict[str, Any], kind: str) -> l
     records = [record for record in values if record is not None]
     if not all(record["result"]["approved"] for record in records):
         raise BraceError(f"{identity} was rejected by adversarial review.")
+    required = item["checks"] if kind == "task" else [item["acceptanceTest"]]
+    for record in records:
+        _assert_review_checks(record["result"], required, identity, record["reviewer"])
     return records
 
 
