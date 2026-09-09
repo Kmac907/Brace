@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["approved", "summary", "findings", "checks", "blocker", "ponytailVerdict"],
+  "properties": {
+    "approved": {"type": "boolean"},
+    "summary": {"type": "string", "minLength": 1},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity", "location", "expectedBehavior", "actualBehavior", "evidence", "impact", "classification"],
+        "properties": {
+          "severity": {"enum": ["critical", "high", "medium", "low"]},
+          "location": {"type": "string", "minLength": 1},
+          "expectedBehavior": {"type": "string", "minLength": 1},
+          "actualBehavior": {"type": "string", "minLength": 1},
+          "evidence": {"type": "string", "minLength": 1},
+          "impact": {"type": "string", "minLength": 1},
+          "classification": {"enum": ["Observed", "Inferred", "Unknown"]}
+        },
+        "additionalProperties": false
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["command", "result", "evidence"],
+        "properties": {
+          "command": {"type": "string", "minLength": 1},
+          "result": {"enum": ["passed", "failed", "skipped"]},
+          "evidence": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "blocker": {"$ref": "blocker.schema.json"},
+    "ponytailVerdict": {
+      "type": "string",
+      "pattern": "^Ponytail verdict: (supported|rejected) — .+$"
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"properties": {"approved": {"const": true}}},
+      "then": {
+        "properties": {
+          "summary": {"const": "No reproducible defect found in the reviewed scope."},
+          "findings": {"maxItems": 0},
+          "checks": {"not": {"contains": {"properties": {"result": {"enum": ["failed", "skipped"]}}, "required": ["result"]}}},
+          "blocker": {"type": "null"},
+          "ponytailVerdict": {"pattern": "^Ponytail verdict: supported — .+$"}
+        }
+      },
+      "else": {
+        "anyOf": [
+          {"properties": {"findings": {"minItems": 1}}},
+          {"properties": {"blocker": {"type": "object"}}}
+        ]
+      }
+    }
+  ]
+}

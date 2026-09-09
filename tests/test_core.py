@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -16,6 +17,20 @@ from support import RepositoryTestCase
 
 
 class CoreTests(RepositoryTestCase):
+    @staticmethod
+    def reviewer_result(approved: bool = True) -> dict:
+        finding = {
+            "severity": "medium", "location": "src/product.py:1", "expectedBehavior": "correct output",
+            "actualBehavior": "incorrect output", "evidence": "focused check failed",
+            "impact": "users receive an incorrect result", "classification": "Observed",
+        }
+        return {
+            "approved": approved,
+            "summary": "No reproducible defect found in the reviewed scope." if approved else "changes required",
+            "findings": [] if approved else [finding], "checks": [], "blocker": None,
+            "ponytailVerdict": f"Ponytail verdict: {'supported' if approved else 'rejected'} — inspected diff evidence.",
+        }
+
     def windows_process_is_running(self, pid: int) -> bool:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
@@ -519,7 +534,7 @@ class CoreTests(RepositoryTestCase):
         self.assertEqual(set(projected), {
             "audit-result.schema.json", "builder-result.schema.json", "fixer-result.schema.json",
             "planning-result.schema.json", "pm-amendment-result.schema.json",
-            "pm-blocker-result.schema.json", "verifier-result.schema.json",
+            "pm-blocker-result.schema.json", "reviewer-result.schema.json", "verifier-result.schema.json",
         })
         self.assertNotIn("uniqueItems", self.schema_keys(projected["planning-result.schema.json"]))
         for name in ("audit-result.schema.json", "builder-result.schema.json", "fixer-result.schema.json", "verifier-result.schema.json"):
@@ -650,7 +665,7 @@ class CoreTests(RepositoryTestCase):
         paths = common.initialize_state_files(root, config)
         base = "a" * 40
         candidate = "b" * 40
-        approved = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
+        approved = self.reviewer_result()
 
         first = common.write_review_result(paths, "TASK-0001", 2, 1, base, candidate, approved)
         second = common.write_review_result(paths, "TASK-0001", 2, 2, base, candidate, approved)
@@ -669,6 +684,53 @@ class CoreTests(RepositoryTestCase):
             with self.subTest(completed_at=completed_at), self.assertRaisesRegex(common.BraceError, error):
                 common.read_review_result(paths, "TASK-0001", 2, 1, base, candidate)
 
+    def test_dual_reviews_start_independently_with_identical_exact_candidate_context(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        base = self.git(root, "rev-parse", "HEAD")
+        (root / "src").mkdir()
+        (root / "src" / "product.py").write_text("value = 1\n", encoding="utf-8")
+        self.git(root, "add", "src/product.py")
+        self.git(root, "commit", "-m", "candidate")
+        candidate = self.git(root, "rev-parse", "HEAD")
+        task = self.task() | {"attemptCount": 1, "baseSha": base, "resultSha": candidate}
+        barrier = threading.Barrier(2)
+        contexts: list[str] = []
+
+        def fake_review(repository, state_paths, identity, attempt, reviewer, base_sha, candidate_sha, context):
+            contexts.append(context)
+            barrier.wait(timeout=2)
+            return {
+                "identity": identity, "attempt": attempt, "reviewer": reviewer,
+                "baseSha": base_sha, "candidateSha": candidate_sha,
+                "result": self.reviewer_result(),
+            }
+
+        with (
+            patch.object(common, "new_review_worktree") as create,
+            patch.object(common, "remove_review_worktree") as remove,
+            patch.object(common, "run_review", side_effect=fake_review),
+        ):
+            records = common.run_reviews(root, paths, task, "task")
+
+        self.assertEqual([record["reviewer"] for record in records], [1, 2])
+        self.assertEqual(contexts[0], contexts[1])
+        context = json.loads(contexts[0])
+        self.assertEqual((context["baseSha"], context["candidateSha"]), (base, candidate))
+        self.assertEqual(context["assignment"]["taskId"], "TASK-0001")
+        self.assertIn("REQ-ONE", context["requirementsMarkdown"])
+        self.assertIn("src/product.py", context["baseToCandidateDiff"])
+        self.assertNotIn("lastError", context["assignment"])
+        self.assertEqual(create.call_count, 2)
+        self.assertEqual(remove.call_count, 2)
+
+        malformed = self.reviewer_result() | {"findings": ["not structured"]}
+        with self.assertRaisesRegex(common.BraceError, "reviewer-result.schema.json"):
+            common.validate_json(malformed, paths.schemas / "reviewer-result.schema.json")
+        incomplete = self.reviewer_result() | {"checks": [{"command": "docs check", "result": "skipped", "evidence": "tool unavailable"}]}
+        with self.assertRaisesRegex(common.BraceError, "should not be valid"):
+            common.validate_json(incomplete, paths.schemas / "reviewer-result.schema.json")
+
     def test_review_worktree_recovery_mutation_and_cleanup(self) -> None:
         root, _, config = self.make_repository()
         paths = common.initialize_state_files(root, config)
@@ -679,7 +741,7 @@ class CoreTests(RepositoryTestCase):
         self.git(root, "add", "candidate.txt", ".gitignore")
         self.git(root, "commit", "-m", "candidate")
         candidate = self.git(root, "rev-parse", "HEAD")
-        approved = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
+        approved = self.reviewer_result()
 
         worktree = common.new_review_worktree(root, config, "BUG-0001", 1, 1, candidate)
         self.assertTrue(worktree.is_absolute())
@@ -707,7 +769,7 @@ class CoreTests(RepositoryTestCase):
         self.assertFalse(worktree.exists())
 
         def mutate_review(_: Path, review_worktree: Path, role: str, context: str, schema: str, sandbox: str) -> dict:
-            self.assertEqual((role, schema, sandbox), ("verifier", "verifier-result.schema.json", "read-only"))
+            self.assertEqual((role, schema, sandbox), ("reviewer", "reviewer-result.schema.json", "read-only"))
             (Path(review_worktree) / "mutation.txt").write_text("changed\n", encoding="utf-8")
             return approved
 
@@ -730,7 +792,7 @@ class CoreTests(RepositoryTestCase):
         root, _, config = self.make_repository()
         paths = common.initialize_state_files(root, config)
         base = candidate = self.git(root, "rev-parse", "HEAD")
-        approved = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
+        approved = self.reviewer_result()
 
         interrupted = common.new_review_worktree(root, config, "TASK-0001", 1, 1, candidate)
         shutil.rmtree(interrupted)

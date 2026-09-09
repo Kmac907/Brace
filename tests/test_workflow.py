@@ -14,6 +14,29 @@ from support import RepositoryTestCase
 
 
 class WorkflowTests(RepositoryTestCase):
+    @staticmethod
+    def reviewer_result(approved: bool = True) -> dict:
+        finding = {
+            "severity": "medium", "location": "src/product.txt:1", "expectedBehavior": "correct output",
+            "actualBehavior": "expected corrected output", "evidence": "focused check failed",
+            "impact": "users receive incorrect output", "classification": "Observed",
+        }
+        return {
+            "approved": approved,
+            "summary": "No reproducible defect found in the reviewed scope." if approved else "changes required",
+            "findings": [] if approved else [finding], "checks": [], "blocker": None,
+            "ponytailVerdict": f"Ponytail verdict: {'supported' if approved else 'rejected'} — inspected diff evidence.",
+        }
+
+    def persist_reviews(self, paths: common.Paths, item: dict, kind: str, results: tuple[dict, dict] | None = None) -> list[dict]:
+        identity = item["taskId" if kind == "task" else "bugId"]
+        chosen = results or (self.reviewer_result(), self.reviewer_result())
+        return [
+            common.read_review_result(paths, identity, item["attemptCount"], reviewer, item["baseSha"], item["resultSha"])
+            or common.write_review_result(paths, identity, item["attemptCount"], reviewer, item["baseSha"], item["resultSha"], result)
+            for reviewer, result in enumerate(chosen, 1)
+        ]
+
     def prepare(self) -> tuple[Path, Path, dict]:
         root, remote, config = self.make_repository()
         source_template = bundled_template()
@@ -164,6 +187,7 @@ class WorkflowTests(RepositoryTestCase):
         with (
             patch.object(build_loop, "assert_prerequisites"),
             patch.object(build_loop, "run_assignment", side_effect=fake_assignment),
+            patch.object(build_loop, "run_reviews", side_effect=lambda repository, state_paths, item, kind: self.persist_reviews(state_paths, item, kind)),
             patch.object(build_loop, "invoke_role", return_value=verifier),
             patch.object(build_loop, "publish_assignment", side_effect=fake_publish),
         ):
@@ -243,14 +267,14 @@ class WorkflowTests(RepositoryTestCase):
 
         verifier = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
 
-        def fake_verifier(repository, worktree, role, context, schema, sandbox):
+        def fake_reviews(repository, paths, item, kind):
             nonlocal verification_calls
-            if context.startswith("Verify only this task"):
-                verification_calls += 1
-                self.assertEqual(active, [f"Verifying TASK-0001 (attempt {verification_calls + 1})"])
-                if verification_calls == 1:
-                    raise RuntimeError("verifier failed")
-            return verifier
+            verification_calls += 1
+            self.assertEqual(active, ["Reviewing TASK-0001 (attempt 2)"])
+            if verification_calls == 1:
+                common.write_review_result(paths, item["taskId"], item["attemptCount"], 1, item["baseSha"], item["resultSha"], self.reviewer_result())
+                raise RuntimeError("second reviewer interrupted")
+            return self.persist_reviews(paths, item, kind)
 
         def fake_publish(repository, worktree, configuration, item, kind):
             base = self.git(root, "rev-parse", f"origin/{configuration['integrationBranch']}")
@@ -265,26 +289,30 @@ class WorkflowTests(RepositoryTestCase):
             patch.object(build_loop, "assert_prerequisites"),
             patch.object(build_loop, "status", side_effect=recording_status),
             patch.object(build_loop, "run_assignment", side_effect=fake_assignment),
-            patch.object(build_loop, "invoke_role", side_effect=fake_verifier),
+            patch.object(build_loop, "run_reviews", side_effect=fake_reviews),
+            patch.object(build_loop, "invoke_role", return_value=verifier),
             patch.object(build_loop, "publish_assignment", side_effect=fake_publish),
         ):
             with self.assertRaisesRegex(RuntimeError, "builder failed"):
                 build_loop.run(root)
             self.assertEqual(active, [])
+            with self.assertRaisesRegex(RuntimeError, "second reviewer interrupted"):
+                build_loop.run(root)
+            self.assertEqual(active, [])
             self.assertEqual(build_loop.run(root), "audit")
 
         self.assertEqual(active, [])
+        self.assertEqual((assignment_calls, verification_calls), (2, 2))
+        self.assertEqual(len(list(common.Paths(root).results.glob("TASK-0001-attempt-002-review-*.json"))), 2)
         self.assertEqual(events, [
             ("enter", "Building TASK-0001"),
             ("exit", "Building TASK-0001"),
             ("enter", "Building TASK-0001"),
             ("exit", "Building TASK-0001"),
-            ("enter", "Verifying TASK-0001 (attempt 2)"),
-            ("exit", "Verifying TASK-0001 (attempt 2)"),
-            ("enter", "Building TASK-0001"),
-            ("exit", "Building TASK-0001"),
-            ("enter", "Verifying TASK-0001 (attempt 3)"),
-            ("exit", "Verifying TASK-0001 (attempt 3)"),
+            ("enter", "Reviewing TASK-0001 (attempt 2)"),
+            ("exit", "Reviewing TASK-0001 (attempt 2)"),
+            ("enter", "Reviewing TASK-0001 (attempt 2)"),
+            ("exit", "Reviewing TASK-0001 (attempt 2)"),
             ("enter", "Running integration verification"),
             ("exit", "Running integration verification"),
         ])
@@ -293,8 +321,9 @@ class WorkflowTests(RepositoryTestCase):
         root, _, config = self.prepare()
         self.plan(root)
         paths = common.Paths(root)
-        approved = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
-        rejected = {"approved": False, "summary": "changes required", "findings": ["expected corrected output"], "checks": [], "blocker": None}
+        approved = self.reviewer_result()
+        rejected = self.reviewer_result(False)
+        verifier = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
         rejected_shas = {}
 
         def fake_assignment(repository, worktree, item, kind, state_paths):
@@ -335,17 +364,17 @@ class WorkflowTests(RepositoryTestCase):
 
         task_verifications = 0
 
-        def fake_build_role(repository, worktree, role, context, schema, sandbox):
+        def fake_task_reviews(repository, state_paths, item, kind):
             nonlocal task_verifications
-            if context.startswith("Verify only this task"):
-                task_verifications += 1
-                return rejected if task_verifications == 1 else approved
-            return approved
+            task_verifications += 1
+            results = (rejected, approved) if task_verifications == 1 else (approved, approved)
+            return self.persist_reviews(state_paths, item, kind, results)
 
         with (
             patch.object(build_loop, "assert_prerequisites"),
             patch.object(build_loop, "run_assignment", side_effect=fake_assignment),
-            patch.object(build_loop, "invoke_role", side_effect=fake_build_role),
+            patch.object(build_loop, "run_reviews", side_effect=fake_task_reviews),
+            patch.object(build_loop, "invoke_role", return_value=verifier),
             patch.object(build_loop, "publish_assignment", side_effect=fake_publish) as task_publish,
         ):
             self.assertEqual(build_loop.run(root), "audit")
@@ -353,6 +382,8 @@ class WorkflowTests(RepositoryTestCase):
         tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
         task = tasks["tasks"][0]
         self.assertEqual(task["attemptCount"], 2)
+        self.assertEqual(task_verifications, 2)
+        self.assertEqual(len(list(paths.results.glob("TASK-0001-attempt-*-review-*.json"))), 4)
         self.assertEqual(task_publish.call_count, 1)
         self.assertEqual(self.git(root, "merge-base", rejected_shas["task"], task["resultSha"]), task["baseSha"])
 
@@ -372,10 +403,13 @@ class WorkflowTests(RepositoryTestCase):
             nonlocal bug_verifications
             if role == "auditor":
                 return audit_result
-            if context.startswith("Verify only this bug correction"):
-                bug_verifications += 1
-                return rejected if bug_verifications == 1 else approved
-            return approved
+            return verifier
+
+        def fake_bug_reviews(repository, state_paths, item, kind):
+            nonlocal bug_verifications
+            bug_verifications += 1
+            results = (approved, rejected) if bug_verifications == 1 else (approved, approved)
+            return self.persist_reviews(state_paths, item, kind, results)
 
         def fake_new_pr(repository, configuration, head, base, expected_head, expected_base, title, body):
             return {
@@ -390,6 +424,7 @@ class WorkflowTests(RepositoryTestCase):
         with (
             patch.object(audit_loop, "assert_prerequisites"),
             patch.object(audit_loop, "run_assignment", side_effect=fake_assignment),
+            patch.object(audit_loop, "run_reviews", side_effect=fake_bug_reviews),
             patch.object(audit_loop, "invoke_role", side_effect=fake_audit_role),
             patch.object(audit_loop, "publish_assignment", side_effect=fake_publish) as bug_publish,
             patch.object(audit_loop, "new_pull_request", side_effect=fake_new_pr),
@@ -400,5 +435,7 @@ class WorkflowTests(RepositoryTestCase):
         bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
         bug = bugs["bugs"][0]
         self.assertEqual(bug["attemptCount"], 2)
+        self.assertEqual(bug_verifications, 2)
+        self.assertEqual(len(list(paths.results.glob("BUG-0001-attempt-*-review-*.json"))), 4)
         self.assertEqual(bug_publish.call_count, 1)
         self.assertEqual(self.git(root, "merge-base", rejected_shas["bug"], bug["resultSha"]), bug["baseSha"])

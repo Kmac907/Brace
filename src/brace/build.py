@@ -28,12 +28,15 @@ from .common import (
     read_attempt_result,
     read_json,
     recover_committed_attempt,
+    require_approved_reviews,
     reset_rejected_assignment,
     remove_audit_worktree,
     remove_merged_assignment,
     remove_worktree,
     repository_root,
+    review_failure,
     run_assignment,
+    run_reviews,
     run_native,
     save_state,
     select_ready_items,
@@ -135,7 +138,8 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 else:
                     task.update(status="pending", lastError="Interrupted before a durable result or commit was produced." if record is None else record["error"])
 
-            for task in (item for item in tasks["tasks"] if item["status"] in {"result_ready", "verified_ready", "submitted"} and item.get("resultSha")):
+            for task in (item for item in tasks["tasks"] if item["status"] in {"verified_ready", "submitted"} and item.get("resultSha")):
+                require_approved_reviews(paths, task, "task")
                 existing = get_pull_request(root, config, task["branch"], config["integrationBranch"], task["resultSha"])
                 if existing:
                     from .common import complete_pull_request
@@ -186,29 +190,37 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                             raise BraceError("Builder result commit SHA does not match the worktree HEAD.")
                         task["resultSha"] = commit["Head"]
                         save_ledger(tasks, paths)
-                        with status(f"Verifying {task['taskId']} (attempt {task['attemptCount']})"):
-                            verification = invoke_role(root, task["worktree"], "verifier", f"Verify only this task:\n{pretty_json(task)}\nBuilder result:\n{pretty_json(result)}", "verifier-result.schema.json", "read-only")
-                        if not verification["approved"]:
-                            blocker = structured_blocker(verification["blocker"], "build", task["taskId"])
+                    except Exception as error:
+                        if task.get("resultSha"):
+                            reset_rejected_assignment(root, config, task, "task")
+                        task.update(status="pending", resultSha=None, lastError=str(error))
+                        warning(f"{task['taskId']} attempt {task['attemptCount']} produced an invalid candidate: {error}")
+                        continue
+                    try:
+                        with status(f"Reviewing {task['taskId']} (attempt {task['attemptCount']})"):
+                            reviews = run_reviews(root, paths, task, "task")
+                    except Exception as error:
+                        task["lastError"] = str(error)
+                        save_ledger(tasks, paths)
+                        raise
+                    if not all(review["result"]["approved"] for review in reviews):
+                        for review in reviews:
+                            blocker = structured_blocker(review["result"]["blocker"], "build", task["taskId"])
                             if is_semantic_blocker(blocker):
-                                _semantic_resolution(root, config, state, paths, tasks, bugs, task, "verification", blocker, input_reader)
+                                _semantic_resolution(root, config, state, paths, tasks, bugs, task, "review", blocker, input_reader)
                                 reset_after_amendment(task, root, config)
                                 save_ledger(tasks, paths)
                                 amendment_handled = True
                                 break
-                            message = "Focused verification failed: " + "; ".join(verification["findings"])
-                            reset_rejected_assignment(root, config, task, "task")
-                            task.update(status="pending", resultSha=None, lastError=message)
-                            continue
-                        task.update(status="verified_ready", lastError=None)
-                        save_ledger(tasks, paths)
-                    except Exception as error:
-                        if state.get("activeAmendment"):
-                            raise
-                        if task.get("resultSha"):
-                            reset_rejected_assignment(root, config, task, "task")
-                        task.update(status="pending", resultSha=None, lastError=str(error))
-                        warning(f"{task['taskId']} attempt {task['attemptCount']} failed verification: {error}")
+                        if amendment_handled:
+                            break
+                        message = review_failure(reviews)
+                        reset_rejected_assignment(root, config, task, "task")
+                        task.update(status="pending", resultSha=None, lastError=message)
+                        continue
+                    require_approved_reviews(paths, task, "task")
+                    task.update(status="verified_ready", lastError=None)
+                    save_ledger(tasks, paths)
                 if amendment_handled:
                     continue
                 save_ledger(tasks, paths)
@@ -216,6 +228,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 for task in (item for item in tasks["tasks"] if item["status"] == "verified_ready"):
                     try:
                         _checks(root, config, state, tasks)
+                        require_approved_reviews(paths, task, "task")
                         state["integrationSha"] = ensure_integration_branch(root, config, state, known_merges(tasks))
                         info(f"PUBLISHING TASK PR: {task['taskId']} at {task['resultSha']}")
                         merged = publish_assignment(root, task["worktree"], config, task, "task")

@@ -13,6 +13,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -576,7 +577,7 @@ def read_review_result(paths: Paths, identity: str, attempt: int, reviewer: int,
 
 def write_review_result(paths: Paths, identity: str, attempt: int, reviewer: int, base_sha: str, candidate_sha: str, result: dict[str, Any]) -> dict[str, Any]:
     assert_review_shas(base_sha, candidate_sha)
-    validate_json(result, paths.schemas / "verifier-result.schema.json")
+    validate_json(result, paths.schemas / "reviewer-result.schema.json")
     record = {
         "schemaVersion": "1.0", "identity": identity, "attempt": attempt, "reviewer": reviewer,
         "baseSha": base_sha, "candidateSha": candidate_sha, "completedAt": utc_now(), "result": result,
@@ -904,9 +905,59 @@ def run_review(root: str | Path, paths: Paths, identity: str, attempt: int, revi
         return existing
     worktree = new_review_worktree(root, get_configuration(root), identity, attempt, reviewer, candidate_sha)
     assert_review_worktree(worktree, candidate_sha)
-    result = invoke_role(root, worktree, "verifier", context, "verifier-result.schema.json", "read-only")
+    result = invoke_role(root, worktree, "reviewer", context, "reviewer-result.schema.json", "read-only")
     assert_review_worktree(worktree, candidate_sha)
     return write_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha, result)
+
+
+def run_reviews(root: str | Path, paths: Paths, item: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+    identity = item["taskId" if kind == "task" else "bugId"]
+    attempt = int(item["attemptCount"])
+    base_sha, candidate_sha = item["baseSha"], item["resultSha"]
+    assert_review_shas(base_sha, candidate_sha)
+    fields = (
+        ("taskId", "title", "description", "requirementIds", "planSections", "dependencies", "allowedPaths", "exclusiveResources", "acceptanceCriteria", "checks")
+        if kind == "task"
+        else ("bugId", "title", "severity", "category", "requirementIds", "description", "evidence", "actualBehavior", "requiredBehavior", "impact", "requiredCorrection", "acceptanceTest", "dependencies", "allowedPaths", "exclusiveResources")
+    )
+    context = pretty_json({
+        "reviewKind": kind,
+        "assignment": {name: item[name] for name in fields},
+        "baseSha": base_sha,
+        "candidateSha": candidate_sha,
+        "requirementsMarkdown": read_git_text(root, candidate_sha, "requirements.md"),
+        "planMarkdown": read_git_text(root, candidate_sha, "plan.md"),
+        "baseToCandidateDiff": run_native("git", ["-C", root, "diff", "--no-ext-diff", f"{base_sha}..{candidate_sha}", "--"]).output,
+    })
+    config = get_configuration(root)
+    for reviewer in (1, 2):
+        if read_review_result(paths, identity, attempt, reviewer, base_sha, candidate_sha) is None:
+            new_review_worktree(root, config, identity, attempt, reviewer, candidate_sha)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(run_review, root, paths, identity, attempt, reviewer, base_sha, candidate_sha, context) for reviewer in (1, 2)]
+        records = [future.result() for future in futures]
+    for reviewer in (1, 2):
+        remove_review_worktree(root, config, paths, identity, attempt, reviewer, base_sha, candidate_sha)
+    return records
+
+
+def require_approved_reviews(paths: Paths, item: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+    identity = item["taskId" if kind == "task" else "bugId"]
+    values = [read_review_result(paths, identity, int(item["attemptCount"]), reviewer, item["baseSha"], item["resultSha"]) for reviewer in (1, 2)]
+    if any(record is None for record in values):
+        raise BraceError(f"{identity} is missing a matching durable reviewer result.")
+    records = [record for record in values if record is not None]
+    if not all(record["result"]["approved"] for record in records):
+        raise BraceError(f"{identity} was rejected by adversarial review.")
+    return records
+
+
+def review_failure(records: Iterable[dict[str, Any]]) -> str:
+    findings = [
+        f"{finding['severity']} {finding['location']}: {finding['actualBehavior']}"
+        for record in records for finding in record["result"]["findings"]
+    ]
+    return "Adversarial review failed: " + "; ".join(findings or ["reviewer reported a semantic blocker"])
 
 
 def remove_review_worktree(root: str | Path, config: dict[str, Any], paths: Paths, identity: str, attempt: int, reviewer: int, base_sha: str, candidate_sha: str) -> None:
