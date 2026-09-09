@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,7 @@ from .common import (
     assert_ledger_identity,
     assert_plan_drift,
     assert_prerequisites,
+    assert_read_only_worktree,
     assert_state_identity,
     assert_target_drift,
     attempt_path,
@@ -150,11 +152,47 @@ def required_final_checks(tasks: dict[str, Any], bugs: dict[str, Any]) -> list[s
 
 
 def assert_final_validation(validation: dict[str, Any], required_checks: list[str]) -> None:
-    passed = {check["command"] for check in validation["checks"] if check["result"] == "passed"}
+    if validation["findings"]:
+        raise BraceError("Final validation reported findings: " + "; ".join(validation["findings"]))
+    passed = {
+        check["command"] for check in validation["checks"]
+        if check["result"] == "passed" and check["evidence"].strip()
+    }
     incomplete = [check for check in required_checks if check not in passed]
     incomplete.extend(check["command"] for check in validation["checks"] if check["result"] != "passed" and check["command"] not in incomplete)
     if incomplete:
         raise BraceError("Final validation is missing passed evidence for required checks: " + ", ".join(incomplete))
+
+
+def recover_bug_definition_state(state: dict[str, Any], bugs: dict[str, Any], paths: Any) -> bool:
+    actual = definition_hash(bugs["bugs"], "bug")
+    if bugs.get("definitionHash") != actual or state.get("bugDefinitionHash") == actual:
+        return False
+    if not bugs.get("auditSha") or bugs.get("auditCycle", 0) < 1:
+        return False
+    record = read_closure_result(paths, bugs["auditCycle"], "audit", bugs["auditSha"])
+    if record is None or record["result"]["status"] != "completed" or record["result"]["missingEvidence"]:
+        return False
+    findings = copy.deepcopy(record["result"]["bugs"])
+    if len(findings) > len(bugs["bugs"]):
+        return False
+    prefix = bugs["bugs"][:len(bugs["bugs"]) - len(findings)] if findings else bugs["bugs"]
+    prior_hash = definition_hash(prefix, "bug")
+    if state.get("bugDefinitionHash") not in ({prior_hash} if prefix else {None, prior_hash}):
+        return False
+    if definition_hash(append_findings(copy.deepcopy(prefix), findings), "bug") != actual:
+        return False
+    state["bugDefinitionHash"] = actual
+    save_state(state, paths)
+    return True
+
+
+def invoke_frozen_role(root: Path, worktree: Path, candidate_sha: str, role: str, context: str, schema: str) -> dict[str, Any]:
+    assert_read_only_worktree(worktree, candidate_sha)
+    try:
+        return invoke_role(root, worktree, role, context, schema, "read-only")
+    finally:
+        assert_read_only_worktree(worktree, candidate_sha)
 
 
 def final_review_item(state: dict[str, Any], tasks: dict[str, Any], bugs: dict[str, Any]) -> dict[str, Any]:
@@ -276,6 +314,7 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
             assert_state_identity(state, root, config)
             assert_plan_drift(state, root, require_plan=True)
             assert_ledger_identity(state, tasks, "task")
+            recover_bug_definition_state(state, bugs, paths)
             if tasks["status"] != "complete" or any(task["status"] not in {"integrated", "superseded"} for task in tasks["tasks"]):
                 raise BraceError("Every active implementation task must be integrated before audit begins.")
             if state["stage"] == "complete":
@@ -313,11 +352,11 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
             if bugs["status"] == "not_audited" or bugs.get("auditSha") != state["integrationSha"]:
                 cycle = next_closure_cycle(paths, bugs["auditCycle"], state["integrationSha"])
                 review_findings = previous_final_findings(paths, state, bugs)
-                audit_worktree = new_audit_worktree(root, config, f"{config['remote']}/{config['integrationBranch']}")
+                audit_worktree = new_audit_worktree(root, config, state["integrationSha"])
                 audit_record = read_closure_result(paths, cycle, "audit", state["integrationSha"])
                 if audit_record is None:
                     with status(f"Running closure audit cycle {cycle}"):
-                        audit_result = invoke_role(root, audit_worktree, "auditor", f"Run a fresh comprehensive closure audit of exact integration commit {state['integrationSha']} against the complete approved requirements and plan. This is closure cycle {cycle}. Return only newly supported findings for this candidate; the existing immutable bug history contains {len(bugs['bugs'])} entries. Independently reconcile these findings from the preceding final reviewers after both completed: {pretty_json(review_findings)}. Do not edit the worktree.", "audit-result.schema.json", "read-only")
+                        audit_result = invoke_frozen_role(root, audit_worktree, state["integrationSha"], "auditor", f"Run a fresh comprehensive closure audit of exact integration commit {state['integrationSha']} against the complete approved requirements and plan. This is closure cycle {cycle}. Return only newly supported findings for this candidate; the existing immutable bug history contains {len(bugs['bugs'])} entries. Independently reconcile these findings from the preceding final reviewers after both completed: {pretty_json(review_findings)}. Do not edit the worktree.", "audit-result.schema.json")
                     audit_record = write_closure_result(paths, cycle, "audit", state["integrationSha"], audit_result)
                 audit_result = audit_record["result"]
                 if audit_result["status"] == "completed" and audit_result["missingEvidence"]:
@@ -515,12 +554,12 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                 return "_restart"
             bugs["status"] = "complete"
             save_ledger(bugs, paths)
-            audit_worktree = new_audit_worktree(root, config, f"{config['remote']}/{config['integrationBranch']}")
+            audit_worktree = new_audit_worktree(root, config, state["integrationSha"])
             validation_record = read_closure_result(paths, bugs["auditCycle"], "validation", state["integrationSha"])
             if validation_record is None:
                 required_checks = required_final_checks(tasks, bugs)
                 with status("Running final project validation"):
-                    final_validation = invoke_role(root, audit_worktree, "verifier", f"Run final project validation at exact integration SHA {state['integrationSha']}. Execute every required project-wide command and report passed evidence for each: {pretty_json(required_checks)}.", "verifier-result.schema.json", "read-only")
+                    final_validation = invoke_frozen_role(root, audit_worktree, state["integrationSha"], "verifier", f"Run final project validation at exact integration SHA {state['integrationSha']}. Execute every required project-wide command and report passed evidence for each: {pretty_json(required_checks)}.", "verifier-result.schema.json")
                 validation_record = write_closure_result(paths, bugs["auditCycle"], "validation", state["integrationSha"], final_validation)
             final_validation = validation_record["result"]
             if not final_validation["approved"]:

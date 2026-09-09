@@ -741,6 +741,55 @@ class CoreTests(RepositoryTestCase):
         with self.assertRaisesRegex(common.BraceError, "depends on unknown bug"):
             audit_loop.append_findings([prior], [finding("BUG-0001", ["BUG-9999"])])
 
+    def test_torn_bug_ledger_write_recovers_from_exact_audit_record(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        candidate = self.git(root, "rev-parse", "HEAD")
+        finding = {
+            "bugId": "BUG-0018", "title": "Defect", "severity": "medium", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "A defect", "evidence": "Focused reproduction",
+            "actualBehavior": "wrong", "requiredBehavior": "right", "impact": "incorrect output",
+            "requiredCorrection": "Correct output", "acceptanceTest": "output is right",
+            "dependencies": [], "allowedPaths": ["src/**"], "exclusiveResources": [],
+        }
+        audit_result = {
+            "status": "completed", "summary": "one finding", "bugs": [finding], "checks": [],
+            "missingEvidence": [], "blocker": None,
+        }
+        audit_loop.write_closure_result(paths, 1, "audit", candidate, audit_result)
+        persisted = audit_loop.append_findings([], [dict(finding)])
+        bug_hash = common.definition_hash(persisted, "bug")
+        bugs.update(auditCycle=1, auditSha=candidate, definitionHash=bug_hash, status="ready", bugs=persisted)
+        common.write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
+        record_before = common.read_text(audit_loop.closure_path(paths, 1, "audit"))
+
+        self.assertTrue(audit_loop.recover_bug_definition_state(state, bugs, paths))
+
+        recovered = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        self.assertEqual(recovered["bugDefinitionHash"], bug_hash)
+        common.assert_ledger_identity(recovered, bugs, "bug")
+        self.assertEqual(common.read_text(audit_loop.closure_path(paths, 1, "audit")), record_before)
+        self.assertFalse(audit_loop.recover_bug_definition_state(recovered, bugs, paths))
+
+    def test_frozen_role_rejects_audit_worktree_mutation(self) -> None:
+        root, _, config = self.make_repository()
+        candidate = self.git(root, "rev-parse", "HEAD")
+        worktree = common.new_audit_worktree(root, config, candidate)
+
+        def mutate(repository, cwd, role, context, schema, sandbox):
+            (Path(cwd) / "mutation.txt").write_text("changed\n", encoding="utf-8")
+            return {}
+
+        try:
+            self.assertEqual(self.git(worktree, "branch", "--show-current"), "")
+            self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), candidate)
+            with patch.object(audit_loop, "invoke_role", side_effect=mutate), self.assertRaisesRegex(common.BraceError, "contains changes"):
+                audit_loop.invoke_frozen_role(root, worktree, candidate, "auditor", "audit", "audit-result.schema.json")
+        finally:
+            common.remove_audit_worktree(root, config)
+
     def test_final_merge_evidence_requires_clean_exact_sha_and_two_approvals(self) -> None:
         root, _, config = self.make_repository()
         paths = common.initialize_state_files(root, config)
@@ -780,11 +829,24 @@ class CoreTests(RepositoryTestCase):
         self.assertEqual(required, ["python -m unittest", "docs check", "bug regression"])
         with self.assertRaisesRegex(common.BraceError, "missing passed evidence.*docs check.*bug regression"):
             audit_loop.assert_final_validation({
-                "checks": [{"command": "python -m unittest", "result": "passed", "evidence": "passed"}]
+                "findings": [], "checks": [{"command": "python -m unittest", "result": "passed", "evidence": "passed"}]
             }, required)
         audit_loop.assert_final_validation({
-            "checks": [{"command": command, "result": "passed", "evidence": "passed"} for command in required]
+            "findings": [], "checks": [{"command": command, "result": "passed", "evidence": "passed"} for command in required]
         }, required)
+        with self.assertRaisesRegex(common.BraceError, "reported findings"):
+            audit_loop.assert_final_validation({
+                "findings": ["regression"],
+                "checks": [{"command": command, "result": "passed", "evidence": "passed"} for command in required],
+            }, required)
+        with self.assertRaisesRegex(common.BraceError, "missing passed evidence.*docs check"):
+            audit_loop.assert_final_validation({
+                "findings": [],
+                "checks": [
+                    {"command": command, "result": "passed", "evidence": " " if command == "docs check" else "passed"}
+                    for command in required
+                ],
+            }, required)
 
     def test_legacy_review_record_is_retained_before_fresh_review(self) -> None:
         root, _, config = self.make_repository()

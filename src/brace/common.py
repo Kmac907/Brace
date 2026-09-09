@@ -944,15 +944,15 @@ def _worktree_registered(root: str | Path, worktree: str | Path) -> bool:
     )
 
 
-def assert_review_worktree(worktree: str | Path, candidate_sha: str) -> None:
+def assert_read_only_worktree(worktree: str | Path, candidate_sha: str) -> None:
     assert_review_shas(candidate_sha, candidate_sha)
     path = Path(worktree).resolve()
     if Path(run_native("git", ["-C", path, "rev-parse", "--show-toplevel"]).output.strip()).resolve() != path:
-        raise BraceError(f"Reviewer worktree root changed: {path}")
+        raise BraceError(f"Read-only worktree root changed: {path}")
     if run_native("git", ["-C", path, "branch", "--show-current"]).output.strip():
-        raise BraceError(f"Reviewer worktree is not detached: {path}")
+        raise BraceError(f"Read-only worktree is not detached: {path}")
     if run_native("git", ["-C", path, "rev-parse", "HEAD"]).output.strip() != candidate_sha:
-        raise BraceError(f"Reviewer worktree HEAD changed: {path}")
+        raise BraceError(f"Read-only worktree HEAD changed: {path}")
     dirty = run_native("git", ["-C", path, "status", "--porcelain", "--untracked-files=all", "--ignored"]).output.strip()
     tracked_directories: set[str] = set()
     for tracked in run_native("git", ["-C", path, "ls-files", "-z"]).output.split("\0"):
@@ -962,7 +962,11 @@ def assert_review_worktree(worktree: str | Path, candidate_sha: str) -> None:
         tracked_directories.update("/".join(parts[:depth]) for depth in range(1, len(parts) + 1))
     unexpected_directory = next((entry for entry in path.rglob("*") if entry.is_dir() and entry.relative_to(path).as_posix() not in tracked_directories), None)
     if dirty or unexpected_directory:
-        raise BraceError(f"Reviewer worktree contains changes: {path}")
+        raise BraceError(f"Read-only worktree contains changes: {path}")
+
+
+def assert_review_worktree(worktree: str | Path, candidate_sha: str) -> None:
+    assert_read_only_worktree(worktree, candidate_sha)
 
 
 def new_review_worktree(root: str | Path, config: dict[str, Any], identity: str, attempt: int, reviewer: int, candidate_sha: str) -> Path:
@@ -1504,7 +1508,10 @@ def new_audit_worktree(root: str | Path, config: dict[str, Any], reference: str)
     path = (base / "AUDIT").resolve()
     if path.is_dir():
         run_native("git", ["-C", root, "worktree", "remove", "--force", "--", path])
-    run_native("git", ["-C", root, "worktree", "add", "--detach", "--", path, reference])
+    candidate_sha = run_native("git", ["-C", root, "rev-parse", reference]).output.strip()
+    assert_review_shas(candidate_sha, candidate_sha)
+    run_native("git", ["-C", root, "worktree", "add", "--detach", "--", path, candidate_sha])
+    assert_read_only_worktree(path, candidate_sha)
     return path
 
 
