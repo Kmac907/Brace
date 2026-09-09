@@ -709,6 +709,15 @@ class CoreTests(RepositoryTestCase):
         self.assertEqual(audit_loop.next_closure_cycle(paths, 0, changed), 2)
         with self.assertRaisesRegex(common.BraceError, "Immutable attempt record"):
             audit_loop.write_closure_result(paths, 1, "audit", candidate, result | {"summary": "different"})
+        incomplete = result | {"missingEvidence": ["required platform unavailable"]}
+        audit_loop.write_closure_result(paths, 2, "audit", candidate, incomplete)
+        self.assertEqual(audit_loop.next_closure_cycle(paths, 1, candidate), 3)
+        blocked = result | {
+            "status": "blocked",
+            "blocker": dict(project_manager.structured_blocker("provider unavailable", "audit", None), kind="operational"),
+        }
+        audit_loop.write_closure_result(paths, 3, "audit", candidate, blocked)
+        self.assertEqual(audit_loop.next_closure_cycle(paths, 2, candidate), 4)
 
     def test_closure_findings_append_without_rewriting_history(self) -> None:
         def finding(identity: str, dependencies: list[str] | None = None) -> dict:
@@ -745,18 +754,37 @@ class CoreTests(RepositoryTestCase):
             "blocker": None,
         }
         audit_loop.write_closure_result(paths, 2, "validation", candidate, validation)
-        item = audit_loop.final_review_item(state, tasks, bugs, validation)
+        item = audit_loop.final_review_item(state, tasks, bugs)
         for reviewer, approved in ((1, True), (2, False)):
             result = self.reviewer_result(approved) | {
                 "checks": [{"command": "python -m unittest", "result": "passed", "evidence": "suite passed"}]
             }
             common.write_review_result(paths, "TASK-0000", 2, reviewer, base, candidate, result, item["checks"])
 
+        with self.assertRaisesRegex(common.BraceError, "no durable zero-finding closure audit"):
+            audit_loop.require_final_evidence(paths, state, tasks, bugs)
+        audit_loop.write_closure_result(paths, 2, "audit", candidate, {
+            "status": "completed", "summary": "clean", "bugs": [], "checks": [],
+            "missingEvidence": [], "blocker": None,
+        })
         with self.assertRaisesRegex(common.BraceError, "rejected by adversarial review"):
             audit_loop.require_final_evidence(paths, state, tasks, bugs)
         self.assertEqual(audit_loop.previous_final_findings(paths, state, bugs), [self.reviewer_result(False)["findings"][0]])
         with self.assertRaisesRegex(common.BraceError, "no clean closure audit"):
             audit_loop.require_final_evidence(paths, state | {"integrationSha": "c" * 40}, tasks, bugs)
+
+    def test_final_validation_requires_deterministic_contract_checks(self) -> None:
+        tasks = {"tasks": [self.task(), self.task("TASK-0002") | {"checks": ["python -m unittest", "docs check"]}]}
+        bugs = {"bugs": [{"acceptanceTest": "bug regression", "disposition": "fixed"}]}
+        required = audit_loop.required_final_checks(tasks, bugs)
+        self.assertEqual(required, ["python -m unittest", "docs check", "bug regression"])
+        with self.assertRaisesRegex(common.BraceError, "missing passed evidence.*docs check.*bug regression"):
+            audit_loop.assert_final_validation({
+                "checks": [{"command": "python -m unittest", "result": "passed", "evidence": "passed"}]
+            }, required)
+        audit_loop.assert_final_validation({
+            "checks": [{"command": command, "result": "passed", "evidence": "passed"} for command in required]
+        }, required)
 
     def test_legacy_review_record_is_retained_before_fresh_review(self) -> None:
         root, _, config = self.make_repository()

@@ -124,14 +124,41 @@ def write_closure_result(paths: Any, cycle: int, kind: str, candidate_sha: str, 
 
 def next_closure_cycle(paths: Any, previous_cycle: int, candidate_sha: str) -> int:
     cycle = previous_cycle + 1
-    while closure_path(paths, cycle, "audit").is_file() and read_closure_result(paths, cycle, "audit", candidate_sha) is None:
+    while closure_path(paths, cycle, "audit").is_file():
+        record = read_closure_result(paths, cycle, "audit", candidate_sha)
+        if record is not None and record["result"]["status"] == "completed" and not record["result"]["missingEvidence"]:
+            break
         cycle += 1
     return cycle
 
 
-def final_review_item(state: dict[str, Any], tasks: dict[str, Any], bugs: dict[str, Any], validation: dict[str, Any]) -> dict[str, Any]:
+def clean_audit_result(paths: Any, bugs: dict[str, Any], candidate_sha: str) -> dict[str, Any] | None:
+    record = read_closure_result(paths, bugs["auditCycle"], "audit", candidate_sha)
+    if record is None:
+        return None
+    result = record["result"]
+    return result if result["status"] == "completed" and not result["bugs"] and not result["missingEvidence"] else None
+
+
+def required_final_checks(tasks: dict[str, Any], bugs: dict[str, Any]) -> list[str]:
+    checks = [
+        check
+        for task in tasks["tasks"] if task.get("status") != "superseded"
+        for check in task["checks"]
+    ] + [bug["acceptanceTest"] for bug in bugs["bugs"] if bug.get("disposition") == "fixed"]
+    return list(dict.fromkeys(checks))
+
+
+def assert_final_validation(validation: dict[str, Any], required_checks: list[str]) -> None:
+    passed = {check["command"] for check in validation["checks"] if check["result"] == "passed"}
+    incomplete = [check for check in required_checks if check not in passed]
+    incomplete.extend(check["command"] for check in validation["checks"] if check["result"] != "passed" and check["command"] not in incomplete)
+    if incomplete:
+        raise BraceError("Final validation is missing passed evidence for required checks: " + ", ".join(incomplete))
+
+
+def final_review_item(state: dict[str, Any], tasks: dict[str, Any], bugs: dict[str, Any]) -> dict[str, Any]:
     requirements = sorted({requirement for task in tasks["tasks"] for requirement in task["requirementIds"]})
-    checks = [check["command"] for check in validation["checks"]]
     return {
         "taskId": "TASK-0000", "title": "Final project candidate",
         "description": "Review the frozen integration candidate against the complete approved requirements and plan.",
@@ -143,7 +170,7 @@ def final_review_item(state: dict[str, Any], tasks: dict[str, Any], bugs: dict[s
             "Final validation passed at this exact candidate SHA.",
             "The complete original-baseline diff preserves required compatibility, recovery, and cleanup behavior.",
         ],
-        "checks": checks, "attemptCount": bugs["auditCycle"],
+        "checks": required_final_checks(tasks, bugs), "attemptCount": bugs["auditCycle"],
         "baseSha": state["targetBaseSha"], "resultSha": state["integrationSha"],
     }
 
@@ -165,14 +192,14 @@ def previous_final_findings(paths: Any, state: dict[str, Any], bugs: dict[str, A
 def require_final_evidence(paths: Any, state: dict[str, Any], tasks: dict[str, Any], bugs: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if bugs["status"] != "complete" or bugs["auditSha"] != state["integrationSha"] or any(bug["status"] != "verified" for bug in bugs["bugs"]):
         raise BraceError("Final project merge has no clean closure audit for its exact integration SHA.")
+    if clean_audit_result(paths, bugs, state["integrationSha"]) is None:
+        raise BraceError("Final project merge has no durable zero-finding closure audit for its exact integration SHA.")
     validation_record = read_closure_result(paths, bugs["auditCycle"], "validation", state["integrationSha"])
     if validation_record is None or not validation_record["result"]["approved"]:
         raise BraceError("Final project merge has no matching approved durable validation result.")
     validation = validation_record["result"]
-    failed = [check["command"] for check in validation["checks"] if check["result"] != "passed"]
-    if failed:
-        raise BraceError("Final project validation has incomplete checks: " + ", ".join(failed))
-    item = final_review_item(state, tasks, bugs, validation)
+    assert_final_validation(validation, required_final_checks(tasks, bugs))
+    item = final_review_item(state, tasks, bugs)
     return validation, require_approved_reviews(paths, item, "task")
 
 
@@ -482,16 +509,23 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                 save_ledger(bugs, paths)
                 save_state(state, paths)
                 return "_restart"
+            if clean_audit_result(paths, bugs, state["integrationSha"]) is None:
+                bugs["status"] = "not_audited"
+                save_ledger(bugs, paths)
+                return "_restart"
             bugs["status"] = "complete"
             save_ledger(bugs, paths)
             audit_worktree = new_audit_worktree(root, config, f"{config['remote']}/{config['integrationBranch']}")
             validation_record = read_closure_result(paths, bugs["auditCycle"], "validation", state["integrationSha"])
             if validation_record is None:
+                required_checks = required_final_checks(tasks, bugs)
                 with status("Running final project validation"):
-                    final_validation = invoke_role(root, audit_worktree, "verifier", f"Run final project validation at exact integration SHA {state['integrationSha']}. Execute the project-wide commands from plan.md.", "verifier-result.schema.json", "read-only")
+                    final_validation = invoke_role(root, audit_worktree, "verifier", f"Run final project validation at exact integration SHA {state['integrationSha']}. Execute every required project-wide command and report passed evidence for each: {pretty_json(required_checks)}.", "verifier-result.schema.json", "read-only")
                 validation_record = write_closure_result(paths, bugs["auditCycle"], "validation", state["integrationSha"], final_validation)
             final_validation = validation_record["result"]
             if not final_validation["approved"]:
+                bugs["status"] = "not_audited"
+                save_ledger(bugs, paths)
                 blocker = structured_blocker(final_validation["blocker"], "audit", None)
                 if is_semantic_blocker(blocker):
                     resume = _handle_semantic(root, config, state, paths, tasks, bugs, "verification", None, blocker, input_reader)
@@ -499,9 +533,12 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                     audit_worktree = None
                     return resume
                 raise BraceError("Final validation failed: " + "; ".join(final_validation["findings"]))
-            incomplete_checks = [check["command"] for check in final_validation["checks"] if check["result"] != "passed"]
-            if incomplete_checks:
-                raise BraceError("Final validation has incomplete checks: " + ", ".join(incomplete_checks))
+            try:
+                assert_final_validation(final_validation, required_final_checks(tasks, bugs))
+            except BraceError:
+                bugs["status"] = "not_audited"
+                save_ledger(bugs, paths)
+                raise
             remove_audit_worktree(root, config)
             audit_worktree = None
             _checks(root, config, state, tasks, bugs)
@@ -512,15 +549,15 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                 state["integrationSha"] = head_sha
                 save_state(state, paths)
                 return "_restart"
-            review_item = final_review_item(state, tasks, bugs, final_validation)
+            review_item = final_review_item(state, tasks, bugs)
             reviews = run_reviews(root, paths, review_item, "task")
             if not all(review["result"]["approved"] for review in reviews):
+                bugs["status"] = "not_audited"
+                save_ledger(bugs, paths)
                 for review in reviews:
                     blocker = structured_blocker(review["result"]["blocker"], "audit", None)
                     if is_semantic_blocker(blocker):
                         return _handle_semantic(root, config, state, paths, tasks, bugs, "review", None, blocker, input_reader)
-                bugs["status"] = "not_audited"
-                save_ledger(bugs, paths)
                 return "_restart"
             require_approved_reviews(paths, review_item, "task")
             _checks(root, config, state, tasks, bugs)

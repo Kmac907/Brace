@@ -249,7 +249,11 @@ class WorkflowTests(RepositoryTestCase):
             common.write_immutable_json(common.attempt_path(paths, "result", item["taskId"], item["attemptCount"]), record)
             return record
 
-        verifier = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
+        verifier = {
+            "approved": True, "summary": "approved", "findings": [],
+            "checks": [{"command": "test -f src/product.txt", "result": "passed", "evidence": "file exists"}],
+            "blocker": None,
+        }
 
         def fake_publish(repository, worktree, configuration, item, kind):
             base = self.git(root, "rev-parse", f"origin/{configuration['integrationBranch']}")
@@ -278,11 +282,17 @@ class WorkflowTests(RepositoryTestCase):
         audit_result = {"status": "completed", "summary": "no bugs", "bugs": [], "checks": [], "missingEvidence": [], "blocker": None}
         audit_contexts: list[str] = []
         final_review_calls = 0
+        validation_calls = 0
 
         def fake_audit_role(repository, worktree, role, context, schema, sandbox):
+            nonlocal validation_calls
             if role == "auditor":
                 audit_contexts.append(context)
-            return audit_result if role == "auditor" else verifier
+                return audit_result
+            validation_calls += 1
+            if validation_calls == 1:
+                return verifier | {"approved": False, "summary": "failed", "findings": ["required checks failed"], "checks": []}
+            return verifier | {"checks": []} if validation_calls == 2 else verifier
 
         def fake_final_reviews(repository, state_paths, item, kind):
             nonlocal final_review_calls
@@ -308,20 +318,27 @@ class WorkflowTests(RepositoryTestCase):
             patch.object(audit_loop, "new_pull_request", side_effect=fake_new_pr) as project_pr,
             patch.object(audit_loop, "complete_pull_request", side_effect=fake_complete),
         ):
+            with self.assertRaisesRegex(common.BraceError, "Final validation failed: required checks failed"):
+                audit_loop.run(root)
+            with self.assertRaisesRegex(common.BraceError, "missing passed evidence.*test -f src/product.txt"):
+                audit_loop.run(root)
             self.assertEqual(audit_loop.run(root), "complete")
 
         state = common.read_json(paths.state, paths.schemas / "state.schema.json")
         bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
         self.assertEqual(state["stage"], "complete")
         self.assertEqual(bugs["status"], "complete")
-        self.assertEqual(bugs["auditCycle"], 2)
+        self.assertEqual(bugs["auditCycle"], 4)
+        self.assertEqual(validation_calls, 4)
         self.assertEqual(final_review_calls, 2)
         self.assertEqual(project_pr.call_count, 1)
-        self.assertIn("src/product.txt:1", audit_contexts[1])
+        self.assertIn("src/product.txt:1", audit_contexts[3])
         self.assertEqual(len(list(paths.results.glob("TASK-0000-attempt-*-review-*.json"))), 4)
         self.assertTrue((paths.results / "CLOSURE-attempt-001-audit.json").is_file())
         self.assertTrue((paths.results / "CLOSURE-attempt-002-audit.json").is_file())
-        self.assertTrue((paths.results / "CLOSURE-attempt-002-validation.json").is_file())
+        self.assertTrue((paths.results / "CLOSURE-attempt-003-audit.json").is_file())
+        self.assertTrue((paths.results / "CLOSURE-attempt-004-audit.json").is_file())
+        self.assertTrue((paths.results / "CLOSURE-attempt-004-validation.json").is_file())
         self.assertTrue(paths.build_summary.is_file())
         self.assertTrue(paths.audit_summary.is_file())
         self.assertFalse(Path(config["worktreeRoot"]).exists())
@@ -432,7 +449,14 @@ class WorkflowTests(RepositoryTestCase):
         paths = common.Paths(root)
         approved = self.reviewer_result()
         rejected = self.reviewer_result(False)
-        verifier = {"approved": True, "summary": "approved", "findings": [], "checks": [], "blocker": None}
+        verifier = {
+            "approved": True, "summary": "approved", "findings": [],
+            "checks": [
+                {"command": "test -f src/product.txt", "result": "passed", "evidence": "file exists"},
+                {"command": "output is correct", "result": "passed", "evidence": "regression passed"},
+            ],
+            "blocker": None,
+        }
         rejected_shas = {}
 
         def fake_assignment(repository, worktree, item, kind, state_paths):
