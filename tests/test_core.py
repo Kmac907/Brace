@@ -823,6 +823,54 @@ class CoreTests(RepositoryTestCase):
                 with self.assertRaisesRegex(common.BraceError, "recorded base"):
                     common.recover_committed_attempt(root, paths, item, kind)
 
+    def test_assignment_start_rejects_mismatched_record_and_future_history(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        base = self.git(root, "rev-parse", "HEAD")
+        task = self.task() | {
+            "branch": "worktree/TASK-0001", "baseSha": base,
+        }
+        task["worktree"] = str(common.new_worktree(root, config, task["taskId"], task["branch"], base))
+        common.begin_assignment(paths, task, "task", base)
+        task.update(status="pending", attemptCount=0)
+        record_path = common.attempt_path(paths, "assignment", task["taskId"], 1)
+        record = common.read_json(record_path)
+        record["startingHead"] = "a" * 40
+        common.write_text_atomic(record_path, common.pretty_json(record))
+        with self.assertRaisesRegex(common.BraceError, "does not match"):
+            common.begin_assignment(paths, task, "task", base)
+        self.assertEqual((task["status"], task["attemptCount"]), ("pending", 0))
+        task.update(
+            status="active", attemptCount=1, resultSha=base,
+            lastError=common.STALE_REVIEW_ERROR,
+        )
+        with self.assertRaisesRegex(common.BraceError, "does not match"):
+            common.resumable_reconciliation_assignment(root, config, paths, task, "task")
+
+        second = self.task("TASK-0002") | {
+            "branch": "worktree/TASK-0002", "baseSha": base,
+        }
+        second["worktree"] = str(common.new_worktree(root, config, second["taskId"], second["branch"], base))
+        common.write_text_atomic(common.attempt_path(paths, "result", second["taskId"], 1), "{}")
+        with self.assertRaisesRegex(common.BraceError, "result does not match"):
+            common.read_attempt_result(paths, second["taskId"], 1)
+        with self.assertRaisesRegex(common.BraceError, "history is ahead"):
+            common.begin_assignment(paths, second, "task", base)
+        self.assertEqual((second["status"], second["attemptCount"]), ("pending", 0))
+        second.update(
+            status="active", attemptCount=1, resultSha=base,
+            lastError=common.STALE_REVIEW_ERROR,
+        )
+        with self.assertRaisesRegex(common.BraceError, "history is ahead"):
+            common.resumable_reconciliation_assignment(root, config, paths, second, "task")
+
+    def test_stale_reconciliation_gets_one_bounded_attempt_beyond_ceiling(self) -> None:
+        stale = {"attemptCount": 1, "lastError": common.STALE_REVIEW_ERROR, "resultSha": "a" * 40}
+        self.assertFalse(common.attempt_limit_reached(stale, 1))
+        self.assertTrue(common.attempt_limit_reached(stale | {"attemptCount": 2}, 1))
+        self.assertTrue(common.attempt_limit_reached(stale | {"resultSha": None}, 1))
+        self.assertTrue(common.attempt_limit_reached(stale | {"lastError": "ordinary failure"}, 1))
+
     def test_stale_requeue_rejects_wrong_recorded_worktree_before_reset(self) -> None:
         root, _, config = self.make_repository()
         base = self.git(root, "rev-parse", "HEAD")

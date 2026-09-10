@@ -615,7 +615,94 @@ def write_immutable_json(path: str | Path, value: Any) -> None:
 
 def read_attempt_result(paths: Paths, identity: str, attempt: int) -> dict[str, Any] | None:
     path = attempt_path(paths, "result", identity, attempt)
-    return read_json(path) if path.is_file() else None
+    if not path.is_file():
+        return None
+    record = read_json(path)
+    if not isinstance(record, dict) or record.get("schemaVersion") != "1.0" or record.get("identity") != identity or record.get("attempt") != attempt:
+        raise BraceError(f"Immutable attempt result does not match {identity} attempt {attempt}.")
+    return record
+
+
+def _has_matching_assignment(paths: Paths, item: dict[str, Any], kind: str, starting_head: str, required: bool) -> bool:
+    identity = item["taskId" if kind == "task" else "bugId"]
+    attempt = int(item["attemptCount"])
+    assert_review_shas(item["baseSha"], starting_head)
+    expected = {
+        "schemaVersion": "1.0", "identity": identity, "attempt": attempt,
+        "baseSha": item["baseSha"], "startingHead": starting_head, "item": item,
+    }
+    path = attempt_path(paths, "assignment", identity, attempt)
+    result_history = list(paths.results.glob(f"{identity}-attempt-{attempt:03d}*.json"))
+    later_assignments = []
+    for candidate in paths.assignments.glob(f"{identity}-attempt-*.json"):
+        match = re.fullmatch(rf"{re.escape(identity)}-attempt-(\d+)", candidate.stem)
+        if not match or int(match.group(1)) > attempt:
+            later_assignments.append(candidate)
+    if result_history or later_assignments:
+        raise BraceError(f"Assignment history is ahead of the {identity} ledger at attempt {attempt}.")
+    if not path.is_file():
+        if required:
+            raise BraceError(f"Active reconciliation assignment is missing: {identity} attempt {attempt}.")
+        return False
+    record = read_json(path)
+    created = record.get("createdAt") if isinstance(record, dict) else None
+    try:
+        valid_created = bool(
+            isinstance(created, str)
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", created)
+            and datetime.fromisoformat(created.replace("Z", "+00:00")).tzinfo is not None
+        )
+    except ValueError:
+        valid_created = False
+    comparable = {name: value for name, value in record.items() if name != "createdAt"} if isinstance(record, dict) else None
+    if not isinstance(record, dict) or set(record) != {*expected, "createdAt"} or comparable != expected or not valid_created:
+        raise BraceError(f"Immutable assignment record does not match {identity} attempt {attempt}.")
+    return True
+
+
+def begin_assignment(paths: Paths, item: dict[str, Any], kind: str, starting_head: str) -> None:
+    active = {**item, "attemptCount": int(item["attemptCount"]) + 1, "status": "active"}
+    if not _has_matching_assignment(paths, active, kind, starting_head, False):
+        identity = active["taskId" if kind == "task" else "bugId"]
+        attempt = active["attemptCount"]
+        write_immutable_json(attempt_path(paths, "assignment", identity, attempt), {
+            "schemaVersion": "1.0", "identity": identity, "attempt": attempt,
+            "baseSha": active["baseSha"], "startingHead": starting_head,
+            "createdAt": utc_now(), "item": active,
+        })
+    item.update(active)
+
+
+def resumable_reconciliation_assignment(
+    root: str | Path,
+    config: dict[str, Any],
+    paths: Paths,
+    item: dict[str, Any],
+    kind: str,
+) -> Path | None:
+    starting_head = item.get("resultSha")
+    if item.get("lastError") != STALE_REVIEW_ERROR or not starting_head:
+        return None
+    identity = item["taskId" if kind == "task" else "bugId"]
+    expected = _recorded_assignment_worktree(root, config, item, identity)
+    if not expected.is_dir() or not _worktree_registered(root, expected):
+        raise BraceError(f"Active reconciliation worktree is not registered at its exact owned path: {identity}.")
+    worktree = new_worktree(
+        root, config, identity, item["branch"], item["baseSha"],
+        expected_head=starting_head, allowed_diverged_head=starting_head,
+    )
+    _has_matching_assignment(paths, item, kind, starting_head, True)
+    return worktree
+
+
+def attempt_limit_reached(item: dict[str, Any], maximum: int) -> bool:
+    attempts = int(item["attemptCount"])
+    fresh_reconciliation_due = (
+        attempts == maximum
+        and item.get("lastError") == STALE_REVIEW_ERROR
+        and bool(item.get("resultSha"))
+    )
+    return attempts >= maximum and not fresh_reconciliation_due
 
 
 def review_path(paths: Paths, identity: str, attempt: int, reviewer: int) -> Path:

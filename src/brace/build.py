@@ -17,6 +17,8 @@ from .common import (
     assert_state_identity,
     assert_target_drift,
     attempt_path,
+    attempt_limit_reached,
+    begin_assignment,
     complete_pull_request,
     ensure_integration_branch,
     get_configuration,
@@ -32,6 +34,7 @@ from .common import (
     read_json,
     recover_committed_attempt,
     requeue_stale_review,
+    resumable_reconciliation_assignment,
     require_approved_reviews,
     reset_rejected_assignment,
     remove_audit_worktree,
@@ -47,7 +50,6 @@ from .common import (
     set_blocked,
     show_status,
     utc_now,
-    write_immutable_json,
     write_json_atomic,
     write_summary,
 )
@@ -153,6 +155,10 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
 
             for task in (item for item in tasks["tasks"] if item["status"] == "active"):
                 record = read_attempt_result(paths, task["taskId"], task["attemptCount"]) or recover_committed_attempt(root, paths, task, "task")
+                if record is None:
+                    resume_worktree = resumable_reconciliation_assignment(root, config, paths, task, "task")
+                    if resume_worktree is not None:
+                        record = run_assignment(root, resume_worktree, task, "task", paths)
                 if record and record["succeeded"]:
                     task["status"] = "result_ready"
                 else:
@@ -289,7 +295,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 if not any(task["status"] not in {"integrated", "superseded"} for task in tasks["tasks"]):
                     break
 
-                exhausted = [task for task in tasks["tasks"] if task["status"] not in {"integrated", "superseded"} and task["attemptCount"] >= config["maximumTaskAttempts"]]
+                exhausted = [task for task in tasks["tasks"] if task["status"] not in {"integrated", "superseded"} and attempt_limit_reached(task, config["maximumTaskAttempts"])]
                 if exhausted:
                     for task in exhausted:
                         task["status"] = "blocked"
@@ -309,13 +315,10 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                         root, config, task["taskId"], task["branch"], task["baseSha"], task.get("resultSha"),
                         allowed_diverged_head=task.get("resultSha"),
                     ))
-                    task["attemptCount"] += 1
-                    task["status"] = "active"
-                    write_immutable_json(attempt_path(paths, "assignment", task["taskId"], task["attemptCount"]), {
-                        "schemaVersion": "1.0", "identity": task["taskId"], "attempt": task["attemptCount"],
-                        "baseSha": task["baseSha"], "startingHead": run_native("git", ["-C", task["worktree"], "rev-parse", "HEAD"]).output.strip(),
-                        "createdAt": utc_now(), "item": task,
-                    })
+                    begin_assignment(
+                        paths, task, "task",
+                        run_native("git", ["-C", task["worktree"], "rev-parse", "HEAD"]).output.strip(),
+                    )
                 save_ledger(tasks, paths)
                 with status("Building " + ", ".join(task["taskId"] for task in wave)):
                     with ThreadPoolExecutor(max_workers=len(wave)) as pool:

@@ -443,6 +443,99 @@ class WorkflowTests(RepositoryTestCase):
             ("exit", "Running integration verification"),
         ])
 
+    def test_build_resumes_assignment_written_before_ledger_save(self) -> None:
+        root, _, _ = self.prepare()
+        self.plan(root)
+        paths = common.Paths(root)
+        real_save = build_loop.save_ledger
+
+        def interrupt_after_assignment(ledger, state_paths):
+            assignment = common.attempt_path(state_paths, "assignment", "TASK-0001", 1)
+            persisted = common.read_json(state_paths.tasks, state_paths.schemas / "tasks.schema.json")
+            if assignment.is_file() and ledger["tasks"][0]["attemptCount"] == 1 and persisted["tasks"][0]["attemptCount"] == 0:
+                raise RuntimeError("interrupted after task assignment")
+            real_save(ledger, state_paths)
+
+        with (
+            patch.object(build_loop, "assert_prerequisites"),
+            patch.object(build_loop, "save_ledger", side_effect=interrupt_after_assignment),
+            patch.object(build_loop, "run_assignment", side_effect=AssertionError("assignment ran before ledger save")),
+            self.assertRaisesRegex(RuntimeError, "interrupted after task assignment"),
+        ):
+            build_loop.run(root)
+
+        assignment_path = common.attempt_path(paths, "assignment", "TASK-0001", 1)
+        original = assignment_path.read_bytes()
+        self.assertEqual(common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")["tasks"][0]["attemptCount"], 0)
+
+        with (
+            patch.object(build_loop, "assert_prerequisites"),
+            patch.object(build_loop, "run_assignment", side_effect=RuntimeError("stop after resumed task assignment")),
+            self.assertRaisesRegex(RuntimeError, "stop after resumed task assignment"),
+        ):
+            build_loop.run(root)
+
+        task = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")["tasks"][0]
+        self.assertEqual((task["status"], task["attemptCount"]), ("active", 1))
+        self.assertEqual(assignment_path.read_bytes(), original)
+
+    def test_build_resumes_persisted_reconciliation_before_worker_start(self) -> None:
+        root, _, config = self.prepare()
+        self.plan(root)
+        paths = common.Paths(root)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        base = common.ensure_integration_branch(root, config, state)
+        task = tasks["tasks"][0]
+        task.update(status="pending", attemptCount=3, branch="worktree/TASK-0001", baseSha=base)
+        prior = self.git(root, "rev-parse", f"{base}^")
+        worktree = common.new_worktree(root, config, task["taskId"], task["branch"], prior)
+        (worktree / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+        self.git(worktree, "add", "candidate.txt")
+        self.git(worktree, "commit", "-m", "candidate")
+        task.update(
+            worktree=str(worktree), resultSha=self.git(worktree, "rev-parse", "HEAD"),
+            lastError=common.STALE_REVIEW_ERROR,
+        )
+        tasks["status"] = "active"
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        state.update(stage="build", stageStatus="running", integrationSha=base)
+        common.save_state(state, paths)
+        worker_calls = 0
+
+        def interrupted_worker(repository, worker_worktree, item, kind, state_paths):
+            nonlocal worker_calls
+            worker_calls += 1
+            if worker_calls == 1:
+                raise RuntimeError("reconciliation worker interrupted")
+            record = {
+                "schemaVersion": "1.0", "identity": item["taskId"], "attempt": item["attemptCount"],
+                "succeeded": False, "result": None, "error": "durable reconciliation failure",
+                "completedAt": common.utc_now(),
+            }
+            common.write_immutable_json(common.attempt_path(state_paths, "result", item["taskId"], item["attemptCount"]), record)
+            return record
+
+        with patch.object(build_loop, "assert_prerequisites"), patch.object(build_loop, "run_assignment", side_effect=interrupted_worker):
+            with self.assertRaisesRegex(RuntimeError, "reconciliation worker interrupted"):
+                build_loop.run(root)
+            assignment = common.attempt_path(paths, "assignment", task["taskId"], 4)
+            immutable = assignment.read_bytes()
+            ignored = worktree / ".codex" / "logs" / "resume-junk"
+            ignored.mkdir(parents=True)
+            (ignored.parent / "ignored.txt").write_text("local\n", encoding="utf-8")
+            with self.assertRaisesRegex(common.BraceError, "uncommitted changes"):
+                build_loop.run(root)
+            self.assertEqual(worker_calls, 1)
+            shutil.rmtree(ignored)
+            (ignored.parent / "ignored.txt").unlink()
+            ignored.parent.rmdir()
+            with self.assertRaisesRegex(common.BraceError, "Task attempts exhausted"):
+                build_loop.run(root)
+        resumed = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")["tasks"][0]
+        self.assertEqual((resumed["status"], resumed["attemptCount"], worker_calls), ("blocked", 4, 2))
+        self.assertEqual(assignment.read_bytes(), immutable)
+
     def test_rejected_task_and_bug_are_retried_from_their_base(self) -> None:
         root, _, config = self.prepare()
         self.plan(root)
@@ -595,7 +688,10 @@ class WorkflowTests(RepositoryTestCase):
 
     def test_parallel_task_and_bug_waves_requeue_stale_reviews(self) -> None:
         root, _, config = self.prepare()
-        config.update(maximumConcurrentBuilders=3, maximumConcurrentFixers=3)
+        config.update(
+            maximumConcurrentBuilders=3, maximumConcurrentFixers=3,
+            maximumTaskAttempts=1, maximumBugAttempts=1,
+        )
         paths = common.Paths(root)
         common.write_text_atomic(paths.config, common.pretty_json(config))
         self.git(root, "add", ".codex/workflow.json")
@@ -798,6 +894,148 @@ class WorkflowTests(RepositoryTestCase):
         persisted = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")["tasks"][0]
         self.assertEqual((persisted["status"], persisted["baseSha"], persisted["resultSha"]), ("pending", advanced, task["resultSha"]))
         self.assertEqual(persisted["pullRequest"]["id"], open_pr["id"])
+
+    def test_audit_resumes_assignment_written_before_ledger_save(self) -> None:
+        root, _, config = self.prepare()
+        self.plan(root)
+        paths = common.Paths(root)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        base = common.ensure_integration_branch(root, config, state)
+        task = tasks["tasks"][0]
+        task.update(
+            status="integrated", attemptCount=1, branch="worktree/TASK-0001", baseSha=base, resultSha=base,
+            pullRequest={
+                "id": "task", "url": "https://example.invalid/task", "state": "merged", "repository": "owner/repo",
+                "head": "worktree/TASK-0001", "headSha": base, "base": config["integrationBranch"],
+                "baseSha": base, "mergeSha": base,
+            },
+        )
+        tasks["status"] = "complete"
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        finding = {
+            "bugId": "BUG-0001", "title": "Fix candidate", "severity": "high", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "wrong", "evidence": "reproduced",
+            "actualBehavior": "wrong", "requiredBehavior": "correct", "impact": "workflow blocks",
+            "requiredCorrection": "correct it", "acceptanceTest": "check bug", "dependencies": [],
+            "allowedPaths": ["bug.txt"], "exclusiveResources": [],
+        }
+        bug = audit_loop.persisted_bug(finding)
+        bug_hash = common.definition_hash([bug], "bug")
+        bugs.update(status="ready", auditCycle=1, auditSha=base, definitionHash=bug_hash, bugs=[bug])
+        common.write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
+        state.update(stage="audit", stageStatus="not_started", integrationSha=base, bugDefinitionHash=bug_hash)
+        common.save_state(state, paths)
+        real_save = audit_loop.save_ledger
+
+        def interrupt(ledger, state_paths):
+            assignment = common.attempt_path(paths, "assignment", "BUG-0001", 1)
+            persisted = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+            if assignment.exists() and ledger["bugs"][0]["attemptCount"] == 1 and persisted["bugs"][0]["attemptCount"] == 0:
+                raise RuntimeError("interrupted after bug assignment")
+            real_save(ledger, state_paths)
+
+        with (
+            patch.object(audit_loop, "assert_prerequisites"),
+            patch.object(audit_loop, "save_ledger", side_effect=interrupt),
+            patch.object(audit_loop, "run_assignment", side_effect=AssertionError("fixer started before ledger save")),
+            self.assertRaisesRegex(RuntimeError, "interrupted after bug assignment"),
+        ):
+            audit_loop.run(root)
+        assignment_path = common.attempt_path(paths, "assignment", "BUG-0001", 1)
+        immutable = assignment_path.read_bytes()
+        self.assertEqual(common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")["bugs"][0]["attemptCount"], 0)
+
+        with (
+            patch.object(audit_loop, "assert_prerequisites"),
+            patch.object(audit_loop, "run_assignment", side_effect=RuntimeError("stop after resumed bug assignment")),
+            self.assertRaisesRegex(RuntimeError, "stop after resumed bug assignment"),
+        ):
+            audit_loop.run(root)
+        resumed = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")["bugs"][0]
+        self.assertEqual((resumed["status"], resumed["attemptCount"]), ("active", 1))
+        self.assertEqual(assignment_path.read_bytes(), immutable)
+
+    def test_audit_resumes_persisted_reconciliation_before_worker_start(self) -> None:
+        root, _, config = self.prepare()
+        self.plan(root)
+        paths = common.Paths(root)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        base = common.ensure_integration_branch(root, config, state)
+        task = tasks["tasks"][0]
+        task.update(
+            status="integrated", attemptCount=1, branch="worktree/TASK-0001", baseSha=base, resultSha=base,
+            pullRequest={
+                "id": "task", "url": "https://example.invalid/task", "state": "merged", "repository": "owner/repo",
+                "head": "worktree/TASK-0001", "headSha": base, "base": config["integrationBranch"],
+                "baseSha": base, "mergeSha": base,
+            },
+        )
+        tasks["status"] = "complete"
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        finding = {
+            "bugId": "BUG-0001", "title": "Fix candidate", "severity": "high", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "wrong", "evidence": "reproduced",
+            "actualBehavior": "wrong", "requiredBehavior": "correct", "impact": "workflow blocks",
+            "requiredCorrection": "correct it", "acceptanceTest": "check bug", "dependencies": [],
+            "allowedPaths": ["bug.txt"], "exclusiveResources": [],
+        }
+        bug = audit_loop.persisted_bug(finding)
+        bug.update(status="open", attemptCount=config["maximumBugAttempts"], branch="worktree/BUG-0001", baseSha=base)
+        prior = self.git(root, "rev-parse", f"{base}^")
+        worktree = common.new_worktree(root, config, bug["bugId"], bug["branch"], prior)
+        (worktree / "bug.txt").write_text("candidate\n", encoding="utf-8")
+        self.git(worktree, "add", "bug.txt")
+        self.git(worktree, "commit", "-m", "candidate")
+        bug.update(
+            worktree=str(worktree), resultSha=self.git(worktree, "rev-parse", "HEAD"),
+            lastError=common.STALE_REVIEW_ERROR,
+        )
+        bug_hash = common.definition_hash([bug], "bug")
+        bugs.update(status="active", auditCycle=1, auditSha=base, definitionHash=bug_hash, bugs=[bug])
+        common.write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
+        state.update(stage="audit", stageStatus="running", integrationSha=base, bugDefinitionHash=bug_hash)
+        common.save_state(state, paths)
+        worker_calls = 0
+
+        def interrupted_worker(repository, worker_worktree, item, kind, state_paths):
+            nonlocal worker_calls
+            worker_calls += 1
+            if worker_calls == 1:
+                raise RuntimeError("reconciliation worker interrupted")
+            record = {
+                "schemaVersion": "1.0", "identity": item["bugId"], "attempt": item["attemptCount"],
+                "succeeded": False, "result": None, "error": "durable reconciliation failure",
+                "completedAt": common.utc_now(),
+            }
+            common.write_immutable_json(common.attempt_path(state_paths, "result", item["bugId"], item["attemptCount"]), record)
+            return record
+
+        with patch.object(audit_loop, "assert_prerequisites"), patch.object(audit_loop, "run_assignment", side_effect=interrupted_worker):
+            with self.assertRaisesRegex(RuntimeError, "reconciliation worker interrupted"):
+                audit_loop.run(root)
+            assignment = common.attempt_path(paths, "assignment", bug["bugId"], config["maximumBugAttempts"] + 1)
+            immutable = assignment.read_bytes()
+            ignored = worktree / ".codex" / "logs" / "resume-junk"
+            ignored.mkdir(parents=True)
+            (ignored.parent / "ignored.txt").write_text("local\n", encoding="utf-8")
+            with self.assertRaisesRegex(common.BraceError, "uncommitted changes"):
+                audit_loop.run(root)
+            self.assertEqual(worker_calls, 1)
+            shutil.rmtree(ignored)
+            (ignored.parent / "ignored.txt").unlink()
+            ignored.parent.rmdir()
+            with self.assertRaisesRegex(common.BraceError, "Bug attempts exhausted"):
+                audit_loop.run(root)
+        resumed = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")["bugs"][0]
+        self.assertEqual(
+            (resumed["status"], resumed["attemptCount"], worker_calls),
+            ("blocked", config["maximumBugAttempts"] + 1, 2),
+        )
+        self.assertEqual(assignment.read_bytes(), immutable)
 
     def test_build_rejects_unowned_remote_before_candidate_mutation(self) -> None:
         root, _, config = self.prepare()

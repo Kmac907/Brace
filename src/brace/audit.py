@@ -20,6 +20,8 @@ from .common import (
     assert_state_identity,
     assert_target_drift,
     attempt_path,
+    attempt_limit_reached,
+    begin_assignment,
     canonicalize_graph_identities,
     complete_pull_request,
     definition_hash,
@@ -40,6 +42,7 @@ from .common import (
     read_json,
     recover_committed_attempt,
     requeue_stale_review,
+    resumable_reconciliation_assignment,
     require_approved_reviews,
     reset_rejected_assignment,
     remove_audit_worktree,
@@ -443,6 +446,10 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
 
             for bug in (item for item in bugs["bugs"] if item["status"] == "active"):
                 record = read_attempt_result(paths, bug["bugId"], bug["attemptCount"]) or recover_committed_attempt(root, paths, bug, "bug")
+                if record is None:
+                    resume_worktree = resumable_reconciliation_assignment(root, config, paths, bug, "bug")
+                    if resume_worktree is not None:
+                        record = run_assignment(root, resume_worktree, bug, "bug", paths)
                 if record and record["succeeded"]:
                     bug["status"] = "result_ready"
                 else:
@@ -570,7 +577,7 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                         warning(str(error))
                 if not any(bug["status"] != "verified" for bug in bugs["bugs"]):
                     break
-                exhausted = [bug for bug in bugs["bugs"] if bug["status"] != "verified" and bug["attemptCount"] >= config["maximumBugAttempts"]]
+                exhausted = [bug for bug in bugs["bugs"] if bug["status"] != "verified" and attempt_limit_reached(bug, config["maximumBugAttempts"])]
                 if exhausted:
                     for bug in exhausted:
                         bug["status"] = "blocked"
@@ -590,13 +597,10 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                         root, config, bug["bugId"], bug["branch"], bug["baseSha"], bug.get("resultSha"),
                         allowed_diverged_head=bug.get("resultSha"),
                     ))
-                    bug["attemptCount"] += 1
-                    bug["status"] = "active"
-                    write_immutable_json(attempt_path(paths, "assignment", bug["bugId"], bug["attemptCount"]), {
-                        "schemaVersion": "1.0", "identity": bug["bugId"], "attempt": bug["attemptCount"],
-                        "baseSha": bug["baseSha"], "startingHead": run_native("git", ["-C", bug["worktree"], "rev-parse", "HEAD"]).output.strip(),
-                        "createdAt": utc_now(), "item": bug,
-                    })
+                    begin_assignment(
+                        paths, bug, "bug",
+                        run_native("git", ["-C", bug["worktree"], "rev-parse", "HEAD"]).output.strip(),
+                    )
                 bugs["status"] = "active"
                 save_ledger(bugs, paths)
                 with ThreadPoolExecutor(max_workers=len(wave)) as pool:
