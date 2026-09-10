@@ -592,3 +592,132 @@ class WorkflowTests(RepositoryTestCase):
         self.assertEqual(len(list(paths.results.glob("BUG-0001-attempt-*-review-*.json"))), 4)
         self.assertEqual(bug_publish.call_count, 1)
         self.assertEqual(self.git(root, "merge-base", rejected_shas["bug"], bug["resultSha"]), bug["baseSha"])
+
+    def test_parallel_task_and_bug_waves_requeue_stale_reviews(self) -> None:
+        root, _, config = self.prepare()
+        planned = self.planner_result()
+        planned["tasks"][0].update(allowedPaths=["task-one.txt"], checks=["check task one"])
+        planned["tasks"].append({
+            **planned["tasks"][0], "taskId": "TASK-0028", "title": "Implement second feature",
+            "allowedPaths": ["task-two.txt"], "checks": ["check task two"],
+        })
+        planned["summary"].update(taskCount=2, parallelizableTaskCount=2)
+        with patch.object(planning_loop, "assert_prerequisites"), patch.object(planning_loop, "invoke_role", return_value=planned):
+            planning_loop.run(root)
+
+        paths = common.Paths(root)
+        assignments: list[tuple[str, str, int, str, str]] = []
+        publications: list[tuple[str, str, str, str]] = []
+
+        def fake_assignment(repository, worktree, item, kind, state_paths):
+            path = Path(worktree)
+            identity = item["taskId" if kind == "task" else "bugId"]
+            filename = item["allowedPaths"][0]
+            self.assertEqual(self.git(path, "rev-parse", "HEAD"), item["baseSha"])
+            (path / filename).write_text(f"{identity} attempt {item['attemptCount']}\n", encoding="utf-8")
+            self.git(path, "add", filename)
+            self.git(path, "commit", "-m", f"{identity} attempt {item['attemptCount']}")
+            head = self.git(path, "rev-parse", "HEAD")
+            assignments.append((kind, identity, item["attemptCount"], item["baseSha"], head))
+            result = {
+                "status": "completed" if kind == "task" else "fixed", "summary": "implemented",
+                "commitSha": head, "checks": [], "blocker": None,
+                "filesChanged" if kind == "task" else "changedFiles": [filename],
+            }
+            record = {
+                "schemaVersion": "1.0", "identity": identity, "attempt": item["attemptCount"],
+                "succeeded": True, "result": result, "error": None, "completedAt": common.utc_now(),
+            }
+            common.write_immutable_json(common.attempt_path(state_paths, "result", identity, item["attemptCount"]), record)
+            return record
+
+        def fake_reviews(repository, state_paths, item, kind):
+            return self.persist_reviews(state_paths, item, kind)
+
+        def fake_publish(repository, worktree, configuration, item, kind):
+            identity = item["taskId" if kind == "task" else "bugId"]
+            base = self.git(root, "rev-parse", f"origin/{configuration['integrationBranch']}")
+            self.assertEqual(item["baseSha"], base)
+            self.git(root, "push", "origin", f"{item['resultSha']}:refs/heads/{configuration['integrationBranch']}")
+            publications.append((kind, identity, base, item["resultSha"]))
+            return {
+                "id": identity, "url": f"https://example.invalid/{identity}", "state": "merged",
+                "repository": "owner/repo", "head": item["branch"], "headSha": item["resultSha"],
+                "base": configuration["integrationBranch"], "baseSha": base, "mergeSha": item["resultSha"],
+            }
+
+        checks = ["check task one", "check task two", "check bug one", "check bug two"]
+        verifier = {
+            "approved": True, "summary": "approved", "findings": [], "blocker": None,
+            "checks": [{"command": command, "result": "passed", "evidence": "passed"} for command in checks],
+        }
+        with (
+            patch.object(build_loop, "assert_prerequisites"),
+            patch.object(build_loop, "run_assignment", side_effect=fake_assignment),
+            patch.object(build_loop, "run_reviews", side_effect=fake_reviews),
+            patch.object(build_loop, "publish_assignment", side_effect=fake_publish),
+            patch.object(build_loop, "invoke_role", return_value=verifier),
+        ):
+            self.assertEqual(build_loop.run(root), "audit")
+
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        self.assertEqual([task["attemptCount"] for task in tasks["tasks"]], [1, 2])
+        self.assertEqual(len(list(paths.results.glob("TASK-0001-attempt-*-review-*.json"))), 2)
+        self.assertEqual(len(list(paths.results.glob("TASK-0002-attempt-*-review-*.json"))), 4)
+
+        findings = [{
+            "bugId": identity, "title": title, "severity": "high", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "output is wrong", "evidence": "reproduced",
+            "actualBehavior": "wrong", "requiredBehavior": "correct", "impact": "workflow blocks",
+            "requiredCorrection": "correct output", "acceptanceTest": check, "dependencies": [],
+            "allowedPaths": [filename], "exclusiveResources": [],
+        } for identity, title, filename, check in (
+            ("BUG-0018", "Fix first bug", "bug-one.txt", "check bug one"),
+            ("BUG-0028", "Fix second bug", "bug-two.txt", "check bug two"),
+        )]
+        audit_calls = 0
+
+        def fake_audit_role(repository, worktree, role, context, schema, sandbox):
+            nonlocal audit_calls
+            if role != "auditor":
+                return verifier
+            audit_calls += 1
+            return {
+                "status": "completed", "summary": "findings" if audit_calls == 1 else "clean",
+                "bugs": findings if audit_calls == 1 else [], "checks": [], "missingEvidence": [], "blocker": None,
+            }
+
+        def fake_new_pr(repository, configuration, head, base, expected_head, expected_base, title, body):
+            return {
+                "id": "project", "url": "https://example.invalid/project", "state": "open",
+                "repository": "owner/repo", "head": head, "headSha": expected_head,
+                "base": base, "baseSha": expected_base, "mergeSha": None,
+            }
+
+        def fake_complete(repository, configuration, pull_request, expected_head, expected_base):
+            self.assertEqual((expected_head, expected_base), (pull_request["headSha"], pull_request["baseSha"]))
+            self.git(root, "push", "origin", f"{expected_head}:refs/heads/{configuration['targetBranch']}")
+            return {**pull_request, "state": "merged", "mergeSha": expected_head}
+
+        with (
+            patch.object(audit_loop, "assert_prerequisites"),
+            patch.object(audit_loop, "run_assignment", side_effect=fake_assignment),
+            patch.object(audit_loop, "run_reviews", side_effect=fake_reviews),
+            patch.object(audit_loop, "publish_assignment", side_effect=fake_publish),
+            patch.object(audit_loop, "invoke_role", side_effect=fake_audit_role),
+            patch.object(audit_loop, "new_pull_request", side_effect=fake_new_pr),
+            patch.object(audit_loop, "complete_pull_request", side_effect=fake_complete),
+        ):
+            self.assertEqual(audit_loop.run(root), "complete")
+
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        self.assertEqual([bug["attemptCount"] for bug in bugs["bugs"]], [1, 2])
+        self.assertEqual(len(list(paths.results.glob("BUG-0001-attempt-*-review-*.json"))), 2)
+        self.assertEqual(len(list(paths.results.glob("BUG-0002-attempt-*-review-*.json"))), 4)
+        for kind in ("task", "bug"):
+            first_publication = next(record for record in publications if record[0] == kind)
+            first = next(record for record in assignments if record[0] == kind and record[1] == first_publication[1] and record[2] == 1)
+            stale = next(record for record in assignments if record[0] == kind and record[1] != first_publication[1] and record[2] == 1)
+            retry = next(record for record in assignments if record[0] == kind and record[1] == stale[1] and record[2] == 2)
+            self.assertEqual(first[3], stale[3])
+            self.assertEqual(retry[3], first_publication[3])

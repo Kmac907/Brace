@@ -9,6 +9,7 @@ from typing import Any
 
 from .common import (
     BraceError,
+    STALE_REVIEW_ERROR,
     WorkflowLock,
     assert_assignment_commit,
     assert_graph,
@@ -38,6 +39,7 @@ from .common import (
     read_review_result,
     read_json,
     recover_committed_attempt,
+    requeue_stale_review,
     require_approved_reviews,
     reset_rejected_assignment,
     remove_audit_worktree,
@@ -523,6 +525,9 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                     _checks(root, config, state, tasks, bugs)
                     require_approved_reviews(paths, bug, "bug")
                     state["integrationSha"] = ensure_integration_branch(root, config, state, known_merges(tasks, bugs))
+                    if requeue_stale_review(root, config, bug, "bug", state["integrationSha"]):
+                        save_ledger(bugs, paths)
+                        continue
                     merged = publish_assignment(root, bug["worktree"], config, bug, "bug")
                     bug.update(pullRequest=merged, status="verified", lastError=None)
                     state["integrationSha"] = merged["mergeSha"]
@@ -547,6 +552,8 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                 base_sha = state["integrationSha"]
                 for bug in wave:
                     bug["branch"] = bug.get("branch") or f"worktree/{bug['bugId']}"
+                    if bug.get("lastError") == STALE_REVIEW_ERROR:
+                        requeue_stale_review(root, config, bug, "bug", base_sha)
                     bug["baseSha"] = bug.get("baseSha") or base_sha
                     bug["worktree"] = str(new_worktree(root, config, bug["bugId"], bug["branch"], bug["baseSha"], bug.get("resultSha")))
                     bug["attemptCount"] += 1

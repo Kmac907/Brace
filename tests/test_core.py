@@ -358,6 +358,8 @@ class CoreTests(RepositoryTestCase):
         self.assertEqual([item["taskId"] for item in common.select_ready_items([first, second], "task", 2)], ["TASK-0001", "TASK-0002"])
         second["allowedPaths"] = ["src/a/file.py"]
         self.assertEqual(len(common.select_ready_items([first, second], "task", 2)), 1)
+        second.update(allowedPaths=["src/b/**"], lastError=common.STALE_REVIEW_ERROR)
+        self.assertEqual(common.select_ready_items([first, second], "task", 2), [second])
 
     def test_blocker_validation(self) -> None:
         operational = project_manager.structured_blocker("failed", "build", "TASK-0001")
@@ -742,6 +744,30 @@ class CoreTests(RepositoryTestCase):
         amendment = common.new_worktree(root, config, "AMEND-0001", "worktree/AMEND-0001", base)
         self.assertEqual(self.git(amendment, "branch", "--show-current"), "worktree/AMEND-0001")
         common.remove_worktree(root, config, "AMEND-0001", "worktree/AMEND-0001")
+
+    def test_stale_review_requeue_recovers_an_interrupted_reset(self) -> None:
+        root, _, config = self.make_repository()
+        base = self.git(root, "rev-parse", "HEAD")
+        task = self.task() | {
+            "status": "verified_ready", "branch": "worktree/TASK-0001", "baseSha": base,
+        }
+        worktree = common.new_worktree(root, config, task["taskId"], task["branch"], base)
+        (worktree / "result.txt").write_text("candidate\n", encoding="utf-8")
+        self.git(worktree, "add", "result.txt")
+        self.git(worktree, "commit", "-m", "candidate")
+        task["resultSha"] = self.git(worktree, "rev-parse", "HEAD")
+        persisted = dict(task)
+        (root / "integrated.txt").write_text("merged sibling\n", encoding="utf-8")
+        self.git(root, "add", "integrated.txt")
+        self.git(root, "commit", "-m", "advance integration")
+        integration = self.git(root, "rev-parse", "HEAD")
+
+        self.assertTrue(common.requeue_stale_review(root, config, task, "task", integration))
+        self.assertEqual((task["status"], task["baseSha"], task["resultSha"]), ("pending", integration, None))
+        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), integration)
+        self.assertTrue(common.requeue_stale_review(root, config, persisted, "task", integration))
+        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), integration)
+        common.remove_worktree(root, config, "TASK-0001", "worktree/TASK-0001")
 
     def test_review_records_are_distinct_resumable_and_candidate_bound(self) -> None:
         root, _, config = self.make_repository()

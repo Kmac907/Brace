@@ -26,6 +26,7 @@ MAXIMUM_LOG_BYTES = 2 * 1024 * 1024
 AGENT_HEARTBEAT_SECONDS = 30
 STATUS_SNAPSHOT_ATTEMPTS = 20
 STATUS_SNAPSHOT_RETRY_SECONDS = 0.05
+STALE_REVIEW_ERROR = "Integration advanced after review; a fresh implementation and reviews are required."
 REVIEW_SUPPORT_PATHS = {
     ".codex/prompts/reviewer.md",
     ".codex/schemas/closure-record.schema.json",
@@ -870,6 +871,9 @@ def select_ready_items(items: list[dict[str, Any]], kind: str, maximum: int) -> 
     key, pending, complete = ("taskId", "pending", "integrated") if kind == "task" else ("bugId", "open", "verified")
     by_id = {item[key]: item for item in items}
     ready = [item for item in items if item["status"] == pending and all(by_id[dep]["status"] == complete for dep in item["dependencies"])]
+    stale = [item for item in ready if item.get("lastError") == STALE_REVIEW_ERROR]
+    if stale:
+        ready, maximum = stale, 1
     selected: list[dict[str, Any]] = []
     for candidate in ready:
         if len(selected) >= maximum:
@@ -1099,6 +1103,27 @@ def reset_rejected_assignment(root: str | Path, config: dict[str, Any], item: di
         raise BraceError(f"Rejected assignment HEAD differs from its recorded result: {identity}")
     if head != item["baseSha"]:
         run_native("git", ["-C", path, "reset", "--hard", item["baseSha"]])
+
+
+def requeue_stale_review(root: str | Path, config: dict[str, Any], item: dict[str, Any], kind: str, integration_sha: str) -> bool:
+    if item["baseSha"] == integration_sha:
+        return False
+    identity = item["taskId" if kind == "task" else "bugId"]
+    path = new_worktree(root, config, identity, item["branch"], item["baseSha"])
+    head = run_native("git", ["-C", path, "rev-parse", "HEAD"]).output.strip()
+    if head not in {item["baseSha"], item["resultSha"], integration_sha}:
+        raise BraceError(f"Stale reviewed assignment HEAD differs from its recorded state: {identity}")
+    if run_native("git", ["-C", root, "merge-base", "--is-ancestor", item["baseSha"], integration_sha], allowed_exit_codes=(0, 1)).returncode != 0:
+        raise BraceError(f"Current integration does not descend from the reviewed base of {identity}.")
+    if head != integration_sha:
+        run_native("git", ["-C", path, "reset", "--hard", integration_sha])
+    item.update(
+        status="pending" if kind == "task" else "open", baseSha=integration_sha, resultSha=None,
+        pullRequest=None, lastError=STALE_REVIEW_ERROR,
+    )
+    if kind == "bug":
+        item["disposition"] = None
+    return True
 
 
 def _matches_path(path: str, pattern: str) -> bool:
@@ -1335,11 +1360,11 @@ def complete_pull_request(root: str | Path, config: dict[str, Any], pull_request
 def publish_assignment(root: str | Path, worktree: str | Path, config: dict[str, Any], item: dict[str, Any], kind: str) -> dict[str, Any]:
     identity = item["taskId" if kind == "task" else "bugId"]
     branch = item["branch"]
-    run_native("git", ["-C", worktree, "push", "--set-upstream", config["remote"], branch])
     run_native("git", ["-C", root, "fetch", config["remote"], "--prune"])
     base_sha = run_native("git", ["-C", root, "rev-parse", f"{config['remote']}/{config['integrationBranch']}"]).output.strip()
     if base_sha != item["baseSha"]:
         raise BraceError(f"Integration base changed after review of {identity}.")
+    run_native("git", ["-C", worktree, "push", "--set-upstream", config["remote"], branch])
     pull_request = new_pull_request(root, config, branch, config["integrationBranch"], item["resultSha"], item["baseSha"], f"{identity} {item['title']}", f"Brace {kind} {identity}")
     return complete_pull_request(root, config, pull_request, item["resultSha"], item["baseSha"])
 

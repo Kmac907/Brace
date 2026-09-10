@@ -7,6 +7,7 @@ from typing import Any
 
 from .common import (
     BraceError,
+    STALE_REVIEW_ERROR,
     WorkflowLock,
     assert_assignment_commit,
     assert_graph,
@@ -29,6 +30,7 @@ from .common import (
     read_attempt_result,
     read_json,
     recover_committed_attempt,
+    requeue_stale_review,
     require_approved_reviews,
     reset_rejected_assignment,
     remove_audit_worktree,
@@ -234,6 +236,9 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                         _checks(root, config, state, tasks)
                         require_approved_reviews(paths, task, "task")
                         state["integrationSha"] = ensure_integration_branch(root, config, state, known_merges(tasks))
+                        if requeue_stale_review(root, config, task, "task", state["integrationSha"]):
+                            save_ledger(tasks, paths)
+                            continue
                         info(f"PUBLISHING TASK PR: {task['taskId']} at {task['resultSha']}")
                         merged = publish_assignment(root, task["worktree"], config, task, "task")
                         success(f"TASK PR MERGED: {task['taskId']} -> {merged['mergeSha']}")
@@ -265,6 +270,8 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 base_sha = state["integrationSha"]
                 for task in wave:
                     task["branch"] = task.get("branch") or f"worktree/{task['taskId']}"
+                    if task.get("lastError") == STALE_REVIEW_ERROR:
+                        requeue_stale_review(root, config, task, "task", base_sha)
                     task["baseSha"] = task.get("baseSha") or base_sha
                     task["worktree"] = str(new_worktree(root, config, task["taskId"], task["branch"], task["baseSha"], task.get("resultSha")))
                     task["attemptCount"] += 1
