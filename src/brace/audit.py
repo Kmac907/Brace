@@ -9,6 +9,7 @@ from typing import Any
 
 from .common import (
     BraceError,
+    STALE_REVIEW_ERROR,
     WorkflowLock,
     assert_assignment_commit,
     assert_graph,
@@ -19,6 +20,8 @@ from .common import (
     assert_state_identity,
     assert_target_drift,
     attempt_path,
+    attempt_limit_reached,
+    begin_assignment,
     canonicalize_graph_identities,
     complete_pull_request,
     definition_hash,
@@ -38,6 +41,8 @@ from .common import (
     read_review_result,
     read_json,
     recover_committed_attempt,
+    requeue_stale_review,
+    resumable_reconciliation_assignment,
     require_approved_reviews,
     reset_rejected_assignment,
     remove_audit_worktree,
@@ -423,22 +428,58 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                 if bugs["bugs"]:
                     assert_graph(bugs["bugs"], "bug")
 
+            recoverable = [item for item in bugs["bugs"] if item["status"] == "ready_to_publish" and item.get("resultSha")]
+            provider_records: dict[str, dict[str, Any] | None] = {}
+            recovered_merges: dict[str, dict[str, Any]] = {}
+            for bug in recoverable:
+                if not has_matching_review_results(paths, bug, "bug"):
+                    continue
+                require_approved_reviews(paths, bug, "bug")
+                existing = get_pull_request(root, config, bug["branch"], config["integrationBranch"], bug["resultSha"])
+                provider_records[bug["bugId"]] = existing
+                if existing and existing["state"] in {"merged", "completed"}:
+                    recovered_merges[bug["bugId"]] = complete_pull_request(root, config, existing, bug["resultSha"], bug["baseSha"])
+            remote_sha = ensure_integration_branch(
+                root, config, state,
+                [*known_merges(tasks, bugs), *(merged["mergeSha"] for merged in recovered_merges.values())],
+            )
+
             for bug in (item for item in bugs["bugs"] if item["status"] == "active"):
                 record = read_attempt_result(paths, bug["bugId"], bug["attemptCount"]) or recover_committed_attempt(root, paths, bug, "bug")
+                if record is None:
+                    resume_worktree = resumable_reconciliation_assignment(root, config, paths, bug, "bug")
+                    if resume_worktree is not None:
+                        record = run_assignment(root, resume_worktree, bug, "bug", paths)
                 if record and record["succeeded"]:
                     bug["status"] = "result_ready"
                 else:
                     bug.update(status="open", lastError="Interrupted before a durable result or commit was produced." if record is None else record["error"])
-            for bug in (item for item in bugs["bugs"] if item["status"] == "ready_to_publish" and item.get("resultSha")):
+            for bug in recoverable:
                 if not has_matching_review_results(paths, bug, "bug"):
                     bug.update(status="result_ready", lastError=None)
                     continue
-                require_approved_reviews(paths, bug, "bug")
-                existing = get_pull_request(root, config, bug["branch"], config["integrationBranch"], bug["resultSha"])
+                existing = provider_records[bug["bugId"]]
+                if bug["bugId"] in recovered_merges:
+                    merged = recovered_merges[bug["bugId"]]
+                    bug.update(pullRequest=merged, status="verified", lastError=None)
+                    state["integrationSha"] = merged["mergeSha"]
+                    save_ledger(bugs, paths)
+                    save_state(state, paths)
+                    try:
+                        remove_merged_assignment(root, config, bug["bugId"], bug["branch"], merged)
+                    except Exception as error:
+                        warning(str(error))
+                    continue
+                if bug["baseSha"] != remote_sha:
+                    if existing:
+                        bug["pullRequest"] = existing
+                    requeue_stale_review(root, config, bug, "bug", remote_sha)
+                    continue
                 if existing:
                     merged = complete_pull_request(root, config, existing, bug["resultSha"], bug["baseSha"])
                     bug.update(pullRequest=merged, status="verified", lastError=None)
                     state["integrationSha"] = merged["mergeSha"]
+                    remote_sha = merged["mergeSha"]
                     save_ledger(bugs, paths)
                     save_state(state, paths)
                     try:
@@ -477,7 +518,8 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                             raise BraceError(f"Bug fixer blocked: {blocker['message']}")
                         context_label = "not-reproducible disposition" if result["status"] == "not_reproducible" else "bug correction"
                         if result["status"] != "not_reproducible":
-                            commit = assert_assignment_commit(bug["worktree"], bug["baseSha"], bug)
+                            assignment = read_json(attempt_path(paths, "assignment", bug["bugId"], bug["attemptCount"]))
+                            commit = assert_assignment_commit(bug["worktree"], bug["baseSha"], bug, assignment["startingHead"])
                             if result["commitSha"] != commit["Head"]:
                                 raise BraceError("Fixer result commit SHA does not match worktree HEAD.")
                             bug["resultSha"] = commit["Head"]
@@ -486,9 +528,8 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                             if candidate != bug["baseSha"]:
                                 raise BraceError("Not-reproducible disposition modified the bug worktree.")
                     except Exception as error:
-                        if bug.get("resultSha"):
-                            reset_rejected_assignment(root, config, bug, "bug")
-                            bug["resultSha"] = None
+                        retry_head = reset_rejected_assignment(root, config, bug, "bug") if bug.get("resultSha") else None
+                        bug["resultSha"] = retry_head
                         bug.update(status="open", lastError=str(error))
                         continue
                     review_item = bug if bug.get("resultSha") else {**bug, "resultSha": candidate}
@@ -505,8 +546,7 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                                 return _handle_semantic(root, config, state, paths, tasks, bugs, "review", bug["bugId"], blocker, input_reader)
                         message = review_failure(reviews)
                         if bug.get("resultSha"):
-                            reset_rejected_assignment(root, config, bug, "bug")
-                            bug["resultSha"] = None
+                            bug["resultSha"] = reset_rejected_assignment(root, config, bug, "bug")
                         bug.update(status="open", lastError=message)
                         continue
                     require_approved_reviews(paths, review_item, "bug")
@@ -523,6 +563,9 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                     _checks(root, config, state, tasks, bugs)
                     require_approved_reviews(paths, bug, "bug")
                     state["integrationSha"] = ensure_integration_branch(root, config, state, known_merges(tasks, bugs))
+                    if requeue_stale_review(root, config, bug, "bug", state["integrationSha"]):
+                        save_ledger(bugs, paths)
+                        continue
                     merged = publish_assignment(root, bug["worktree"], config, bug, "bug")
                     bug.update(pullRequest=merged, status="verified", lastError=None)
                     state["integrationSha"] = merged["mergeSha"]
@@ -534,7 +577,7 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                         warning(str(error))
                 if not any(bug["status"] != "verified" for bug in bugs["bugs"]):
                     break
-                exhausted = [bug for bug in bugs["bugs"] if bug["status"] != "verified" and bug["attemptCount"] >= config["maximumBugAttempts"]]
+                exhausted = [bug for bug in bugs["bugs"] if bug["status"] != "verified" and attempt_limit_reached(bug, config["maximumBugAttempts"])]
                 if exhausted:
                     for bug in exhausted:
                         bug["status"] = "blocked"
@@ -547,15 +590,17 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                 base_sha = state["integrationSha"]
                 for bug in wave:
                     bug["branch"] = bug.get("branch") or f"worktree/{bug['bugId']}"
+                    if bug.get("lastError") == STALE_REVIEW_ERROR:
+                        requeue_stale_review(root, config, bug, "bug", base_sha)
                     bug["baseSha"] = bug.get("baseSha") or base_sha
-                    bug["worktree"] = str(new_worktree(root, config, bug["bugId"], bug["branch"], bug["baseSha"], bug.get("resultSha")))
-                    bug["attemptCount"] += 1
-                    bug["status"] = "active"
-                    write_immutable_json(attempt_path(paths, "assignment", bug["bugId"], bug["attemptCount"]), {
-                        "schemaVersion": "1.0", "identity": bug["bugId"], "attempt": bug["attemptCount"],
-                        "baseSha": bug["baseSha"], "startingHead": run_native("git", ["-C", bug["worktree"], "rev-parse", "HEAD"]).output.strip(),
-                        "createdAt": utc_now(), "item": bug,
-                    })
+                    bug["worktree"] = str(new_worktree(
+                        root, config, bug["bugId"], bug["branch"], bug["baseSha"], bug.get("resultSha"),
+                        allowed_diverged_head=bug.get("resultSha"),
+                    ))
+                    begin_assignment(
+                        paths, bug, "bug",
+                        run_native("git", ["-C", bug["worktree"], "rev-parse", "HEAD"]).output.strip(),
+                    )
                 bugs["status"] = "active"
                 save_ledger(bugs, paths)
                 with ThreadPoolExecutor(max_workers=len(wave)) as pool:

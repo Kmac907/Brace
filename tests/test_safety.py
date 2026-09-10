@@ -230,6 +230,18 @@ class SafetyTests(unittest.TestCase):
                 common.publish_assignment(".", worktree, self.provider_config(), item, "task")
             self.assertTrue(worktree.is_dir())
 
+    def test_stale_review_is_rejected_before_source_branch_push(self) -> None:
+        item = {"taskId": "TASK-0001", "title": "Task", "branch": "worktree/TASK-0001", "baseSha": "a" * 40, "resultSha": "b" * 40}
+        commands: list[list[str]] = []
+
+        def native(command, arguments=(), *args, **kwargs):
+            commands.append(list(arguments))
+            return common.NativeResult(0, "c" * 40 if "rev-parse" in arguments else "")
+
+        with patch.object(common, "run_native", side_effect=native), self.assertRaisesRegex(common.BraceError, "Integration base changed"):
+            common.publish_assignment(".", ".", self.provider_config(), item, "task")
+        self.assertFalse(any("push" in arguments for arguments in commands))
+
     def test_immutable_result_cannot_be_replaced(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "result.json"

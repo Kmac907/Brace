@@ -7,6 +7,7 @@ from typing import Any
 
 from .common import (
     BraceError,
+    STALE_REVIEW_ERROR,
     WorkflowLock,
     assert_assignment_commit,
     assert_graph,
@@ -16,6 +17,9 @@ from .common import (
     assert_state_identity,
     assert_target_drift,
     attempt_path,
+    attempt_limit_reached,
+    begin_assignment,
+    complete_pull_request,
     ensure_integration_branch,
     get_configuration,
     get_pull_request,
@@ -29,6 +33,8 @@ from .common import (
     read_attempt_result,
     read_json,
     recover_committed_attempt,
+    requeue_stale_review,
+    resumable_reconciliation_assignment,
     require_approved_reviews,
     reset_rejected_assignment,
     remove_audit_worktree,
@@ -44,7 +50,6 @@ from .common import (
     set_blocked,
     show_status,
     utc_now,
-    write_immutable_json,
     write_json_atomic,
     write_summary,
 )
@@ -128,28 +133,63 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 raise BraceError("Planning has not produced a buildable task queue.")
             if state["stage"] not in {"build", "blocked"}:
                 raise BraceError(f"The workflow is at stage {state['stage']}, not build.")
+            recoverable = [item for item in tasks["tasks"] if item["status"] in {"verified_ready", "submitted"} and item.get("resultSha")]
+            provider_records: dict[str, dict[str, Any] | None] = {}
+            recovered_merges: dict[str, dict[str, Any]] = {}
+            for task in recoverable:
+                if not has_matching_review_results(paths, task, "task"):
+                    continue
+                require_approved_reviews(paths, task, "task")
+                existing = get_pull_request(root, config, task["branch"], config["integrationBranch"], task["resultSha"])
+                provider_records[task["taskId"]] = existing
+                if existing and existing["state"] in {"merged", "completed"}:
+                    recovered_merges[task["taskId"]] = complete_pull_request(root, config, existing, task["resultSha"], task["baseSha"])
+            remote_sha = ensure_integration_branch(
+                root, config, state,
+                [*known_merges(tasks), *(merged["mergeSha"] for merged in recovered_merges.values())],
+            )
+
             state.update(stage="build", stageStatus="running", blocker=None)
             tasks["status"] = "active"
             save_state(state, paths)
 
             for task in (item for item in tasks["tasks"] if item["status"] == "active"):
                 record = read_attempt_result(paths, task["taskId"], task["attemptCount"]) or recover_committed_attempt(root, paths, task, "task")
+                if record is None:
+                    resume_worktree = resumable_reconciliation_assignment(root, config, paths, task, "task")
+                    if resume_worktree is not None:
+                        record = run_assignment(root, resume_worktree, task, "task", paths)
                 if record and record["succeeded"]:
                     task["status"] = "result_ready"
                 else:
                     task.update(status="pending", lastError="Interrupted before a durable result or commit was produced." if record is None else record["error"])
 
-            for task in (item for item in tasks["tasks"] if item["status"] in {"verified_ready", "submitted"} and item.get("resultSha")):
+            for task in recoverable:
                 if not has_matching_review_results(paths, task, "task"):
                     task.update(status="result_ready", lastError=None)
                     continue
-                require_approved_reviews(paths, task, "task")
-                existing = get_pull_request(root, config, task["branch"], config["integrationBranch"], task["resultSha"])
+                existing = provider_records[task["taskId"]]
+                if task["taskId"] in recovered_merges:
+                    merged = recovered_merges[task["taskId"]]
+                    task.update(pullRequest=merged, status="integrated", lastError=None)
+                    state["integrationSha"] = merged["mergeSha"]
+                    save_ledger(tasks, paths)
+                    save_state(state, paths)
+                    try:
+                        remove_merged_assignment(root, config, task["taskId"], task["branch"], merged)
+                    except Exception as error:
+                        warning(str(error))
+                    continue
+                if task["baseSha"] != remote_sha:
+                    if existing:
+                        task["pullRequest"] = existing
+                    requeue_stale_review(root, config, task, "task", remote_sha)
+                    continue
                 if existing:
-                    from .common import complete_pull_request
                     merged = complete_pull_request(root, config, existing, task["resultSha"], task["baseSha"])
                     task.update(pullRequest=merged, status="integrated", lastError=None)
                     state["integrationSha"] = merged["mergeSha"]
+                    remote_sha = merged["mergeSha"]
                     save_ledger(tasks, paths)
                     save_state(state, paths)
                     try:
@@ -189,15 +229,15 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     result = record["result"]
                     try:
                         _checks(root, config, state, tasks)
-                        commit = assert_assignment_commit(task["worktree"], task["baseSha"], task)
+                        assignment = read_json(attempt_path(paths, "assignment", task["taskId"], task["attemptCount"]))
+                        commit = assert_assignment_commit(task["worktree"], task["baseSha"], task, assignment["startingHead"])
                         if result["commitSha"] != commit["Head"]:
                             raise BraceError("Builder result commit SHA does not match the worktree HEAD.")
                         task["resultSha"] = commit["Head"]
                         save_ledger(tasks, paths)
                     except Exception as error:
-                        if task.get("resultSha"):
-                            reset_rejected_assignment(root, config, task, "task")
-                        task.update(status="pending", resultSha=None, lastError=str(error))
+                        retry_head = reset_rejected_assignment(root, config, task, "task") if task.get("resultSha") else None
+                        task.update(status="pending", resultSha=retry_head, lastError=str(error))
                         warning(f"{task['taskId']} attempt {task['attemptCount']} produced an invalid candidate: {error}")
                         continue
                     try:
@@ -219,8 +259,8 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                         if amendment_handled:
                             break
                         message = review_failure(reviews)
-                        reset_rejected_assignment(root, config, task, "task")
-                        task.update(status="pending", resultSha=None, lastError=message)
+                        retry_head = reset_rejected_assignment(root, config, task, "task")
+                        task.update(status="pending", resultSha=retry_head, lastError=message)
                         continue
                     require_approved_reviews(paths, task, "task")
                     task.update(status="verified_ready", lastError=None)
@@ -234,6 +274,9 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                         _checks(root, config, state, tasks)
                         require_approved_reviews(paths, task, "task")
                         state["integrationSha"] = ensure_integration_branch(root, config, state, known_merges(tasks))
+                        if requeue_stale_review(root, config, task, "task", state["integrationSha"]):
+                            save_ledger(tasks, paths)
+                            continue
                         info(f"PUBLISHING TASK PR: {task['taskId']} at {task['resultSha']}")
                         merged = publish_assignment(root, task["worktree"], config, task, "task")
                         success(f"TASK PR MERGED: {task['taskId']} -> {merged['mergeSha']}")
@@ -252,7 +295,7 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 if not any(task["status"] not in {"integrated", "superseded"} for task in tasks["tasks"]):
                     break
 
-                exhausted = [task for task in tasks["tasks"] if task["status"] not in {"integrated", "superseded"} and task["attemptCount"] >= config["maximumTaskAttempts"]]
+                exhausted = [task for task in tasks["tasks"] if task["status"] not in {"integrated", "superseded"} and attempt_limit_reached(task, config["maximumTaskAttempts"])]
                 if exhausted:
                     for task in exhausted:
                         task["status"] = "blocked"
@@ -265,15 +308,17 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 base_sha = state["integrationSha"]
                 for task in wave:
                     task["branch"] = task.get("branch") or f"worktree/{task['taskId']}"
+                    if task.get("lastError") == STALE_REVIEW_ERROR:
+                        requeue_stale_review(root, config, task, "task", base_sha)
                     task["baseSha"] = task.get("baseSha") or base_sha
-                    task["worktree"] = str(new_worktree(root, config, task["taskId"], task["branch"], task["baseSha"], task.get("resultSha")))
-                    task["attemptCount"] += 1
-                    task["status"] = "active"
-                    write_immutable_json(attempt_path(paths, "assignment", task["taskId"], task["attemptCount"]), {
-                        "schemaVersion": "1.0", "identity": task["taskId"], "attempt": task["attemptCount"],
-                        "baseSha": task["baseSha"], "startingHead": run_native("git", ["-C", task["worktree"], "rev-parse", "HEAD"]).output.strip(),
-                        "createdAt": utc_now(), "item": task,
-                    })
+                    task["worktree"] = str(new_worktree(
+                        root, config, task["taskId"], task["branch"], task["baseSha"], task.get("resultSha"),
+                        allowed_diverged_head=task.get("resultSha"),
+                    ))
+                    begin_assignment(
+                        paths, task, "task",
+                        run_native("git", ["-C", task["worktree"], "rev-parse", "HEAD"]).output.strip(),
+                    )
                 save_ledger(tasks, paths)
                 with status("Building " + ", ".join(task["taskId"] for task in wave)):
                     with ThreadPoolExecutor(max_workers=len(wave)) as pool:

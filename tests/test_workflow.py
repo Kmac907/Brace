@@ -443,6 +443,99 @@ class WorkflowTests(RepositoryTestCase):
             ("exit", "Running integration verification"),
         ])
 
+    def test_build_resumes_assignment_written_before_ledger_save(self) -> None:
+        root, _, _ = self.prepare()
+        self.plan(root)
+        paths = common.Paths(root)
+        real_save = build_loop.save_ledger
+
+        def interrupt_after_assignment(ledger, state_paths):
+            assignment = common.attempt_path(state_paths, "assignment", "TASK-0001", 1)
+            persisted = common.read_json(state_paths.tasks, state_paths.schemas / "tasks.schema.json")
+            if assignment.is_file() and ledger["tasks"][0]["attemptCount"] == 1 and persisted["tasks"][0]["attemptCount"] == 0:
+                raise RuntimeError("interrupted after task assignment")
+            real_save(ledger, state_paths)
+
+        with (
+            patch.object(build_loop, "assert_prerequisites"),
+            patch.object(build_loop, "save_ledger", side_effect=interrupt_after_assignment),
+            patch.object(build_loop, "run_assignment", side_effect=AssertionError("assignment ran before ledger save")),
+            self.assertRaisesRegex(RuntimeError, "interrupted after task assignment"),
+        ):
+            build_loop.run(root)
+
+        assignment_path = common.attempt_path(paths, "assignment", "TASK-0001", 1)
+        original = assignment_path.read_bytes()
+        self.assertEqual(common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")["tasks"][0]["attemptCount"], 0)
+
+        with (
+            patch.object(build_loop, "assert_prerequisites"),
+            patch.object(build_loop, "run_assignment", side_effect=RuntimeError("stop after resumed task assignment")),
+            self.assertRaisesRegex(RuntimeError, "stop after resumed task assignment"),
+        ):
+            build_loop.run(root)
+
+        task = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")["tasks"][0]
+        self.assertEqual((task["status"], task["attemptCount"]), ("active", 1))
+        self.assertEqual(assignment_path.read_bytes(), original)
+
+    def test_build_resumes_persisted_reconciliation_before_worker_start(self) -> None:
+        root, _, config = self.prepare()
+        self.plan(root)
+        paths = common.Paths(root)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        base = common.ensure_integration_branch(root, config, state)
+        task = tasks["tasks"][0]
+        task.update(status="pending", attemptCount=3, branch="worktree/TASK-0001", baseSha=base)
+        prior = self.git(root, "rev-parse", f"{base}^")
+        worktree = common.new_worktree(root, config, task["taskId"], task["branch"], prior)
+        (worktree / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+        self.git(worktree, "add", "candidate.txt")
+        self.git(worktree, "commit", "-m", "candidate")
+        task.update(
+            worktree=str(worktree), resultSha=self.git(worktree, "rev-parse", "HEAD"),
+            lastError=common.STALE_REVIEW_ERROR,
+        )
+        tasks["status"] = "active"
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        state.update(stage="build", stageStatus="running", integrationSha=base)
+        common.save_state(state, paths)
+        worker_calls = 0
+
+        def interrupted_worker(repository, worker_worktree, item, kind, state_paths):
+            nonlocal worker_calls
+            worker_calls += 1
+            if worker_calls == 1:
+                raise RuntimeError("reconciliation worker interrupted")
+            record = {
+                "schemaVersion": "1.0", "identity": item["taskId"], "attempt": item["attemptCount"],
+                "succeeded": False, "result": None, "error": "durable reconciliation failure",
+                "completedAt": common.utc_now(),
+            }
+            common.write_immutable_json(common.attempt_path(state_paths, "result", item["taskId"], item["attemptCount"]), record)
+            return record
+
+        with patch.object(build_loop, "assert_prerequisites"), patch.object(build_loop, "run_assignment", side_effect=interrupted_worker):
+            with self.assertRaisesRegex(RuntimeError, "reconciliation worker interrupted"):
+                build_loop.run(root)
+            assignment = common.attempt_path(paths, "assignment", task["taskId"], 4)
+            immutable = assignment.read_bytes()
+            ignored = worktree / ".codex" / "logs" / "resume-junk"
+            ignored.mkdir(parents=True)
+            (ignored.parent / "ignored.txt").write_text("local\n", encoding="utf-8")
+            with self.assertRaisesRegex(common.BraceError, "uncommitted changes"):
+                build_loop.run(root)
+            self.assertEqual(worker_calls, 1)
+            shutil.rmtree(ignored)
+            (ignored.parent / "ignored.txt").unlink()
+            ignored.parent.rmdir()
+            with self.assertRaisesRegex(common.BraceError, "Task attempts exhausted"):
+                build_loop.run(root)
+        resumed = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")["tasks"][0]
+        self.assertEqual((resumed["status"], resumed["attemptCount"], worker_calls), ("blocked", 4, 2))
+        self.assertEqual(assignment.read_bytes(), immutable)
+
     def test_rejected_task_and_bug_are_retried_from_their_base(self) -> None:
         root, _, config = self.prepare()
         self.plan(root)
@@ -592,3 +685,513 @@ class WorkflowTests(RepositoryTestCase):
         self.assertEqual(len(list(paths.results.glob("BUG-0001-attempt-*-review-*.json"))), 4)
         self.assertEqual(bug_publish.call_count, 1)
         self.assertEqual(self.git(root, "merge-base", rejected_shas["bug"], bug["resultSha"]), bug["baseSha"])
+
+    def test_parallel_task_and_bug_waves_requeue_stale_reviews(self) -> None:
+        root, _, config = self.prepare()
+        config.update(
+            maximumConcurrentBuilders=3, maximumConcurrentFixers=3,
+            maximumTaskAttempts=1, maximumBugAttempts=1,
+        )
+        paths = common.Paths(root)
+        common.write_text_atomic(paths.config, common.pretty_json(config))
+        self.git(root, "add", ".codex/workflow.json")
+        self.git(root, "commit", "-m", "configure bounded three-agent waves")
+        self.git(root, "push", "origin", "main")
+        planned = self.planner_result()
+        planned["tasks"][0].update(allowedPaths=["task-one.txt"], checks=["check task one"])
+        planned["tasks"].append({
+            **planned["tasks"][0], "taskId": "TASK-0028", "title": "Implement second feature",
+            "allowedPaths": ["task-two.txt"], "checks": ["check task two"],
+        })
+        planned["tasks"].append({
+            **planned["tasks"][0], "taskId": "TASK-0038", "title": "Implement third feature",
+            "allowedPaths": ["task-three.txt"], "checks": ["check task three"],
+        })
+        planned["summary"].update(taskCount=3, parallelizableTaskCount=3)
+        with patch.object(planning_loop, "assert_prerequisites"), patch.object(planning_loop, "invoke_role", return_value=planned):
+            planning_loop.run(root)
+
+        assignments: list[tuple[str, str, int, str, str]] = []
+        publications: list[tuple[str, str, str, str]] = []
+
+        def fake_assignment(repository, worktree, item, kind, state_paths):
+            path = Path(worktree)
+            identity = item["taskId" if kind == "task" else "bugId"]
+            filename = item["allowedPaths"][0]
+            starting_head = self.git(path, "rev-parse", "HEAD")
+            if item.get("resultSha"):
+                self.assertEqual(starting_head, item["resultSha"])
+                self.git(path, "merge", "--no-edit", item["baseSha"])
+            else:
+                self.assertEqual(starting_head, item["baseSha"])
+                (path / filename).write_text(f"{identity} attempt {item['attemptCount']}\n", encoding="utf-8")
+                self.git(path, "add", filename)
+                self.git(path, "commit", "-m", f"{identity} attempt {item['attemptCount']}")
+            head = self.git(path, "rev-parse", "HEAD")
+            assignments.append((kind, identity, item["attemptCount"], item["baseSha"], head))
+            result = {
+                "status": "completed" if kind == "task" else "fixed", "summary": "implemented",
+                "commitSha": head, "checks": [], "blocker": None,
+                "filesChanged" if kind == "task" else "changedFiles": [filename],
+            }
+            record = {
+                "schemaVersion": "1.0", "identity": identity, "attempt": item["attemptCount"],
+                "succeeded": True, "result": result, "error": None, "completedAt": common.utc_now(),
+            }
+            common.write_immutable_json(common.attempt_path(state_paths, "result", identity, item["attemptCount"]), record)
+            return record
+
+        def fake_reviews(repository, state_paths, item, kind):
+            return self.persist_reviews(state_paths, item, kind)
+
+        def fake_publish(repository, worktree, configuration, item, kind):
+            identity = item["taskId" if kind == "task" else "bugId"]
+            base = self.git(root, "rev-parse", f"origin/{configuration['integrationBranch']}")
+            self.assertEqual(item["baseSha"], base)
+            tree = self.git(root, "rev-parse", f"{item['resultSha']}^{{tree}}")
+            merge_sha = self.git(root, "commit-tree", tree, "-p", base, "-m", f"merge {identity}")
+            self.git(root, "push", "origin", f"{merge_sha}:refs/heads/{configuration['integrationBranch']}")
+            publications.append((kind, identity, base, merge_sha))
+            return {
+                "id": identity, "url": f"https://example.invalid/{identity}", "state": "merged",
+                "repository": "owner/repo", "head": item["branch"], "headSha": item["resultSha"],
+                "base": configuration["integrationBranch"], "baseSha": base, "mergeSha": merge_sha,
+            }
+
+        checks = ["check task one", "check task two", "check task three", "check bug one", "check bug two", "check bug three"]
+        verifier = {
+            "approved": True, "summary": "approved", "findings": [], "blocker": None,
+            "checks": [{"command": command, "result": "passed", "evidence": "passed"} for command in checks],
+        }
+        with (
+            patch.object(build_loop, "assert_prerequisites"),
+            patch.object(build_loop, "run_assignment", side_effect=fake_assignment),
+            patch.object(build_loop, "run_reviews", side_effect=fake_reviews),
+            patch.object(build_loop, "publish_assignment", side_effect=fake_publish),
+            patch.object(build_loop, "invoke_role", return_value=verifier),
+        ):
+            self.assertEqual(build_loop.run(root), "audit")
+
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        self.assertEqual([task["attemptCount"] for task in tasks["tasks"]], [1, 2, 2])
+        self.assertEqual(len(list(paths.results.glob("TASK-0001-attempt-*-review-*.json"))), 2)
+        self.assertEqual(len(list(paths.results.glob("TASK-0002-attempt-*-review-*.json"))), 4)
+        self.assertEqual(len(list(paths.results.glob("TASK-0003-attempt-*-review-*.json"))), 4)
+
+        findings = [{
+            "bugId": identity, "title": title, "severity": "high", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "output is wrong", "evidence": "reproduced",
+            "actualBehavior": "wrong", "requiredBehavior": "correct", "impact": "workflow blocks",
+            "requiredCorrection": "correct output", "acceptanceTest": check, "dependencies": [],
+            "allowedPaths": [filename], "exclusiveResources": [],
+        } for identity, title, filename, check in (
+            ("BUG-0018", "Fix first bug", "bug-one.txt", "check bug one"),
+            ("BUG-0028", "Fix second bug", "bug-two.txt", "check bug two"),
+            ("BUG-0038", "Fix third bug", "bug-three.txt", "check bug three"),
+        )]
+        audit_calls = 0
+
+        def fake_audit_role(repository, worktree, role, context, schema, sandbox):
+            nonlocal audit_calls
+            if role != "auditor":
+                return verifier
+            audit_calls += 1
+            return {
+                "status": "completed", "summary": "findings" if audit_calls == 1 else "clean",
+                "bugs": findings if audit_calls == 1 else [], "checks": [], "missingEvidence": [], "blocker": None,
+            }
+
+        def fake_new_pr(repository, configuration, head, base, expected_head, expected_base, title, body):
+            return {
+                "id": "project", "url": "https://example.invalid/project", "state": "open",
+                "repository": "owner/repo", "head": head, "headSha": expected_head,
+                "base": base, "baseSha": expected_base, "mergeSha": None,
+            }
+
+        def fake_complete(repository, configuration, pull_request, expected_head, expected_base):
+            self.assertEqual((expected_head, expected_base), (pull_request["headSha"], pull_request["baseSha"]))
+            self.git(root, "push", "origin", f"{expected_head}:refs/heads/{configuration['targetBranch']}")
+            return {**pull_request, "state": "merged", "mergeSha": expected_head}
+
+        with (
+            patch.object(audit_loop, "assert_prerequisites"),
+            patch.object(audit_loop, "run_assignment", side_effect=fake_assignment),
+            patch.object(audit_loop, "run_reviews", side_effect=fake_reviews),
+            patch.object(audit_loop, "publish_assignment", side_effect=fake_publish),
+            patch.object(audit_loop, "invoke_role", side_effect=fake_audit_role),
+            patch.object(audit_loop, "new_pull_request", side_effect=fake_new_pr),
+            patch.object(audit_loop, "complete_pull_request", side_effect=fake_complete),
+        ):
+            self.assertEqual(audit_loop.run(root), "complete")
+
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        self.assertEqual([bug["attemptCount"] for bug in bugs["bugs"]], [1, 2, 2])
+        self.assertEqual(len(list(paths.results.glob("BUG-0001-attempt-*-review-*.json"))), 2)
+        self.assertEqual(len(list(paths.results.glob("BUG-0002-attempt-*-review-*.json"))), 4)
+        self.assertEqual(len(list(paths.results.glob("BUG-0003-attempt-*-review-*.json"))), 4)
+        for kind in ("task", "bug"):
+            kind_publications = [record for record in publications if record[0] == kind]
+            initial = [record for record in assignments if record[0] == kind and record[2] == 1]
+            retries = [record for record in assignments if record[0] == kind and record[2] == 2]
+            self.assertEqual(len({record[3] for record in initial}), 1)
+            self.assertEqual([record[3] for record in retries], [record[3] for record in kind_publications[:2]])
+
+    def test_build_restart_requeues_open_pr_before_merge_validation(self) -> None:
+        root, _, config = self.prepare()
+        planned = self.planner_result()
+        planned["tasks"].append({
+            **planned["tasks"][0], "taskId": "TASK-0002", "title": "Merged sibling",
+            "allowedPaths": ["sibling.txt"],
+        })
+        planned["summary"].update(taskCount=2, parallelizableTaskCount=2)
+        with patch.object(planning_loop, "assert_prerequisites"), patch.object(planning_loop, "invoke_role", return_value=planned):
+            planning_loop.run(root)
+        paths = common.Paths(root)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        base = common.ensure_integration_branch(root, config, state)
+        task = tasks["tasks"][0]
+        task.update(
+            status="verified_ready", attemptCount=1, branch="worktree/TASK-0001", baseSha=base,
+        )
+        worktree = common.new_worktree(root, config, task["taskId"], task["branch"], base)
+        (worktree / "src").mkdir()
+        (worktree / "src" / "product.txt").write_text("candidate\n", encoding="utf-8")
+        self.git(worktree, "add", "src/product.txt")
+        self.git(worktree, "commit", "-m", "candidate")
+        task.update(worktree=str(worktree), resultSha=self.git(worktree, "rev-parse", "HEAD"))
+        self.persist_reviews(paths, task, "task")
+        tasks["status"] = "active"
+        tree = self.git(root, "rev-parse", f"{base}^{{tree}}")
+        advanced = self.git(root, "commit-tree", tree, "-p", base, "-m", "merged sibling")
+        self.git(root, "push", "origin", f"{advanced}:refs/heads/{config['integrationBranch']}")
+        sibling = tasks["tasks"][1]
+        sibling.update(
+            status="integrated", attemptCount=1, branch="worktree/TASK-0002", baseSha=base, resultSha=advanced,
+            pullRequest={
+                "id": "2", "url": "https://example.invalid/2", "state": "merged", "repository": "owner/repo",
+                "head": "worktree/TASK-0002", "headSha": advanced, "base": config["integrationBranch"],
+                "baseSha": base, "mergeSha": advanced,
+            },
+        )
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        state.update(stage="build", stageStatus="running", integrationSha=advanced)
+        common.save_state(state, paths)
+        open_pr = {
+            "id": "1", "url": "https://example.invalid/1", "state": "open", "repository": "owner/repo",
+            "head": task["branch"], "headSha": task["resultSha"], "base": config["integrationBranch"],
+            "baseSha": advanced, "mergeSha": None,
+        }
+
+        with (
+            patch.object(build_loop, "assert_prerequisites"),
+            patch.object(build_loop, "get_pull_request", return_value=open_pr),
+            patch.object(common, "complete_pull_request", side_effect=AssertionError("stale PR was completed")),
+            patch.object(build_loop, "select_ready_items", side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            build_loop.run(root)
+        persisted = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")["tasks"][0]
+        self.assertEqual((persisted["status"], persisted["baseSha"], persisted["resultSha"]), ("pending", advanced, task["resultSha"]))
+        self.assertEqual(persisted["pullRequest"]["id"], open_pr["id"])
+
+    def test_audit_resumes_assignment_written_before_ledger_save(self) -> None:
+        root, _, config = self.prepare()
+        self.plan(root)
+        paths = common.Paths(root)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        base = common.ensure_integration_branch(root, config, state)
+        task = tasks["tasks"][0]
+        task.update(
+            status="integrated", attemptCount=1, branch="worktree/TASK-0001", baseSha=base, resultSha=base,
+            pullRequest={
+                "id": "task", "url": "https://example.invalid/task", "state": "merged", "repository": "owner/repo",
+                "head": "worktree/TASK-0001", "headSha": base, "base": config["integrationBranch"],
+                "baseSha": base, "mergeSha": base,
+            },
+        )
+        tasks["status"] = "complete"
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        finding = {
+            "bugId": "BUG-0001", "title": "Fix candidate", "severity": "high", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "wrong", "evidence": "reproduced",
+            "actualBehavior": "wrong", "requiredBehavior": "correct", "impact": "workflow blocks",
+            "requiredCorrection": "correct it", "acceptanceTest": "check bug", "dependencies": [],
+            "allowedPaths": ["bug.txt"], "exclusiveResources": [],
+        }
+        bug = audit_loop.persisted_bug(finding)
+        bug_hash = common.definition_hash([bug], "bug")
+        bugs.update(status="ready", auditCycle=1, auditSha=base, definitionHash=bug_hash, bugs=[bug])
+        common.write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
+        state.update(stage="audit", stageStatus="not_started", integrationSha=base, bugDefinitionHash=bug_hash)
+        common.save_state(state, paths)
+        real_save = audit_loop.save_ledger
+
+        def interrupt(ledger, state_paths):
+            assignment = common.attempt_path(paths, "assignment", "BUG-0001", 1)
+            persisted = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+            if assignment.exists() and ledger["bugs"][0]["attemptCount"] == 1 and persisted["bugs"][0]["attemptCount"] == 0:
+                raise RuntimeError("interrupted after bug assignment")
+            real_save(ledger, state_paths)
+
+        with (
+            patch.object(audit_loop, "assert_prerequisites"),
+            patch.object(audit_loop, "save_ledger", side_effect=interrupt),
+            patch.object(audit_loop, "run_assignment", side_effect=AssertionError("fixer started before ledger save")),
+            self.assertRaisesRegex(RuntimeError, "interrupted after bug assignment"),
+        ):
+            audit_loop.run(root)
+        assignment_path = common.attempt_path(paths, "assignment", "BUG-0001", 1)
+        immutable = assignment_path.read_bytes()
+        self.assertEqual(common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")["bugs"][0]["attemptCount"], 0)
+
+        with (
+            patch.object(audit_loop, "assert_prerequisites"),
+            patch.object(audit_loop, "run_assignment", side_effect=RuntimeError("stop after resumed bug assignment")),
+            self.assertRaisesRegex(RuntimeError, "stop after resumed bug assignment"),
+        ):
+            audit_loop.run(root)
+        resumed = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")["bugs"][0]
+        self.assertEqual((resumed["status"], resumed["attemptCount"]), ("active", 1))
+        self.assertEqual(assignment_path.read_bytes(), immutable)
+
+    def test_audit_resumes_persisted_reconciliation_before_worker_start(self) -> None:
+        root, _, config = self.prepare()
+        self.plan(root)
+        paths = common.Paths(root)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        base = common.ensure_integration_branch(root, config, state)
+        task = tasks["tasks"][0]
+        task.update(
+            status="integrated", attemptCount=1, branch="worktree/TASK-0001", baseSha=base, resultSha=base,
+            pullRequest={
+                "id": "task", "url": "https://example.invalid/task", "state": "merged", "repository": "owner/repo",
+                "head": "worktree/TASK-0001", "headSha": base, "base": config["integrationBranch"],
+                "baseSha": base, "mergeSha": base,
+            },
+        )
+        tasks["status"] = "complete"
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        finding = {
+            "bugId": "BUG-0001", "title": "Fix candidate", "severity": "high", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "wrong", "evidence": "reproduced",
+            "actualBehavior": "wrong", "requiredBehavior": "correct", "impact": "workflow blocks",
+            "requiredCorrection": "correct it", "acceptanceTest": "check bug", "dependencies": [],
+            "allowedPaths": ["bug.txt"], "exclusiveResources": [],
+        }
+        bug = audit_loop.persisted_bug(finding)
+        bug.update(status="open", attemptCount=config["maximumBugAttempts"], branch="worktree/BUG-0001", baseSha=base)
+        prior = self.git(root, "rev-parse", f"{base}^")
+        worktree = common.new_worktree(root, config, bug["bugId"], bug["branch"], prior)
+        (worktree / "bug.txt").write_text("candidate\n", encoding="utf-8")
+        self.git(worktree, "add", "bug.txt")
+        self.git(worktree, "commit", "-m", "candidate")
+        bug.update(
+            worktree=str(worktree), resultSha=self.git(worktree, "rev-parse", "HEAD"),
+            lastError=common.STALE_REVIEW_ERROR,
+        )
+        bug_hash = common.definition_hash([bug], "bug")
+        bugs.update(status="active", auditCycle=1, auditSha=base, definitionHash=bug_hash, bugs=[bug])
+        common.write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
+        state.update(stage="audit", stageStatus="running", integrationSha=base, bugDefinitionHash=bug_hash)
+        common.save_state(state, paths)
+        worker_calls = 0
+
+        def interrupted_worker(repository, worker_worktree, item, kind, state_paths):
+            nonlocal worker_calls
+            worker_calls += 1
+            if worker_calls == 1:
+                raise RuntimeError("reconciliation worker interrupted")
+            record = {
+                "schemaVersion": "1.0", "identity": item["bugId"], "attempt": item["attemptCount"],
+                "succeeded": False, "result": None, "error": "durable reconciliation failure",
+                "completedAt": common.utc_now(),
+            }
+            common.write_immutable_json(common.attempt_path(state_paths, "result", item["bugId"], item["attemptCount"]), record)
+            return record
+
+        with patch.object(audit_loop, "assert_prerequisites"), patch.object(audit_loop, "run_assignment", side_effect=interrupted_worker):
+            with self.assertRaisesRegex(RuntimeError, "reconciliation worker interrupted"):
+                audit_loop.run(root)
+            assignment = common.attempt_path(paths, "assignment", bug["bugId"], config["maximumBugAttempts"] + 1)
+            immutable = assignment.read_bytes()
+            ignored = worktree / ".codex" / "logs" / "resume-junk"
+            ignored.mkdir(parents=True)
+            (ignored.parent / "ignored.txt").write_text("local\n", encoding="utf-8")
+            with self.assertRaisesRegex(common.BraceError, "uncommitted changes"):
+                audit_loop.run(root)
+            self.assertEqual(worker_calls, 1)
+            shutil.rmtree(ignored)
+            (ignored.parent / "ignored.txt").unlink()
+            ignored.parent.rmdir()
+            with self.assertRaisesRegex(common.BraceError, "Bug attempts exhausted"):
+                audit_loop.run(root)
+        resumed = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")["bugs"][0]
+        self.assertEqual(
+            (resumed["status"], resumed["attemptCount"], worker_calls),
+            ("blocked", config["maximumBugAttempts"] + 1, 2),
+        )
+        self.assertEqual(assignment.read_bytes(), immutable)
+
+    def test_build_rejects_unowned_remote_before_candidate_mutation(self) -> None:
+        root, _, config = self.prepare()
+        self.plan(root)
+        paths = common.Paths(root)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        base = common.ensure_integration_branch(root, config, state)
+        task = tasks["tasks"][0]
+        task.update(status="verified_ready", attemptCount=1, branch="worktree/TASK-0001", baseSha=base)
+        worktree = common.new_worktree(root, config, task["taskId"], task["branch"], base)
+        (worktree / "src").mkdir()
+        (worktree / "src" / "product.txt").write_text("candidate\n", encoding="utf-8")
+        self.git(worktree, "add", "src/product.txt")
+        self.git(worktree, "commit", "-m", "candidate")
+        task.update(worktree=str(worktree), resultSha=self.git(worktree, "rev-parse", "HEAD"))
+        self.persist_reviews(paths, task, "task")
+        tasks["status"] = "active"
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        state.update(stage="build", stageStatus="running", integrationSha=base)
+        common.save_state(state, paths)
+        before = common.pretty_json(task)
+        candidate = task["resultSha"]
+
+        tree = self.git(root, "rev-parse", f"{base}^{{tree}}")
+        unowned = self.git(root, "commit-tree", tree, "-p", base, "-m", "unowned remote commit")
+        self.git(root, "push", "origin", f"{unowned}:refs/heads/{config['integrationBranch']}")
+        with (
+            patch.object(build_loop, "assert_prerequisites"),
+            patch.object(build_loop, "get_pull_request", return_value=None),
+            self.assertRaisesRegex(common.BraceError, "unowned commits"),
+        ):
+            build_loop.run(root)
+
+        persisted = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")["tasks"][0]
+        self.assertEqual(common.pretty_json(persisted), before)
+        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), candidate)
+
+    def test_audit_restart_requeues_open_pr_before_merge_validation(self) -> None:
+        root, _, config = self.prepare()
+        self.plan(root)
+        paths = common.Paths(root)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        base = common.ensure_integration_branch(root, config, state)
+        tree = self.git(root, "rev-parse", f"{base}^{{tree}}")
+        advanced = self.git(root, "commit-tree", tree, "-p", base, "-m", "merged sibling")
+        self.git(root, "push", "origin", f"{advanced}:refs/heads/{config['integrationBranch']}")
+        tasks["tasks"][0].update(
+            status="integrated", attemptCount=1, branch="worktree/TASK-0001", baseSha=base, resultSha=advanced,
+            pullRequest={
+                "id": "task", "url": "https://example.invalid/task", "state": "merged", "repository": "owner/repo",
+                "head": "worktree/TASK-0001", "headSha": advanced, "base": config["integrationBranch"],
+                "baseSha": base, "mergeSha": advanced,
+            },
+        )
+        tasks["status"] = "complete"
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        finding = {
+            "bugId": "BUG-0001", "title": "Fix candidate", "severity": "high", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "wrong", "evidence": "reproduced",
+            "actualBehavior": "wrong", "requiredBehavior": "correct", "impact": "workflow blocks",
+            "requiredCorrection": "correct it", "acceptanceTest": "check bug", "dependencies": [],
+            "allowedPaths": ["bug.txt"], "exclusiveResources": [],
+        }
+        bug = audit_loop.persisted_bug(finding)
+        bug.update(status="ready_to_publish", disposition="fixed", attemptCount=1, branch="worktree/BUG-0001", baseSha=base)
+        worktree = common.new_worktree(root, config, bug["bugId"], bug["branch"], base)
+        (worktree / "bug.txt").write_text("candidate\n", encoding="utf-8")
+        self.git(worktree, "add", "bug.txt")
+        self.git(worktree, "commit", "-m", "candidate")
+        bug.update(worktree=str(worktree), resultSha=self.git(worktree, "rev-parse", "HEAD"))
+        self.persist_reviews(paths, bug, "bug")
+        bugs.update(
+            status="active", auditCycle=1, auditSha=advanced, bugs=[bug],
+            definitionHash=common.definition_hash([bug], "bug"),
+        )
+        common.write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
+        state.update(
+            stage="audit", stageStatus="running", integrationSha=advanced,
+            bugDefinitionHash=bugs["definitionHash"],
+        )
+        common.save_state(state, paths)
+        open_pr = {
+            "id": "1", "url": "https://example.invalid/1", "state": "open", "repository": "owner/repo",
+            "head": bug["branch"], "headSha": bug["resultSha"], "base": config["integrationBranch"],
+            "baseSha": advanced, "mergeSha": None,
+        }
+
+        with (
+            patch.object(audit_loop, "assert_prerequisites"),
+            patch.object(audit_loop, "get_pull_request", return_value=open_pr),
+            patch.object(audit_loop, "complete_pull_request", side_effect=AssertionError("stale PR was completed")),
+            patch.object(audit_loop, "select_ready_items", side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            audit_loop.run(root)
+        persisted = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")["bugs"][0]
+        self.assertEqual((persisted["status"], persisted["baseSha"], persisted["resultSha"]), ("open", advanced, bug["resultSha"]))
+        self.assertEqual(persisted["pullRequest"]["id"], open_pr["id"])
+
+    def test_audit_rejects_unowned_remote_before_candidate_mutation(self) -> None:
+        root, _, config = self.prepare()
+        self.plan(root)
+        paths = common.Paths(root)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        base = common.ensure_integration_branch(root, config, state)
+        task = tasks["tasks"][0]
+        task.update(
+            status="integrated", attemptCount=1, branch="worktree/TASK-0001", baseSha=base, resultSha=base,
+            pullRequest={
+                "id": "task", "url": "https://example.invalid/task", "state": "merged", "repository": "owner/repo",
+                "head": "worktree/TASK-0001", "headSha": base, "base": config["integrationBranch"],
+                "baseSha": base, "mergeSha": base,
+            },
+        )
+        tasks["status"] = "complete"
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        finding = {
+            "bugId": "BUG-0001", "title": "Fix candidate", "severity": "high", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "wrong", "evidence": "reproduced",
+            "actualBehavior": "wrong", "requiredBehavior": "correct", "impact": "workflow blocks",
+            "requiredCorrection": "correct it", "acceptanceTest": "check bug", "dependencies": [],
+            "allowedPaths": ["bug.txt"], "exclusiveResources": [],
+        }
+        bug = audit_loop.persisted_bug(finding)
+        bug.update(status="ready_to_publish", disposition="fixed", attemptCount=1, branch="worktree/BUG-0001", baseSha=base)
+        worktree = common.new_worktree(root, config, bug["bugId"], bug["branch"], base)
+        (worktree / "bug.txt").write_text("candidate\n", encoding="utf-8")
+        self.git(worktree, "add", "bug.txt")
+        self.git(worktree, "commit", "-m", "candidate")
+        bug.update(worktree=str(worktree), resultSha=self.git(worktree, "rev-parse", "HEAD"))
+        self.persist_reviews(paths, bug, "bug")
+        bugs.update(
+            status="active", auditCycle=1, auditSha=base, bugs=[bug],
+            definitionHash=common.definition_hash([bug], "bug"),
+        )
+        common.write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
+        state.update(stage="audit", stageStatus="running", integrationSha=base, bugDefinitionHash=bugs["definitionHash"])
+        common.save_state(state, paths)
+        before = common.pretty_json(bug)
+        candidate = bug["resultSha"]
+
+        tree = self.git(root, "rev-parse", f"{base}^{{tree}}")
+        unowned = self.git(root, "commit-tree", tree, "-p", base, "-m", "unowned remote commit")
+        self.git(root, "push", "origin", f"{unowned}:refs/heads/{config['integrationBranch']}")
+        with (
+            patch.object(audit_loop, "assert_prerequisites"),
+            patch.object(audit_loop, "get_pull_request", return_value=None),
+            self.assertRaisesRegex(common.BraceError, "unowned commits"),
+        ):
+            audit_loop.run(root)
+
+        persisted = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")["bugs"][0]
+        self.assertEqual(common.pretty_json(persisted), before)
+        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), candidate)

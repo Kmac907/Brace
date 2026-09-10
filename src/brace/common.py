@@ -26,6 +26,7 @@ MAXIMUM_LOG_BYTES = 2 * 1024 * 1024
 AGENT_HEARTBEAT_SECONDS = 30
 STATUS_SNAPSHOT_ATTEMPTS = 20
 STATUS_SNAPSHOT_RETRY_SECONDS = 0.05
+STALE_REVIEW_ERROR = "Integration advanced after review; a fresh implementation and reviews are required."
 REVIEW_SUPPORT_PATHS = {
     ".codex/prompts/reviewer.md",
     ".codex/schemas/closure-record.schema.json",
@@ -614,7 +615,94 @@ def write_immutable_json(path: str | Path, value: Any) -> None:
 
 def read_attempt_result(paths: Paths, identity: str, attempt: int) -> dict[str, Any] | None:
     path = attempt_path(paths, "result", identity, attempt)
-    return read_json(path) if path.is_file() else None
+    if not path.is_file():
+        return None
+    record = read_json(path)
+    if not isinstance(record, dict) or record.get("schemaVersion") != "1.0" or record.get("identity") != identity or record.get("attempt") != attempt:
+        raise BraceError(f"Immutable attempt result does not match {identity} attempt {attempt}.")
+    return record
+
+
+def _has_matching_assignment(paths: Paths, item: dict[str, Any], kind: str, starting_head: str, required: bool) -> bool:
+    identity = item["taskId" if kind == "task" else "bugId"]
+    attempt = int(item["attemptCount"])
+    assert_review_shas(item["baseSha"], starting_head)
+    expected = {
+        "schemaVersion": "1.0", "identity": identity, "attempt": attempt,
+        "baseSha": item["baseSha"], "startingHead": starting_head, "item": item,
+    }
+    path = attempt_path(paths, "assignment", identity, attempt)
+    result_history = list(paths.results.glob(f"{identity}-attempt-{attempt:03d}*.json"))
+    later_assignments = []
+    for candidate in paths.assignments.glob(f"{identity}-attempt-*.json"):
+        match = re.fullmatch(rf"{re.escape(identity)}-attempt-(\d+)", candidate.stem)
+        if not match or int(match.group(1)) > attempt:
+            later_assignments.append(candidate)
+    if result_history or later_assignments:
+        raise BraceError(f"Assignment history is ahead of the {identity} ledger at attempt {attempt}.")
+    if not path.is_file():
+        if required:
+            raise BraceError(f"Active reconciliation assignment is missing: {identity} attempt {attempt}.")
+        return False
+    record = read_json(path)
+    created = record.get("createdAt") if isinstance(record, dict) else None
+    try:
+        valid_created = bool(
+            isinstance(created, str)
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", created)
+            and datetime.fromisoformat(created.replace("Z", "+00:00")).tzinfo is not None
+        )
+    except ValueError:
+        valid_created = False
+    comparable = {name: value for name, value in record.items() if name != "createdAt"} if isinstance(record, dict) else None
+    if not isinstance(record, dict) or set(record) != {*expected, "createdAt"} or comparable != expected or not valid_created:
+        raise BraceError(f"Immutable assignment record does not match {identity} attempt {attempt}.")
+    return True
+
+
+def begin_assignment(paths: Paths, item: dict[str, Any], kind: str, starting_head: str) -> None:
+    active = {**item, "attemptCount": int(item["attemptCount"]) + 1, "status": "active"}
+    if not _has_matching_assignment(paths, active, kind, starting_head, False):
+        identity = active["taskId" if kind == "task" else "bugId"]
+        attempt = active["attemptCount"]
+        write_immutable_json(attempt_path(paths, "assignment", identity, attempt), {
+            "schemaVersion": "1.0", "identity": identity, "attempt": attempt,
+            "baseSha": active["baseSha"], "startingHead": starting_head,
+            "createdAt": utc_now(), "item": active,
+        })
+    item.update(active)
+
+
+def resumable_reconciliation_assignment(
+    root: str | Path,
+    config: dict[str, Any],
+    paths: Paths,
+    item: dict[str, Any],
+    kind: str,
+) -> Path | None:
+    starting_head = item.get("resultSha")
+    if item.get("lastError") != STALE_REVIEW_ERROR or not starting_head:
+        return None
+    identity = item["taskId" if kind == "task" else "bugId"]
+    expected = _recorded_assignment_worktree(root, config, item, identity)
+    if not expected.is_dir() or not _worktree_registered(root, expected):
+        raise BraceError(f"Active reconciliation worktree is not registered at its exact owned path: {identity}.")
+    worktree = new_worktree(
+        root, config, identity, item["branch"], item["baseSha"],
+        expected_head=starting_head, allowed_diverged_head=starting_head,
+    )
+    _has_matching_assignment(paths, item, kind, starting_head, True)
+    return worktree
+
+
+def attempt_limit_reached(item: dict[str, Any], maximum: int) -> bool:
+    attempts = int(item["attemptCount"])
+    fresh_reconciliation_due = (
+        attempts == maximum
+        and item.get("lastError") == STALE_REVIEW_ERROR
+        and bool(item.get("resultSha"))
+    )
+    return attempts >= maximum and not fresh_reconciliation_due
 
 
 def review_path(paths: Paths, identity: str, attempt: int, reviewer: int) -> Path:
@@ -676,6 +764,14 @@ def worktree_base(root: str | Path, config: dict[str, Any]) -> Path:
     parent = Path(configured).resolve() if configured else Path(tempfile.gettempdir()) / "brace"
     repository_id = hashlib.sha256(str(Path(root).resolve()).upper().encode("utf-8")).hexdigest()[:16]
     return (parent / repository_id).resolve()
+
+
+def assignment_worktree_path(root: str | Path, config: dict[str, Any], identity: str) -> Path:
+    base = worktree_base(root, config)
+    path = (base / identity).resolve()
+    if path.parent != base or path.name != identity:
+        raise BraceError(f"Refusing unexpected assignment worktree path: {path}")
+    return path
 
 
 def reset_completed_workflow(root: str | Path, config: dict[str, Any], state: dict[str, Any]) -> None:
@@ -870,6 +966,9 @@ def select_ready_items(items: list[dict[str, Any]], kind: str, maximum: int) -> 
     key, pending, complete = ("taskId", "pending", "integrated") if kind == "task" else ("bugId", "open", "verified")
     by_id = {item[key]: item for item in items}
     ready = [item for item in items if item["status"] == pending and all(by_id[dep]["status"] == complete for dep in item["dependencies"])]
+    stale = [item for item in ready if item.get("lastError") == STALE_REVIEW_ERROR or item.get("resultSha")]
+    if stale:
+        ready, maximum = stale, 1
     selected: list[dict[str, Any]] = []
     for candidate in ready:
         if len(selected) >= maximum:
@@ -890,23 +989,43 @@ def remove_empty_worktree_containers(root: str | Path, config: dict[str, Any]) -
             configured_root.rmdir()
 
 
-def new_worktree(root: str | Path, config: dict[str, Any], identity: str, branch: str, base_reference: str, expected_head: str | None = None) -> Path:
+def _worktree_contains_changes(path: Path) -> bool:
+    if run_native("git", ["-C", path, "status", "--porcelain", "--untracked-files=all", "--ignored"]).output.strip():
+        return True
+    tracked_directories: set[str] = set()
+    for tracked in run_native("git", ["-C", path, "ls-files", "-z"]).output.split("\0"):
+        if tracked:
+            parts = tracked.split("/")
+            tracked_directories.update("/".join(parts[:depth]) for depth in range(1, len(parts) + 1))
+    return any(entry.is_dir() and entry.relative_to(path).as_posix() not in tracked_directories for entry in path.rglob("*"))
+
+
+def new_worktree(
+    root: str | Path,
+    config: dict[str, Any],
+    identity: str,
+    branch: str,
+    base_reference: str,
+    expected_head: str | None = None,
+    allowed_diverged_head: str | None = None,
+) -> Path:
     if not re.fullmatch(r"(?:TASK|BUG|AMEND)-\d{4}", identity):
         raise BraceError(f"Invalid worktree identity: {identity}")
     if branch != f"worktree/{identity}":
         raise BraceError(f"Unexpected branch for {identity}: {branch}")
     base = worktree_base(root, config)
     base.mkdir(parents=True, exist_ok=True)
-    path = (base / identity).resolve()
+    path = assignment_worktree_path(root, config, identity)
     if path.is_dir():
         actual_root = Path(run_native("git", ["-C", path, "rev-parse", "--show-toplevel"]).output.strip()).resolve()
         actual_branch = run_native("git", ["-C", path, "branch", "--show-current"]).output.strip()
         if actual_root != path or actual_branch != branch:
             raise BraceError(f"Existing worktree does not match {identity}: {path}")
-        if run_native("git", ["-C", path, "status", "--porcelain", "--untracked-files=all"]).output.strip():
+        if _worktree_contains_changes(path):
             raise BraceError(f"Interrupted worktree contains uncommitted changes: {identity}")
         head = run_native("git", ["-C", path, "rev-parse", "HEAD"]).output.strip()
-        if run_native("git", ["-C", path, "merge-base", "--is-ancestor", base_reference, head], allowed_exit_codes=(0, 1)).returncode != 0:
+        descends = run_native("git", ["-C", path, "merge-base", "--is-ancestor", base_reference, head], allowed_exit_codes=(0, 1)).returncode == 0
+        if not descends and allowed_diverged_head != head:
             raise BraceError(f"Existing worktree branch does not descend from its recorded base: {identity}")
         if expected_head and head != expected_head:
             raise BraceError(f"Existing worktree HEAD differs from its recorded result: {identity}")
@@ -915,7 +1034,8 @@ def new_worktree(root: str | Path, config: dict[str, Any], identity: str, branch
     args = ["-C", root, "worktree", "add"] + (["--", path, branch] if exists else ["-b", branch, "--", path, base_reference])
     run_native("git", args)
     head = run_native("git", ["-C", path, "rev-parse", "HEAD"]).output.strip()
-    if exists and run_native("git", ["-C", path, "merge-base", "--is-ancestor", base_reference, head], allowed_exit_codes=(0, 1)).returncode != 0:
+    descends = run_native("git", ["-C", path, "merge-base", "--is-ancestor", base_reference, head], allowed_exit_codes=(0, 1)).returncode == 0
+    if exists and not descends and allowed_diverged_head != head:
         raise BraceError(f"Existing branch does not descend from its recorded base: {identity}")
     if expected_head and head != expected_head:
         raise BraceError(f"Existing branch HEAD differs from its recorded result: {identity}")
@@ -957,15 +1077,7 @@ def assert_read_only_worktree(worktree: str | Path, candidate_sha: str) -> None:
         raise BraceError(f"Read-only worktree is not detached: {path}")
     if run_native("git", ["-C", path, "rev-parse", "HEAD"]).output.strip() != candidate_sha:
         raise BraceError(f"Read-only worktree HEAD changed: {path}")
-    dirty = run_native("git", ["-C", path, "status", "--porcelain", "--untracked-files=all", "--ignored"]).output.strip()
-    tracked_directories: set[str] = set()
-    for tracked in run_native("git", ["-C", path, "ls-files", "-z"]).output.split("\0"):
-        if not tracked:
-            continue
-        parts = tracked.split("/")
-        tracked_directories.update("/".join(parts[:depth]) for depth in range(1, len(parts) + 1))
-    unexpected_directory = next((entry for entry in path.rglob("*") if entry.is_dir() and entry.relative_to(path).as_posix() not in tracked_directories), None)
-    if dirty or unexpected_directory:
+    if _worktree_contains_changes(path):
         raise BraceError(f"Read-only worktree contains changes: {path}")
 
 
@@ -1091,30 +1203,92 @@ def remove_review_worktree(root: str | Path, config: dict[str, Any], paths: Path
     remove_empty_worktree_containers(root, config)
 
 
-def reset_rejected_assignment(root: str | Path, config: dict[str, Any], item: dict[str, Any], kind: str) -> None:
+def _recorded_assignment_worktree(root: str | Path, config: dict[str, Any], item: dict[str, Any], identity: str) -> Path:
+    path = assignment_worktree_path(root, config, identity)
+    recorded = item.get("worktree")
+    if not recorded or Path(recorded).resolve() != path:
+        raise BraceError(f"Refusing to mutate {identity}: its recorded worktree is not the exact owned path.")
+    return path
+
+
+def reset_rejected_assignment(root: str | Path, config: dict[str, Any], item: dict[str, Any], kind: str) -> str | None:
     identity = item["taskId" if kind == "task" else "bugId"]
-    path = new_worktree(root, config, identity, item["branch"], item["baseSha"])
+    starting_head = item["baseSha"]
+    assignment = attempt_path(Paths(root), "assignment", identity, int(item["attemptCount"]))
+    if assignment.is_file():
+        record = read_json(assignment)
+        if record.get("identity") != identity or record.get("attempt") != item["attemptCount"] or record.get("baseSha") != item["baseSha"]:
+            raise BraceError(f"Assignment record does not match {identity} attempt {item['attemptCount']}.")
+        starting_head = record.get("startingHead")
+    assert_review_shas(starting_head, starting_head)
+    expected_path = _recorded_assignment_worktree(root, config, item, identity)
+    path = new_worktree(
+        root, config, identity, item["branch"], item["baseSha"],
+        allowed_diverged_head=starting_head if starting_head != item["baseSha"] else None,
+    )
+    if path != expected_path:
+        raise BraceError(f"Refusing to reset an unexpected worktree for {identity}.")
     head = run_native("git", ["-C", path, "rev-parse", "HEAD"]).output.strip()
-    if head not in {item["baseSha"], item["resultSha"]}:
+    allowed = head in {item["baseSha"], item.get("resultSha"), starting_head}
+    if not allowed and starting_head != item["baseSha"]:
+        parents = run_native("git", ["-C", path, "rev-list", "--parents", "-n", "1", head]).output.split()
+        allowed = parents[1:] == [starting_head, item["baseSha"]]
+    if not allowed:
         raise BraceError(f"Rejected assignment HEAD differs from its recorded result: {identity}")
-    if head != item["baseSha"]:
-        run_native("git", ["-C", path, "reset", "--hard", item["baseSha"]])
+    target = starting_head if starting_head != item["baseSha"] else item["baseSha"]
+    if head != target:
+        run_native("git", ["-C", path, "reset", "--hard", target])
+    return target if target != item["baseSha"] else None
+
+
+def requeue_stale_review(root: str | Path, config: dict[str, Any], item: dict[str, Any], kind: str, integration_sha: str) -> bool:
+    if item["baseSha"] == integration_sha:
+        return False
+    identity = item["taskId" if kind == "task" else "bugId"]
+    expected_path = _recorded_assignment_worktree(root, config, item, identity)
+    path = new_worktree(
+        root, config, identity, item["branch"], item["baseSha"],
+        allowed_diverged_head=item["resultSha"],
+    )
+    if path != expected_path:
+        raise BraceError(f"Refusing to reconcile an unexpected worktree for {identity}.")
+    head = run_native("git", ["-C", path, "rev-parse", "HEAD"]).output.strip()
+    if head not in {item["baseSha"], item["resultSha"], integration_sha}:
+        raise BraceError(f"Stale reviewed assignment HEAD differs from its recorded state: {identity}")
+    if run_native("git", ["-C", root, "merge-base", "--is-ancestor", item["baseSha"], integration_sha], allowed_exit_codes=(0, 1)).returncode != 0:
+        raise BraceError(f"Current integration does not descend from the reviewed base of {identity}.")
+    if head != item["resultSha"]:
+        run_native("git", ["-C", path, "cat-file", "-e", f"{item['resultSha']}^{{commit}}"])
+        run_native("git", ["-C", path, "reset", "--hard", item["resultSha"]])
+    item.update(
+        status="pending" if kind == "task" else "open", baseSha=integration_sha,
+        lastError=STALE_REVIEW_ERROR,
+    )
+    if kind == "bug":
+        item["disposition"] = None
+    return True
 
 
 def _matches_path(path: str, pattern: str) -> bool:
     return fnmatch.fnmatchcase(path.lower(), pattern.replace("\\", "/").lower())
 
 
-def assert_assignment_commit(worktree: str | Path, base_sha: str, item: dict[str, Any]) -> dict[str, Any]:
+def assert_assignment_commit(worktree: str | Path, base_sha: str, item: dict[str, Any], starting_head: str | None = None) -> dict[str, Any]:
     if run_native("git", ["-C", worktree, "status", "--porcelain", "--untracked-files=all"]).output.strip():
         raise BraceError("Agent worktree is not clean after its reported commit.")
     head = run_native("git", ["-C", worktree, "rev-parse", "HEAD"]).output.strip()
     ancestor = run_native("git", ["-C", worktree, "merge-base", "--is-ancestor", base_sha, head], allowed_exit_codes=(0, 1)).returncode == 0
     if not ancestor or head == base_sha:
         raise BraceError("Agent did not create a descendant commit for the assignment.")
-    count = int(run_native("git", ["-C", worktree, "rev-list", "--count", f"{base_sha}..{head}"]).output.strip())
-    if count != 1:
-        raise BraceError(f"Agent assignment must contain exactly one commit; found {count}.")
+    previous_candidate = starting_head if starting_head and starting_head != base_sha else None
+    if previous_candidate:
+        parents = run_native("git", ["-C", worktree, "rev-list", "--parents", "-n", "1", head]).output.split()
+        if parents[1:] != [previous_candidate, base_sha]:
+            raise BraceError("Reconciliation assignment must produce one merge commit from the preserved candidate and current integration base.")
+    else:
+        count = int(run_native("git", ["-C", worktree, "rev-list", "--count", f"{base_sha}..{head}"]).output.strip())
+        if count != 1:
+            raise BraceError(f"Agent assignment must contain exactly one commit; found {count}.")
     changed = run_native("git", ["-C", worktree, "diff", "--name-only", f"{base_sha}..{head}"]).lines
     for changed_path in changed:
         normalized = changed_path.replace("\\", "/")
@@ -1136,6 +1310,15 @@ def recover_committed_attempt(root: str | Path, paths: Paths, item: dict[str, An
         raise BraceError(f"Interrupted worktree contains uncommitted changes: {identity}")
     head = run_native("git", ["-C", worktree, "rev-parse", "HEAD"]).output.strip()
     if run_native("git", ["-C", worktree, "merge-base", "--is-ancestor", item["baseSha"], head], allowed_exit_codes=(0, 1)).returncode != 0:
+        assignment_file = attempt_path(paths, "assignment", identity, int(item["attemptCount"]))
+        assignment = read_json(assignment_file) if assignment_file.is_file() else {}
+        if (
+            assignment.get("identity") == identity
+            and assignment.get("attempt") == item["attemptCount"]
+            and assignment.get("baseSha") == item["baseSha"]
+            and assignment.get("startingHead") == head == item.get("resultSha")
+        ):
+            return None
         raise BraceError(f"Interrupted worktree does not descend from its recorded base: {identity}")
     if head == item["baseSha"]:
         return None
@@ -1152,6 +1335,11 @@ def recover_committed_attempt(root: str | Path, paths: Paths, item: dict[str, An
     record = {"schemaVersion": "1.0", "identity": identity, "attempt": int(item["attemptCount"]), "succeeded": True, "result": result, "error": None, "completedAt": utc_now()}
     write_immutable_json(attempt_path(paths, "result", identity, int(item["attemptCount"])), record)
     return record
+
+
+def remote_integration_sha(root: str | Path, config: dict[str, Any]) -> str:
+    run_native("git", ["-C", root, "fetch", config["remote"], "--prune"])
+    return run_native("git", ["-C", root, "rev-parse", f"{config['remote']}/{config['integrationBranch']}"]).output.strip()
 
 
 def ensure_integration_branch(root: str | Path, config: dict[str, Any], state: dict[str, Any], allowed_merge_shas: Iterable[str] = ()) -> str:
@@ -1335,11 +1523,10 @@ def complete_pull_request(root: str | Path, config: dict[str, Any], pull_request
 def publish_assignment(root: str | Path, worktree: str | Path, config: dict[str, Any], item: dict[str, Any], kind: str) -> dict[str, Any]:
     identity = item["taskId" if kind == "task" else "bugId"]
     branch = item["branch"]
-    run_native("git", ["-C", worktree, "push", "--set-upstream", config["remote"], branch])
-    run_native("git", ["-C", root, "fetch", config["remote"], "--prune"])
-    base_sha = run_native("git", ["-C", root, "rev-parse", f"{config['remote']}/{config['integrationBranch']}"]).output.strip()
+    base_sha = remote_integration_sha(root, config)
     if base_sha != item["baseSha"]:
         raise BraceError(f"Integration base changed after review of {identity}.")
+    run_native("git", ["-C", worktree, "push", "--set-upstream", config["remote"], branch])
     pull_request = new_pull_request(root, config, branch, config["integrationBranch"], item["resultSha"], item["baseSha"], f"{identity} {item['title']}", f"Brace {kind} {identity}")
     return complete_pull_request(root, config, pull_request, item["resultSha"], item["baseSha"])
 
@@ -1683,8 +1870,15 @@ def run_assignment(root: str | Path, worktree: str | Path, item: dict[str, Any],
     identity = item["taskId" if kind == "task" else "bugId"]
     role, schema, label = ("builder", "builder-result.schema.json", "Task") if kind == "task" else ("bug-fixer", "fixer-result.schema.json", "Bug")
     try:
+        reconciliation = ""
+        if item.get("resultSha"):
+            reconciliation = (
+                f"\nReconciliation retry: preserve candidate {item['resultSha']} as the first parent and merge exact "
+                f"integration base {item['baseSha']} as the second parent. Do not reset, rebase, force-push, or rewrite "
+                "history. Resolve only in-scope conflicts, then return the single resulting merge commit for fresh review.\n"
+            )
         result = invoke_role(
-            root, worktree, role, f"{label} assignment:\n{pretty_json(item)}", schema, "workspace-write",
+            root, worktree, role, f"{label} assignment:{reconciliation}\n{pretty_json(item)}", schema, "workspace-write",
             work_identity=identity, attempt=int(item["attemptCount"]),
         )
         record = {"schemaVersion": "1.0", "identity": identity, "attempt": int(item["attemptCount"]), "succeeded": True, "result": result, "error": None, "completedAt": utc_now()}
