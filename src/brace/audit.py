@@ -40,6 +40,7 @@ from .common import (
     read_json,
     recover_committed_attempt,
     requeue_stale_review,
+    remote_integration_sha,
     require_approved_reviews,
     reset_rejected_assignment,
     remove_audit_worktree,
@@ -431,16 +432,35 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                     bug["status"] = "result_ready"
                 else:
                     bug.update(status="open", lastError="Interrupted before a durable result or commit was produced." if record is None else record["error"])
-            for bug in (item for item in bugs["bugs"] if item["status"] == "ready_to_publish" and item.get("resultSha")):
+            recoverable = [item for item in bugs["bugs"] if item["status"] == "ready_to_publish" and item.get("resultSha")]
+            remote_sha = remote_integration_sha(root, config) if recoverable else None
+            for bug in recoverable:
                 if not has_matching_review_results(paths, bug, "bug"):
                     bug.update(status="result_ready", lastError=None)
                     continue
                 require_approved_reviews(paths, bug, "bug")
                 existing = get_pull_request(root, config, bug["branch"], config["integrationBranch"], bug["resultSha"])
+                if existing and existing["state"] in {"merged", "completed"}:
+                    merged = complete_pull_request(root, config, existing, bug["resultSha"], bug["baseSha"])
+                    bug.update(pullRequest=merged, status="verified", lastError=None)
+                    state["integrationSha"] = merged["mergeSha"]
+                    save_ledger(bugs, paths)
+                    save_state(state, paths)
+                    try:
+                        remove_merged_assignment(root, config, bug["bugId"], bug["branch"], merged)
+                    except Exception as error:
+                        warning(str(error))
+                    continue
+                if bug["baseSha"] != remote_sha:
+                    if existing:
+                        bug["pullRequest"] = existing
+                    requeue_stale_review(root, config, bug, "bug", remote_sha)
+                    continue
                 if existing:
                     merged = complete_pull_request(root, config, existing, bug["resultSha"], bug["baseSha"])
                     bug.update(pullRequest=merged, status="verified", lastError=None)
                     state["integrationSha"] = merged["mergeSha"]
+                    remote_sha = merged["mergeSha"]
                     save_ledger(bugs, paths)
                     save_state(state, paths)
                     try:
@@ -479,7 +499,8 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                             raise BraceError(f"Bug fixer blocked: {blocker['message']}")
                         context_label = "not-reproducible disposition" if result["status"] == "not_reproducible" else "bug correction"
                         if result["status"] != "not_reproducible":
-                            commit = assert_assignment_commit(bug["worktree"], bug["baseSha"], bug)
+                            assignment = read_json(attempt_path(paths, "assignment", bug["bugId"], bug["attemptCount"]))
+                            commit = assert_assignment_commit(bug["worktree"], bug["baseSha"], bug, assignment["startingHead"])
                             if result["commitSha"] != commit["Head"]:
                                 raise BraceError("Fixer result commit SHA does not match worktree HEAD.")
                             bug["resultSha"] = commit["Head"]
@@ -488,9 +509,8 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                             if candidate != bug["baseSha"]:
                                 raise BraceError("Not-reproducible disposition modified the bug worktree.")
                     except Exception as error:
-                        if bug.get("resultSha"):
-                            reset_rejected_assignment(root, config, bug, "bug")
-                            bug["resultSha"] = None
+                        retry_head = reset_rejected_assignment(root, config, bug, "bug") if bug.get("resultSha") else None
+                        bug["resultSha"] = retry_head
                         bug.update(status="open", lastError=str(error))
                         continue
                     review_item = bug if bug.get("resultSha") else {**bug, "resultSha": candidate}
@@ -507,8 +527,7 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                                 return _handle_semantic(root, config, state, paths, tasks, bugs, "review", bug["bugId"], blocker, input_reader)
                         message = review_failure(reviews)
                         if bug.get("resultSha"):
-                            reset_rejected_assignment(root, config, bug, "bug")
-                            bug["resultSha"] = None
+                            bug["resultSha"] = reset_rejected_assignment(root, config, bug, "bug")
                         bug.update(status="open", lastError=message)
                         continue
                     require_approved_reviews(paths, review_item, "bug")
@@ -555,7 +574,10 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                     if bug.get("lastError") == STALE_REVIEW_ERROR:
                         requeue_stale_review(root, config, bug, "bug", base_sha)
                     bug["baseSha"] = bug.get("baseSha") or base_sha
-                    bug["worktree"] = str(new_worktree(root, config, bug["bugId"], bug["branch"], bug["baseSha"], bug.get("resultSha")))
+                    bug["worktree"] = str(new_worktree(
+                        root, config, bug["bugId"], bug["branch"], bug["baseSha"], bug.get("resultSha"),
+                        allowed_diverged_head=bug.get("resultSha"),
+                    ))
                     bug["attemptCount"] += 1
                     bug["status"] = "active"
                     write_immutable_json(attempt_path(paths, "assignment", bug["bugId"], bug["attemptCount"]), {

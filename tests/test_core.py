@@ -736,7 +736,7 @@ class CoreTests(RepositoryTestCase):
         self.git(path, "commit", "-m", "task")
         result = common.assert_assignment_commit(path, base, task)
         self.assertRegex(result["Head"], r"^[0-9a-f]{40,64}$")
-        task.update(branch="worktree/TASK-0001", baseSha=base, resultSha=result["Head"])
+        task.update(branch="worktree/TASK-0001", worktree=str(path), baseSha=base, resultSha=result["Head"])
         common.reset_rejected_assignment(root, config, task, "task")
         common.reset_rejected_assignment(root, config, task, "task")
         self.assertEqual(self.git(path, "rev-parse", "HEAD"), base)
@@ -745,7 +745,38 @@ class CoreTests(RepositoryTestCase):
         self.assertEqual(self.git(amendment, "branch", "--show-current"), "worktree/AMEND-0001")
         common.remove_worktree(root, config, "AMEND-0001", "worktree/AMEND-0001")
 
-    def test_stale_review_requeue_recovers_an_interrupted_reset(self) -> None:
+    def test_stale_review_requeue_preserves_pushed_history_for_reconciliation(self) -> None:
+        root, _, config = self.make_repository()
+        base = self.git(root, "rev-parse", "HEAD")
+        task = self.task(paths=["result.txt"]) | {
+            "status": "verified_ready", "branch": "worktree/TASK-0001", "baseSha": base,
+        }
+        worktree = common.new_worktree(root, config, task["taskId"], task["branch"], base)
+        (worktree / "result.txt").write_text("candidate\n", encoding="utf-8")
+        self.git(worktree, "add", "result.txt")
+        self.git(worktree, "commit", "-m", "candidate")
+        task["resultSha"] = self.git(worktree, "rev-parse", "HEAD")
+        candidate = task["resultSha"]
+        task["worktree"] = str(worktree)
+        task["pullRequest"] = {"id": "1", "url": "https://example.invalid/1", "state": "open"}
+        self.git(worktree, "push", "--set-upstream", "origin", task["branch"])
+        (root / "integrated.txt").write_text("merged sibling\n", encoding="utf-8")
+        self.git(root, "add", "integrated.txt")
+        self.git(root, "commit", "-m", "advance integration")
+        integration = self.git(root, "rev-parse", "HEAD")
+
+        self.assertTrue(common.requeue_stale_review(root, config, task, "task", integration))
+        self.assertEqual((task["status"], task["baseSha"], task["resultSha"]), ("pending", integration, candidate))
+        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), candidate)
+        self.assertEqual(task["pullRequest"]["id"], "1")
+        self.git(worktree, "merge", "--no-edit", integration)
+        commit = common.assert_assignment_commit(worktree, integration, task, candidate)
+        self.assertEqual(commit["Head"], self.git(worktree, "rev-parse", "HEAD"))
+        self.git(worktree, "push", "origin", task["branch"])
+        self.assertEqual(self.git(root, "ls-remote", "origin", f"refs/heads/{task['branch']}").split()[0], commit["Head"])
+        common.remove_worktree(root, config, "TASK-0001", "worktree/TASK-0001")
+
+    def test_stale_requeue_rejects_wrong_recorded_worktree_before_reset(self) -> None:
         root, _, config = self.make_repository()
         base = self.git(root, "rev-parse", "HEAD")
         task = self.task() | {
@@ -755,19 +786,57 @@ class CoreTests(RepositoryTestCase):
         (worktree / "result.txt").write_text("candidate\n", encoding="utf-8")
         self.git(worktree, "add", "result.txt")
         self.git(worktree, "commit", "-m", "candidate")
-        task["resultSha"] = self.git(worktree, "rev-parse", "HEAD")
-        persisted = dict(task)
+        task.update(resultSha=self.git(worktree, "rev-parse", "HEAD"), worktree=str(root))
+        candidate = task["resultSha"]
         (root / "integrated.txt").write_text("merged sibling\n", encoding="utf-8")
         self.git(root, "add", "integrated.txt")
         self.git(root, "commit", "-m", "advance integration")
-        integration = self.git(root, "rev-parse", "HEAD")
 
-        self.assertTrue(common.requeue_stale_review(root, config, task, "task", integration))
-        self.assertEqual((task["status"], task["baseSha"], task["resultSha"]), ("pending", integration, None))
-        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), integration)
-        self.assertTrue(common.requeue_stale_review(root, config, persisted, "task", integration))
-        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), integration)
-        common.remove_worktree(root, config, "TASK-0001", "worktree/TASK-0001")
+        with self.assertRaisesRegex(common.BraceError, "recorded worktree"):
+            common.requeue_stale_review(root, config, task, "task", self.git(root, "rev-parse", "HEAD"))
+        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), candidate)
+
+    def test_stale_requeue_rejects_ignored_content_before_reset(self) -> None:
+        root, _, config = self.make_repository()
+        base = self.git(root, "rev-parse", "HEAD")
+        task = self.task() | {
+            "status": "verified_ready", "branch": "worktree/TASK-0001", "baseSha": base,
+        }
+        worktree = common.new_worktree(root, config, task["taskId"], task["branch"], base)
+        (worktree / "result.txt").write_text("candidate\n", encoding="utf-8")
+        self.git(worktree, "add", "result.txt")
+        self.git(worktree, "commit", "-m", "candidate")
+        task.update(resultSha=self.git(worktree, "rev-parse", "HEAD"), worktree=str(worktree))
+        candidate = task["resultSha"]
+        ignored = worktree / ".codex" / "logs"
+        (ignored / "empty").mkdir(parents=True)
+        (ignored / "ignored.txt").write_text("local\n", encoding="utf-8")
+        (root / "integrated.txt").write_text("merged sibling\n", encoding="utf-8")
+        self.git(root, "add", "integrated.txt")
+        self.git(root, "commit", "-m", "advance integration")
+
+        with self.assertRaisesRegex(common.BraceError, "uncommitted changes"):
+            common.requeue_stale_review(root, config, task, "task", self.git(root, "rev-parse", "HEAD"))
+        self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), candidate)
+
+    def test_assignment_worktree_rejects_redirect_outside_owned_root(self) -> None:
+        root, _, config = self.make_repository()
+        owned = common.worktree_base(root, config)
+        owned.mkdir(parents=True)
+        outside = self.base / "outside"
+        outside.mkdir()
+        redirect = owned / "TASK-0001"
+        if os.name == "nt":
+            created = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(redirect), str(outside)],
+                capture_output=True, text=True, encoding="utf-8", check=False,
+            )
+            self.assertEqual(created.returncode, 0, created.stdout + created.stderr)
+        else:
+            redirect.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(common.BraceError, "unexpected assignment worktree path"):
+            common.new_worktree(root, config, "TASK-0001", "worktree/TASK-0001", self.git(root, "rev-parse", "HEAD"))
 
     def test_review_records_are_distinct_resumable_and_candidate_bound(self) -> None:
         root, _, config = self.make_repository()

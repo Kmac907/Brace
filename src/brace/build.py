@@ -31,6 +31,7 @@ from .common import (
     read_json,
     recover_committed_attempt,
     requeue_stale_review,
+    remote_integration_sha,
     require_approved_reviews,
     reset_rejected_assignment,
     remove_audit_worktree,
@@ -141,17 +142,37 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 else:
                     task.update(status="pending", lastError="Interrupted before a durable result or commit was produced." if record is None else record["error"])
 
-            for task in (item for item in tasks["tasks"] if item["status"] in {"verified_ready", "submitted"} and item.get("resultSha")):
+            recoverable = [item for item in tasks["tasks"] if item["status"] in {"verified_ready", "submitted"} and item.get("resultSha")]
+            remote_sha = remote_integration_sha(root, config) if recoverable else None
+            for task in recoverable:
                 if not has_matching_review_results(paths, task, "task"):
                     task.update(status="result_ready", lastError=None)
                     continue
                 require_approved_reviews(paths, task, "task")
                 existing = get_pull_request(root, config, task["branch"], config["integrationBranch"], task["resultSha"])
+                if existing and existing["state"] in {"merged", "completed"}:
+                    from .common import complete_pull_request
+                    merged = complete_pull_request(root, config, existing, task["resultSha"], task["baseSha"])
+                    task.update(pullRequest=merged, status="integrated", lastError=None)
+                    state["integrationSha"] = merged["mergeSha"]
+                    save_ledger(tasks, paths)
+                    save_state(state, paths)
+                    try:
+                        remove_merged_assignment(root, config, task["taskId"], task["branch"], merged)
+                    except Exception as error:
+                        warning(str(error))
+                    continue
+                if task["baseSha"] != remote_sha:
+                    if existing:
+                        task["pullRequest"] = existing
+                    requeue_stale_review(root, config, task, "task", remote_sha)
+                    continue
                 if existing:
                     from .common import complete_pull_request
                     merged = complete_pull_request(root, config, existing, task["resultSha"], task["baseSha"])
                     task.update(pullRequest=merged, status="integrated", lastError=None)
                     state["integrationSha"] = merged["mergeSha"]
+                    remote_sha = merged["mergeSha"]
                     save_ledger(tasks, paths)
                     save_state(state, paths)
                     try:
@@ -191,15 +212,15 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     result = record["result"]
                     try:
                         _checks(root, config, state, tasks)
-                        commit = assert_assignment_commit(task["worktree"], task["baseSha"], task)
+                        assignment = read_json(attempt_path(paths, "assignment", task["taskId"], task["attemptCount"]))
+                        commit = assert_assignment_commit(task["worktree"], task["baseSha"], task, assignment["startingHead"])
                         if result["commitSha"] != commit["Head"]:
                             raise BraceError("Builder result commit SHA does not match the worktree HEAD.")
                         task["resultSha"] = commit["Head"]
                         save_ledger(tasks, paths)
                     except Exception as error:
-                        if task.get("resultSha"):
-                            reset_rejected_assignment(root, config, task, "task")
-                        task.update(status="pending", resultSha=None, lastError=str(error))
+                        retry_head = reset_rejected_assignment(root, config, task, "task") if task.get("resultSha") else None
+                        task.update(status="pending", resultSha=retry_head, lastError=str(error))
                         warning(f"{task['taskId']} attempt {task['attemptCount']} produced an invalid candidate: {error}")
                         continue
                     try:
@@ -221,8 +242,8 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                         if amendment_handled:
                             break
                         message = review_failure(reviews)
-                        reset_rejected_assignment(root, config, task, "task")
-                        task.update(status="pending", resultSha=None, lastError=message)
+                        retry_head = reset_rejected_assignment(root, config, task, "task")
+                        task.update(status="pending", resultSha=retry_head, lastError=message)
                         continue
                     require_approved_reviews(paths, task, "task")
                     task.update(status="verified_ready", lastError=None)
@@ -273,7 +294,10 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     if task.get("lastError") == STALE_REVIEW_ERROR:
                         requeue_stale_review(root, config, task, "task", base_sha)
                     task["baseSha"] = task.get("baseSha") or base_sha
-                    task["worktree"] = str(new_worktree(root, config, task["taskId"], task["branch"], task["baseSha"], task.get("resultSha")))
+                    task["worktree"] = str(new_worktree(
+                        root, config, task["taskId"], task["branch"], task["baseSha"], task.get("resultSha"),
+                        allowed_diverged_head=task.get("resultSha"),
+                    ))
                     task["attemptCount"] += 1
                     task["status"] = "active"
                     write_immutable_json(attempt_path(paths, "assignment", task["taskId"], task["attemptCount"]), {

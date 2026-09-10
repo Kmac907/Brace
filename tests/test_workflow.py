@@ -613,10 +613,15 @@ class WorkflowTests(RepositoryTestCase):
             path = Path(worktree)
             identity = item["taskId" if kind == "task" else "bugId"]
             filename = item["allowedPaths"][0]
-            self.assertEqual(self.git(path, "rev-parse", "HEAD"), item["baseSha"])
-            (path / filename).write_text(f"{identity} attempt {item['attemptCount']}\n", encoding="utf-8")
-            self.git(path, "add", filename)
-            self.git(path, "commit", "-m", f"{identity} attempt {item['attemptCount']}")
+            starting_head = self.git(path, "rev-parse", "HEAD")
+            if item.get("resultSha"):
+                self.assertEqual(starting_head, item["resultSha"])
+                self.git(path, "merge", "--no-edit", item["baseSha"])
+            else:
+                self.assertEqual(starting_head, item["baseSha"])
+                (path / filename).write_text(f"{identity} attempt {item['attemptCount']}\n", encoding="utf-8")
+                self.git(path, "add", filename)
+                self.git(path, "commit", "-m", f"{identity} attempt {item['attemptCount']}")
             head = self.git(path, "rev-parse", "HEAD")
             assignments.append((kind, identity, item["attemptCount"], item["baseSha"], head))
             result = {
@@ -638,12 +643,14 @@ class WorkflowTests(RepositoryTestCase):
             identity = item["taskId" if kind == "task" else "bugId"]
             base = self.git(root, "rev-parse", f"origin/{configuration['integrationBranch']}")
             self.assertEqual(item["baseSha"], base)
-            self.git(root, "push", "origin", f"{item['resultSha']}:refs/heads/{configuration['integrationBranch']}")
-            publications.append((kind, identity, base, item["resultSha"]))
+            tree = self.git(root, "rev-parse", f"{item['resultSha']}^{{tree}}")
+            merge_sha = self.git(root, "commit-tree", tree, "-p", base, "-m", f"merge {identity}")
+            self.git(root, "push", "origin", f"{merge_sha}:refs/heads/{configuration['integrationBranch']}")
+            publications.append((kind, identity, base, merge_sha))
             return {
                 "id": identity, "url": f"https://example.invalid/{identity}", "state": "merged",
                 "repository": "owner/repo", "head": item["branch"], "headSha": item["resultSha"],
-                "base": configuration["integrationBranch"], "baseSha": base, "mergeSha": item["resultSha"],
+                "base": configuration["integrationBranch"], "baseSha": base, "mergeSha": merge_sha,
             }
 
         checks = ["check task one", "check task two", "check bug one", "check bug two"]
@@ -721,3 +728,126 @@ class WorkflowTests(RepositoryTestCase):
             retry = next(record for record in assignments if record[0] == kind and record[1] == stale[1] and record[2] == 2)
             self.assertEqual(first[3], stale[3])
             self.assertEqual(retry[3], first_publication[3])
+
+    def test_build_restart_requeues_open_pr_before_merge_validation(self) -> None:
+        root, _, config = self.prepare()
+        planned = self.planner_result()
+        planned["tasks"].append({
+            **planned["tasks"][0], "taskId": "TASK-0002", "title": "Merged sibling",
+            "allowedPaths": ["sibling.txt"],
+        })
+        planned["summary"].update(taskCount=2, parallelizableTaskCount=2)
+        with patch.object(planning_loop, "assert_prerequisites"), patch.object(planning_loop, "invoke_role", return_value=planned):
+            planning_loop.run(root)
+        paths = common.Paths(root)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        base = common.ensure_integration_branch(root, config, state)
+        task = tasks["tasks"][0]
+        task.update(
+            status="verified_ready", attemptCount=1, branch="worktree/TASK-0001", baseSha=base,
+        )
+        worktree = common.new_worktree(root, config, task["taskId"], task["branch"], base)
+        (worktree / "src").mkdir()
+        (worktree / "src" / "product.txt").write_text("candidate\n", encoding="utf-8")
+        self.git(worktree, "add", "src/product.txt")
+        self.git(worktree, "commit", "-m", "candidate")
+        task.update(worktree=str(worktree), resultSha=self.git(worktree, "rev-parse", "HEAD"))
+        self.persist_reviews(paths, task, "task")
+        tasks["status"] = "active"
+        tree = self.git(root, "rev-parse", f"{base}^{{tree}}")
+        advanced = self.git(root, "commit-tree", tree, "-p", base, "-m", "merged sibling")
+        self.git(root, "push", "origin", f"{advanced}:refs/heads/{config['integrationBranch']}")
+        sibling = tasks["tasks"][1]
+        sibling.update(
+            status="integrated", attemptCount=1, branch="worktree/TASK-0002", baseSha=base, resultSha=advanced,
+            pullRequest={
+                "id": "2", "url": "https://example.invalid/2", "state": "merged", "repository": "owner/repo",
+                "head": "worktree/TASK-0002", "headSha": advanced, "base": config["integrationBranch"],
+                "baseSha": base, "mergeSha": advanced,
+            },
+        )
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        state.update(stage="build", stageStatus="running", integrationSha=advanced)
+        common.save_state(state, paths)
+        open_pr = {
+            "id": "1", "url": "https://example.invalid/1", "state": "open", "repository": "owner/repo",
+            "head": task["branch"], "headSha": task["resultSha"], "base": config["integrationBranch"],
+            "baseSha": advanced, "mergeSha": None,
+        }
+
+        with (
+            patch.object(build_loop, "assert_prerequisites"),
+            patch.object(build_loop, "get_pull_request", return_value=open_pr),
+            patch.object(common, "complete_pull_request", side_effect=AssertionError("stale PR was completed")),
+            patch.object(build_loop, "select_ready_items", side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            build_loop.run(root)
+        persisted = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")["tasks"][0]
+        self.assertEqual((persisted["status"], persisted["baseSha"], persisted["resultSha"]), ("pending", advanced, task["resultSha"]))
+        self.assertEqual(persisted["pullRequest"]["id"], open_pr["id"])
+
+    def test_audit_restart_requeues_open_pr_before_merge_validation(self) -> None:
+        root, _, config = self.prepare()
+        self.plan(root)
+        paths = common.Paths(root)
+        state = common.read_json(paths.state, paths.schemas / "state.schema.json")
+        tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        base = common.ensure_integration_branch(root, config, state)
+        tree = self.git(root, "rev-parse", f"{base}^{{tree}}")
+        advanced = self.git(root, "commit-tree", tree, "-p", base, "-m", "merged sibling")
+        self.git(root, "push", "origin", f"{advanced}:refs/heads/{config['integrationBranch']}")
+        tasks["tasks"][0].update(
+            status="integrated", attemptCount=1, branch="worktree/TASK-0001", baseSha=base, resultSha=advanced,
+            pullRequest={
+                "id": "task", "url": "https://example.invalid/task", "state": "merged", "repository": "owner/repo",
+                "head": "worktree/TASK-0001", "headSha": advanced, "base": config["integrationBranch"],
+                "baseSha": base, "mergeSha": advanced,
+            },
+        )
+        tasks["status"] = "complete"
+        common.write_json_atomic(paths.tasks, tasks, paths.schemas / "tasks.schema.json")
+        finding = {
+            "bugId": "BUG-0001", "title": "Fix candidate", "severity": "high", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "wrong", "evidence": "reproduced",
+            "actualBehavior": "wrong", "requiredBehavior": "correct", "impact": "workflow blocks",
+            "requiredCorrection": "correct it", "acceptanceTest": "check bug", "dependencies": [],
+            "allowedPaths": ["bug.txt"], "exclusiveResources": [],
+        }
+        bug = audit_loop.persisted_bug(finding)
+        bug.update(status="ready_to_publish", disposition="fixed", attemptCount=1, branch="worktree/BUG-0001", baseSha=base)
+        worktree = common.new_worktree(root, config, bug["bugId"], bug["branch"], base)
+        (worktree / "bug.txt").write_text("candidate\n", encoding="utf-8")
+        self.git(worktree, "add", "bug.txt")
+        self.git(worktree, "commit", "-m", "candidate")
+        bug.update(worktree=str(worktree), resultSha=self.git(worktree, "rev-parse", "HEAD"))
+        self.persist_reviews(paths, bug, "bug")
+        bugs.update(
+            status="active", auditCycle=1, auditSha=advanced, bugs=[bug],
+            definitionHash=common.definition_hash([bug], "bug"),
+        )
+        common.write_json_atomic(paths.bugs, bugs, paths.schemas / "bugs.schema.json")
+        state.update(
+            stage="audit", stageStatus="running", integrationSha=advanced,
+            bugDefinitionHash=bugs["definitionHash"],
+        )
+        common.save_state(state, paths)
+        open_pr = {
+            "id": "1", "url": "https://example.invalid/1", "state": "open", "repository": "owner/repo",
+            "head": bug["branch"], "headSha": bug["resultSha"], "base": config["integrationBranch"],
+            "baseSha": advanced, "mergeSha": None,
+        }
+
+        with (
+            patch.object(audit_loop, "assert_prerequisites"),
+            patch.object(audit_loop, "get_pull_request", return_value=open_pr),
+            patch.object(audit_loop, "complete_pull_request", side_effect=AssertionError("stale PR was completed")),
+            patch.object(audit_loop, "select_ready_items", side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            audit_loop.run(root)
+        persisted = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")["bugs"][0]
+        self.assertEqual((persisted["status"], persisted["baseSha"], persisted["resultSha"]), ("open", advanced, bug["resultSha"]))
+        self.assertEqual(persisted["pullRequest"]["id"], open_pr["id"])
