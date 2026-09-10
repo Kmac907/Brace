@@ -1491,12 +1491,17 @@ def complete_pull_request(root: str | Path, config: dict[str, Any], pull_request
         current = _assert_pull_request_identity(current, pull_request, expected_head_sha, expected_base_sha)
         if current["state"] not in {"open", "active"}:
             raise BraceError(f"Pull request {pull_request['id']} cannot be merged from state {current['state']}.")
+        _wait_for_required_checks(root, config, current)
         if config["provider"] == "github":
             args = ["pr", "merge", pull_request["id"], "--repo", pull_request["repository"], "--squash", "--match-head-commit", expected_head_sha]
             if config.get("deleteMergedBranches"):
                 args.append("--delete-branch")
             run_native("gh", args, root)
         else:
+            current = get_pull_request(root, config, pull_request["head"], pull_request["base"], expected_head_sha, pull_request["id"], expected_base_sha)
+            current = _assert_pull_request_identity(current, pull_request, expected_head_sha, expected_base_sha)
+            if current["state"] not in {"open", "active"}:
+                raise BraceError(f"Pull request {pull_request['id']} cannot be merged from state {current['state']}.")
             azure = config["azureDevOps"]
             args = ["repos", "pr", "update", "--organization", azure["organization"], "--id", pull_request["id"], "--status", "completed", "--squash", "true", "--output", "none"]
             if config.get("deleteMergedBranches"):
