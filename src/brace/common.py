@@ -1159,7 +1159,10 @@ def requeue_stale_review(root: str | Path, config: dict[str, Any], item: dict[st
         return False
     identity = item["taskId" if kind == "task" else "bugId"]
     expected_path = _recorded_assignment_worktree(root, config, item, identity)
-    path = new_worktree(root, config, identity, item["branch"], item["baseSha"])
+    path = new_worktree(
+        root, config, identity, item["branch"], item["baseSha"],
+        allowed_diverged_head=item["resultSha"],
+    )
     if path != expected_path:
         raise BraceError(f"Refusing to reconcile an unexpected worktree for {identity}.")
     head = run_native("git", ["-C", path, "rev-parse", "HEAD"]).output.strip()
@@ -1220,6 +1223,15 @@ def recover_committed_attempt(root: str | Path, paths: Paths, item: dict[str, An
         raise BraceError(f"Interrupted worktree contains uncommitted changes: {identity}")
     head = run_native("git", ["-C", worktree, "rev-parse", "HEAD"]).output.strip()
     if run_native("git", ["-C", worktree, "merge-base", "--is-ancestor", item["baseSha"], head], allowed_exit_codes=(0, 1)).returncode != 0:
+        assignment_file = attempt_path(paths, "assignment", identity, int(item["attemptCount"]))
+        assignment = read_json(assignment_file) if assignment_file.is_file() else {}
+        if (
+            assignment.get("identity") == identity
+            and assignment.get("attempt") == item["attemptCount"]
+            and assignment.get("baseSha") == item["baseSha"]
+            and assignment.get("startingHead") == head == item.get("resultSha")
+        ):
+            return None
         raise BraceError(f"Interrupted worktree does not descend from its recorded base: {identity}")
     if head == item["baseSha"]:
         return None

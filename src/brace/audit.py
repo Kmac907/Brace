@@ -40,7 +40,6 @@ from .common import (
     read_json,
     recover_committed_attempt,
     requeue_stale_review,
-    remote_integration_sha,
     require_approved_reviews,
     reset_rejected_assignment,
     remove_audit_worktree,
@@ -426,22 +425,35 @@ def _run_once(repository: str | Path = ".", input_reader: InputReader | None = N
                 if bugs["bugs"]:
                     assert_graph(bugs["bugs"], "bug")
 
+            recoverable = [item for item in bugs["bugs"] if item["status"] == "ready_to_publish" and item.get("resultSha")]
+            provider_records: dict[str, dict[str, Any] | None] = {}
+            recovered_merges: dict[str, dict[str, Any]] = {}
+            for bug in recoverable:
+                if not has_matching_review_results(paths, bug, "bug"):
+                    continue
+                require_approved_reviews(paths, bug, "bug")
+                existing = get_pull_request(root, config, bug["branch"], config["integrationBranch"], bug["resultSha"])
+                provider_records[bug["bugId"]] = existing
+                if existing and existing["state"] in {"merged", "completed"}:
+                    recovered_merges[bug["bugId"]] = complete_pull_request(root, config, existing, bug["resultSha"], bug["baseSha"])
+            remote_sha = ensure_integration_branch(
+                root, config, state,
+                [*known_merges(tasks, bugs), *(merged["mergeSha"] for merged in recovered_merges.values())],
+            )
+
             for bug in (item for item in bugs["bugs"] if item["status"] == "active"):
                 record = read_attempt_result(paths, bug["bugId"], bug["attemptCount"]) or recover_committed_attempt(root, paths, bug, "bug")
                 if record and record["succeeded"]:
                     bug["status"] = "result_ready"
                 else:
                     bug.update(status="open", lastError="Interrupted before a durable result or commit was produced." if record is None else record["error"])
-            recoverable = [item for item in bugs["bugs"] if item["status"] == "ready_to_publish" and item.get("resultSha")]
-            remote_sha = remote_integration_sha(root, config) if recoverable else None
             for bug in recoverable:
                 if not has_matching_review_results(paths, bug, "bug"):
                     bug.update(status="result_ready", lastError=None)
                     continue
-                require_approved_reviews(paths, bug, "bug")
-                existing = get_pull_request(root, config, bug["branch"], config["integrationBranch"], bug["resultSha"])
-                if existing and existing["state"] in {"merged", "completed"}:
-                    merged = complete_pull_request(root, config, existing, bug["resultSha"], bug["baseSha"])
+                existing = provider_records[bug["bugId"]]
+                if bug["bugId"] in recovered_merges:
+                    merged = recovered_merges[bug["bugId"]]
                     bug.update(pullRequest=merged, status="verified", lastError=None)
                     state["integrationSha"] = merged["mergeSha"]
                     save_ledger(bugs, paths)

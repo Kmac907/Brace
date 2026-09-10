@@ -776,6 +776,53 @@ class CoreTests(RepositoryTestCase):
         self.assertEqual(self.git(root, "ls-remote", "origin", f"refs/heads/{task['branch']}").split()[0], commit["Head"])
         common.remove_worktree(root, config, "TASK-0001", "worktree/TASK-0001")
 
+    def test_interrupted_reconciliation_start_is_recoverable_only_at_recorded_head(self) -> None:
+        root, _, config = self.make_repository()
+        paths = common.initialize_state_files(root, config)
+        base = self.git(root, "rev-parse", "HEAD")
+        items = [
+            ("task", self.task(paths=["task.txt"])),
+            ("bug", {
+                "bugId": "BUG-0001", "status": "ready_to_publish", "attemptCount": 1,
+                "branch": "worktree/BUG-0001", "worktree": None, "baseSha": base,
+                "resultSha": None, "pullRequest": None, "lastError": None, "disposition": "fixed",
+            }),
+        ]
+        for kind, item in items:
+            identity = item["taskId" if kind == "task" else "bugId"]
+            item.update(status="verified_ready" if kind == "task" else "ready_to_publish", branch=f"worktree/{identity}", baseSha=base)
+            worktree = common.new_worktree(root, config, identity, item["branch"], base)
+            filename = f"{identity}.txt"
+            (worktree / filename).write_text("candidate\n", encoding="utf-8")
+            self.git(worktree, "add", filename)
+            self.git(worktree, "commit", "-m", "candidate")
+            item.update(worktree=str(worktree), resultSha=self.git(worktree, "rev-parse", "HEAD"))
+
+        (root / "integrated.txt").write_text("merged sibling\n", encoding="utf-8")
+        self.git(root, "add", "integrated.txt")
+        self.git(root, "commit", "-m", "advance integration")
+        integration = self.git(root, "rev-parse", "HEAD")
+
+        for kind, item in items:
+            identity = item["taskId" if kind == "task" else "bugId"]
+            with self.subTest(kind=kind):
+                self.assertTrue(common.requeue_stale_review(root, config, item, kind, integration))
+                candidate = item["resultSha"]
+                item.update(status="active", attemptCount=2)
+                common.write_immutable_json(common.attempt_path(paths, "assignment", identity, 2), {
+                    "schemaVersion": "1.0", "identity": identity, "attempt": 2,
+                    "baseSha": integration, "startingHead": candidate,
+                    "createdAt": common.utc_now(), "item": item,
+                })
+                self.assertIsNone(common.recover_committed_attempt(root, paths, item, kind))
+
+                worktree = Path(item["worktree"])
+                (worktree / "unexpected.txt").write_text("unrecorded history\n", encoding="utf-8")
+                self.git(worktree, "add", "unexpected.txt")
+                self.git(worktree, "commit", "-m", "unexpected history")
+                with self.assertRaisesRegex(common.BraceError, "recorded base"):
+                    common.recover_committed_attempt(root, paths, item, kind)
+
     def test_stale_requeue_rejects_wrong_recorded_worktree_before_reset(self) -> None:
         root, _, config = self.make_repository()
         base = self.git(root, "rev-parse", "HEAD")

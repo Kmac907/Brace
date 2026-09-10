@@ -17,6 +17,7 @@ from .common import (
     assert_state_identity,
     assert_target_drift,
     attempt_path,
+    complete_pull_request,
     ensure_integration_branch,
     get_configuration,
     get_pull_request,
@@ -31,7 +32,6 @@ from .common import (
     read_json,
     recover_committed_attempt,
     requeue_stale_review,
-    remote_integration_sha,
     require_approved_reviews,
     reset_rejected_assignment,
     remove_audit_worktree,
@@ -131,6 +131,22 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 raise BraceError("Planning has not produced a buildable task queue.")
             if state["stage"] not in {"build", "blocked"}:
                 raise BraceError(f"The workflow is at stage {state['stage']}, not build.")
+            recoverable = [item for item in tasks["tasks"] if item["status"] in {"verified_ready", "submitted"} and item.get("resultSha")]
+            provider_records: dict[str, dict[str, Any] | None] = {}
+            recovered_merges: dict[str, dict[str, Any]] = {}
+            for task in recoverable:
+                if not has_matching_review_results(paths, task, "task"):
+                    continue
+                require_approved_reviews(paths, task, "task")
+                existing = get_pull_request(root, config, task["branch"], config["integrationBranch"], task["resultSha"])
+                provider_records[task["taskId"]] = existing
+                if existing and existing["state"] in {"merged", "completed"}:
+                    recovered_merges[task["taskId"]] = complete_pull_request(root, config, existing, task["resultSha"], task["baseSha"])
+            remote_sha = ensure_integration_branch(
+                root, config, state,
+                [*known_merges(tasks), *(merged["mergeSha"] for merged in recovered_merges.values())],
+            )
+
             state.update(stage="build", stageStatus="running", blocker=None)
             tasks["status"] = "active"
             save_state(state, paths)
@@ -142,17 +158,13 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                 else:
                     task.update(status="pending", lastError="Interrupted before a durable result or commit was produced." if record is None else record["error"])
 
-            recoverable = [item for item in tasks["tasks"] if item["status"] in {"verified_ready", "submitted"} and item.get("resultSha")]
-            remote_sha = remote_integration_sha(root, config) if recoverable else None
             for task in recoverable:
                 if not has_matching_review_results(paths, task, "task"):
                     task.update(status="result_ready", lastError=None)
                     continue
-                require_approved_reviews(paths, task, "task")
-                existing = get_pull_request(root, config, task["branch"], config["integrationBranch"], task["resultSha"])
-                if existing and existing["state"] in {"merged", "completed"}:
-                    from .common import complete_pull_request
-                    merged = complete_pull_request(root, config, existing, task["resultSha"], task["baseSha"])
+                existing = provider_records[task["taskId"]]
+                if task["taskId"] in recovered_merges:
+                    merged = recovered_merges[task["taskId"]]
                     task.update(pullRequest=merged, status="integrated", lastError=None)
                     state["integrationSha"] = merged["mergeSha"]
                     save_ledger(tasks, paths)
@@ -168,7 +180,6 @@ def run(repository: str | Path = ".", input_reader: InputReader | None = None) -
                     requeue_stale_review(root, config, task, "task", remote_sha)
                     continue
                 if existing:
-                    from .common import complete_pull_request
                     merged = complete_pull_request(root, config, existing, task["resultSha"], task["baseSha"])
                     task.update(pullRequest=merged, status="integrated", lastError=None)
                     state["integrationSha"] = merged["mergeSha"]
