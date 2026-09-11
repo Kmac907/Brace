@@ -15,7 +15,6 @@ from unittest.mock import Mock, patch
 
 from brace import audit as audit_loop
 from brace import common, project_manager, ui
-import support
 from support import RepositoryTestCase
 
 
@@ -433,20 +432,31 @@ class CoreTests(RepositoryTestCase):
 
         self.assertEqual(common.run_native(str(script), ["Endpoint Engineering"]).output, "Endpoint Engineering")
 
-    def test_executable_cache_observes_availability_changes(self) -> None:
-        support._cached_which.cache_clear()
-        resolver = Mock(side_effect=[None, "resolved", None])
-        try:
-            with (
-                patch.object(support, "_real_which", resolver),
-                patch.object(support.os, "access", side_effect=[True, False]),
-            ):
-                self.assertIsNone(support._which("changing-tool"))
-                self.assertEqual(support._which("changing-tool"), "resolved")
-                self.assertIsNone(support._which("changing-tool"))
-            self.assertEqual(resolver.call_count, 3)
-        finally:
-            support._cached_which.cache_clear()
+    def test_executable_resolution_observes_path_priority_and_availability(self) -> None:
+        high, low = self.base / "a", self.base / "b"
+        high.mkdir()
+        low.mkdir()
+        suffix = ".CMD" if os.name == "nt" else ""
+        low_tool = low / f"changing-tool{suffix}"
+        low_tool.write_text("@exit /b 0\n" if os.name == "nt" else "#!/bin/sh\n", encoding="utf-8")
+        if os.name != "nt":
+            low_tool.chmod(0o755)
+        environment = {"PATH": os.pathsep.join((str(high), str(low)))}
+        if os.name == "nt":
+            environment["PATHEXT"] = ".CMD"
+        with patch.dict(os.environ, environment):
+            self.assertTrue(os.path.samefile(shutil.which("changing-tool"), low_tool))
+            high_tool = high / low_tool.name
+            shutil.copy2(low_tool, high_tool)
+            self.assertTrue(os.path.samefile(shutil.which("changing-tool"), high_tool))
+            high_tool.unlink()
+            self.assertTrue(os.path.samefile(shutil.which("changing-tool"), low_tool))
+            if os.name == "nt":
+                with patch.object(shutil.os, "access", return_value=False):
+                    self.assertIsNone(shutil.which("changing-tool"))
+            else:
+                low_tool.chmod(0o644)
+                self.assertIsNone(shutil.which("changing-tool"))
 
     @unittest.skipUnless(os.name == "nt", "Windows process cleanup behavior")
     def test_windows_tree_cleanup_uses_retained_parent_identity(self) -> None:

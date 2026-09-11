@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import tempfile
 import unittest
-from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
-from unittest.mock import patch
 
 from brace.bootstrap import bundled_template
 
@@ -17,44 +14,23 @@ from brace.bootstrap import bundled_template
 _seed_temporary = tempfile.TemporaryDirectory()
 _seed = Path(_seed_temporary.name) / "repository.git"
 _worktree_root = Path(_seed_temporary.name) / "worktrees"
-_real_which = shutil.which
-
-
-@lru_cache
-def _cached_which(command: str, mode: int, path: str | None, path_value: str | None, path_ext: str | None, cwd: str) -> str | None:
-    return _real_which(command, mode, path)
-
-
-def _which(command: str, mode: int = os.F_OK | os.X_OK, path: str | None = None) -> str | None:
-    resolved = _cached_which(command, mode, path, os.environ.get("PATH"), os.environ.get("PATHEXT"), os.getcwd())
-    if resolved is None:
-        _cached_which.cache_clear()
-    elif not os.access(resolved, mode):
-        _cached_which.cache_clear()
-        resolved = _real_which(command, mode, path)
-    return resolved
 
 
 class RepositoryTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.which_patch = patch.object(shutil, "which", _which)
-        self.which_patch.start()
         self.temporary = tempfile.TemporaryDirectory()
         self.base = Path(self.temporary.name)
         self.repository_roots: list[Path] = []
 
     def tearDown(self) -> None:
-        try:
-            self.temporary.cleanup()
-            for root in self.repository_roots:
-                repository_id = sha256(str(root.resolve()).upper().encode("utf-8")).hexdigest()[:16]
-                worktrees = _worktree_root / repository_id
-                if worktrees.is_dir():
-                    shutil.rmtree(worktrees)
-            if _worktree_root.is_dir() and not any(_worktree_root.iterdir()):
-                _worktree_root.rmdir()
-        finally:
-            self.which_patch.stop()
+        self.temporary.cleanup()
+        for root in self.repository_roots:
+            repository_id = sha256(str(root.resolve()).upper().encode("utf-8")).hexdigest()[:16]
+            worktrees = _worktree_root / repository_id
+            if worktrees.is_dir():
+                shutil.rmtree(worktrees)
+        if _worktree_root.is_dir() and not any(_worktree_root.iterdir()):
+            _worktree_root.rmdir()
 
     def task(self, identity: str = "TASK-0001", dependencies: list[str] | None = None, paths: list[str] | None = None) -> dict:
         return {
