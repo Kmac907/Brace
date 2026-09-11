@@ -67,7 +67,7 @@ class RepositoryTestCase(unittest.TestCase):
             self.git(seed_root, "add", "plan.md")
             self.git(seed_root, "commit", "-m", "plan")
             subprocess.run(["git", "clone", "--bare", "--local", str(seed_root), str(_seed)], check=True, capture_output=True)
-        shutil.copytree(_seed, remote)
+        subprocess.run(["git", "clone", "--bare", "--local", str(_seed), str(remote)], check=True, capture_output=True)
         subprocess.run([
             "git", "clone", "--local", "--config", "user.name=Test", "--config",
             "user.email=test@example.invalid", str(remote), str(root),
