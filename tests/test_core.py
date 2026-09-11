@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 from brace import audit as audit_loop
 from brace import common, project_manager, ui
+import support
 from support import RepositoryTestCase
 
 
@@ -431,6 +432,21 @@ class CoreTests(RepositoryTestCase):
         script.write_text("@echo off\n@echo(%~1\n", encoding="utf-8")
 
         self.assertEqual(common.run_native(str(script), ["Endpoint Engineering"]).output, "Endpoint Engineering")
+
+    def test_executable_cache_observes_availability_changes(self) -> None:
+        support._cached_which.cache_clear()
+        resolver = Mock(side_effect=[None, "resolved", None])
+        try:
+            with (
+                patch.object(support, "_real_which", resolver),
+                patch.object(support.os, "access", side_effect=[True, False]),
+            ):
+                self.assertIsNone(support._which("changing-tool"))
+                self.assertEqual(support._which("changing-tool"), "resolved")
+                self.assertIsNone(support._which("changing-tool"))
+            self.assertEqual(resolver.call_count, 3)
+        finally:
+            support._cached_which.cache_clear()
 
     @unittest.skipUnless(os.name == "nt", "Windows process cleanup behavior")
     def test_windows_tree_cleanup_uses_retained_parent_identity(self) -> None:

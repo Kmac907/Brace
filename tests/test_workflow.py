@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -15,7 +16,6 @@ from support import RepositoryTestCase
 class WorkflowTests(RepositoryTestCase):
     def setUp(self) -> None:
         super().setUp()
-        real_audit_boundary_campaigns = {"test_planning_build_and_audit_complete"}
         if self._testMethodName in {
             "test_build_rejects_unowned_remote_before_candidate_mutation",
             "test_audit_rejects_unowned_remote_before_candidate_mutation",
@@ -52,17 +52,16 @@ class WorkflowTests(RepositoryTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-        if self._testMethodName not in real_audit_boundary_campaigns:
-            for target, name, replacement in (
-                (build_loop, "new_audit_worktree", lambda root, *args: Path(root)),
-                (build_loop, "remove_audit_worktree", lambda *args: None),
-                (audit_loop, "new_audit_worktree", lambda root, *args: Path(root)),
-                (audit_loop, "remove_audit_worktree", lambda *args: None),
-                (audit_loop, "assert_read_only_worktree", lambda *args: None),
-            ):
-                patcher = patch.object(target, name, replacement)
-                patcher.start()
-                self.addCleanup(patcher.stop)
+        for target, name, replacement in (
+            (build_loop, "new_audit_worktree", lambda root, *args: Path(root)),
+            (build_loop, "remove_audit_worktree", lambda *args: None),
+            (audit_loop, "new_audit_worktree", lambda root, *args: Path(root)),
+            (audit_loop, "remove_audit_worktree", lambda *args: None),
+            (audit_loop, "assert_read_only_worktree", lambda *args: None),
+        ):
+            patcher = patch.object(target, name, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
         if self._testMethodName.startswith("test_planning_") and self._testMethodName != "test_planning_build_and_audit_complete":
             def planning_native(command, arguments, *args, **kwargs):
@@ -311,7 +310,16 @@ class WorkflowTests(RepositoryTestCase):
 
     def test_planning_build_and_audit_complete(self) -> None:
         root, _, config = self.prepare()
+        (root / "plan.md").write_text("# Plan\n", encoding="utf-8")
+        self.git(root, "add", "plan.md")
+        self.git(root, "commit", "-m", "blank plan")
+        self.git(root, "push", "origin", "main")
+        blank_plan_sha = self.git(root, "rev-parse", "HEAD")
         self.plan(root)
+        planned_sha = self.git(root, "rev-parse", "HEAD")
+        self.assertNotEqual(planned_sha, blank_plan_sha)
+        self.assertEqual((root / "plan.md").read_text(encoding="utf-8"), self.planner_result()["planMarkdown"].rstrip())
+        self.assertEqual(self.git(root, "show", f"{planned_sha}:plan.md"), self.planner_result()["planMarkdown"].rstrip())
         paths = common.Paths(root)
         tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
         state = common.read_json(paths.state, paths.schemas / "state.schema.json")
@@ -371,12 +379,15 @@ class WorkflowTests(RepositoryTestCase):
                 audit_contexts.append(context)
                 return audit_result
             validation_calls += 1
-            return verifier
+            if validation_calls == 1:
+                return verifier | {"approved": False, "summary": "failed", "findings": ["required checks failed"], "checks": []}
+            return verifier | {"checks": []} if validation_calls == 2 else verifier
 
         def fake_final_reviews(repository, state_paths, item, kind):
             nonlocal final_review_calls
             final_review_calls += 1
-            return self.persist_reviews(state_paths, item, kind)
+            results = (self.reviewer_result(), self.reviewer_result(False)) if final_review_calls == 1 else None
+            return self.persist_reviews(state_paths, item, kind, results)
 
         def fake_new_pr(repository, configuration, head, base, expected_head, expected_base, title, body):
             return {
@@ -396,21 +407,29 @@ class WorkflowTests(RepositoryTestCase):
             patch.object(audit_loop, "new_pull_request", side_effect=fake_new_pr) as project_pr,
             patch.object(audit_loop, "complete_pull_request", side_effect=fake_complete),
         ):
+            with self.assertRaisesRegex(common.BraceError, "Final validation failed: required checks failed"):
+                audit_loop.run(root)
+            project_pr.assert_not_called()
+            with self.assertRaisesRegex(common.BraceError, "missing passed evidence.*test -f src/product.txt"):
+                audit_loop.run(root)
+            project_pr.assert_not_called()
             self.assertEqual(audit_loop.run(root), "complete")
 
         state = common.read_json(paths.state, paths.schemas / "state.schema.json")
         bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
         self.assertEqual(state["stage"], "complete")
         self.assertEqual(bugs["status"], "complete")
-        self.assertEqual(bugs["auditCycle"], 1)
-        self.assertEqual(validation_calls, 1)
-        self.assertEqual(final_review_calls, 1)
+        self.assertEqual(bugs["auditCycle"], 4)
+        self.assertEqual(validation_calls, 4)
+        self.assertEqual(final_review_calls, 2)
         self.assertEqual(project_pr.call_count, 1)
-        self.assertEqual(len(audit_contexts), 1)
-        self.assertIn("fresh comprehensive closure audit of exact integration commit", audit_contexts[0])
-        self.assertEqual(len(list(paths.results.glob("TASK-0000-attempt-*-review-*.json"))), 2)
+        self.assertIn("src/product.txt:1", audit_contexts[3])
+        self.assertEqual(len(list(paths.results.glob("TASK-0000-attempt-*-review-*.json"))), 4)
         self.assertTrue((paths.results / "CLOSURE-attempt-001-audit.json").is_file())
-        self.assertTrue((paths.results / "CLOSURE-attempt-001-validation.json").is_file())
+        self.assertTrue((paths.results / "CLOSURE-attempt-002-audit.json").is_file())
+        self.assertTrue((paths.results / "CLOSURE-attempt-003-audit.json").is_file())
+        self.assertTrue((paths.results / "CLOSURE-attempt-004-audit.json").is_file())
+        self.assertTrue((paths.results / "CLOSURE-attempt-004-validation.json").is_file())
         self.assertTrue(paths.build_summary.is_file())
         self.assertTrue(paths.audit_summary.is_file())
         self.assertFalse(Path(config["worktreeRoot"]).exists())
@@ -608,7 +627,7 @@ class WorkflowTests(RepositoryTestCase):
         self.assertEqual((resumed["status"], resumed["attemptCount"], worker_calls), ("blocked", 4, 2))
         self.assertEqual(assignment.read_bytes(), immutable)
 
-    def test_rejected_task_is_retried_and_bug_succeeds_from_its_base(self) -> None:
+    def test_rejected_task_and_bug_are_retried_from_their_base(self) -> None:
         root, _, config = self.prepare()
         self.plan(root)
         paths = common.Paths(root)
@@ -636,7 +655,7 @@ class WorkflowTests(RepositoryTestCase):
             self.git(path, "commit", "-m", f"{kind} attempt {item['attemptCount']}")
             head = self.git(path, "rev-parse", "HEAD")
             identity = item["taskId" if kind == "task" else "bugId"]
-            if kind == "task" and item["attemptCount"] == 1:
+            if item["attemptCount"] == 1:
                 rejected_shas[kind] = head
             result = {
                 "status": "completed" if kind == "task" else "fixed", "summary": "implemented", "commitSha": head,
@@ -714,7 +733,10 @@ class WorkflowTests(RepositoryTestCase):
             if kind == "task":
                 return self.persist_reviews(state_paths, item, kind)
             bug_verifications += 1
-            return self.persist_reviews(state_paths, item, kind)
+            if bug_verifications == 1:
+                raise RuntimeError("legacy bug review interrupted")
+            results = (approved, rejected) if bug_verifications == 2 else (approved, approved)
+            return self.persist_reviews(state_paths, item, kind, results)
 
         def fake_new_pr(repository, configuration, head, base, expected_head, expected_base, title, body):
             return {
@@ -736,6 +758,11 @@ class WorkflowTests(RepositoryTestCase):
             patch.object(audit_loop, "new_pull_request", side_effect=fake_new_pr),
             patch.object(audit_loop, "complete_pull_request", side_effect=fake_complete),
         ):
+            with self.assertRaisesRegex(RuntimeError, "legacy bug review interrupted"):
+                audit_loop.run(root)
+            legacy_bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+            legacy_bugs["bugs"][0].update(status="ready_to_publish", disposition="fixed")
+            audit_loop.save_ledger(legacy_bugs, paths)
             self.assertEqual(audit_loop.run(root), "complete")
 
         bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
@@ -744,13 +771,14 @@ class WorkflowTests(RepositoryTestCase):
         self.assertEqual(audit_calls, 2)
         self.assertEqual(bugs["auditCycle"], 2)
         self.assertEqual(bugs["auditSha"], state["integrationSha"])
-        self.assertEqual(bug["attemptCount"], 1)
-        self.assertEqual(bug_verifications, 1)
-        self.assertEqual(len(list(paths.results.glob("BUG-0001-attempt-*-review-*.json"))), 2)
+        self.assertEqual(bug["attemptCount"], 2)
+        self.assertEqual(bug_verifications, 3)
+        self.assertEqual(len(list(paths.results.glob("BUG-0001-attempt-*-review-*.json"))), 4)
         self.assertEqual(bug_publish.call_count, 1)
-        self.assertEqual(self.git(root, "merge-base", bug["baseSha"], bug["resultSha"]), bug["baseSha"])
+        self.assertEqual(self.git(root, "merge-base", rejected_shas["bug"], bug["resultSha"]), bug["baseSha"])
+        self.assertFalse(Path(config["worktreeRoot"]).exists())
 
-    def test_parallel_task_wave_requeues_stale_review(self) -> None:
+    def test_parallel_task_and_bug_waves_requeue_stale_reviews(self) -> None:
         root, _, config = self.prepare()
         config.update(
             maximumConcurrentBuilders=2, maximumConcurrentFixers=2,
@@ -772,26 +800,22 @@ class WorkflowTests(RepositoryTestCase):
 
         assignments: list[tuple[str, str, int, str, str]] = []
         publications: list[tuple[str, str, str, str]] = []
+        waves = {kind: threading.Barrier(2) for kind in ("task", "bug")}
+        workers = {kind: set() for kind in ("task", "bug")}
+        heads: dict[str, str] = {}
 
         def fake_assignment(repository, worktree, item, kind, state_paths):
-            path = Path(worktree)
             identity = item["taskId" if kind == "task" else "bugId"]
-            filename = item["allowedPaths"][0]
-            starting_head = self.git(path, "rev-parse", "HEAD")
-            if item.get("resultSha"):
-                self.assertEqual(starting_head, item["resultSha"])
-                self.git(path, "merge", "--no-edit", item["baseSha"])
-            else:
-                self.assertEqual(starting_head, item["baseSha"])
-                (path / filename).write_text(f"{identity} attempt {item['attemptCount']}\n", encoding="utf-8")
-                self.git(path, "add", filename)
-                self.git(path, "commit", "-m", f"{identity} attempt {item['attemptCount']}")
-            head = self.git(path, "rev-parse", "HEAD")
+            if item["attemptCount"] == 1:
+                workers[kind].add(threading.get_ident())
+                waves[kind].wait(timeout=5)
+            head = f"{int(identity[-4:]) * 10 + item['attemptCount']:040x}"
+            heads[identity] = head
             assignments.append((kind, identity, item["attemptCount"], item["baseSha"], head))
             result = {
                 "status": "completed" if kind == "task" else "fixed", "summary": "implemented",
                 "commitSha": head, "checks": [], "blocker": None,
-                "filesChanged" if kind == "task" else "changedFiles": [filename],
+                "filesChanged" if kind == "task" else "changedFiles": [item["allowedPaths"][0]],
             }
             record = {
                 "schemaVersion": "1.0", "identity": identity, "attempt": item["attemptCount"],
@@ -805,11 +829,8 @@ class WorkflowTests(RepositoryTestCase):
 
         def fake_publish(repository, worktree, configuration, item, kind):
             identity = item["taskId" if kind == "task" else "bugId"]
-            base = self.git(root, "rev-parse", f"origin/{configuration['integrationBranch']}")
-            self.assertEqual(item["baseSha"], base)
-            tree = self.git(root, "rev-parse", f"{item['resultSha']}^{{tree}}")
-            merge_sha = self.git(root, "commit-tree", tree, "-p", base, "-m", f"merge {identity}")
-            self.git(root, "push", "origin", f"{merge_sha}:refs/heads/{configuration['integrationBranch']}")
+            base = item["baseSha"]
+            merge_sha = f"{int(identity[-4:]) + (100 if kind == 'task' else 200):040x}"
             publications.append((kind, identity, base, merge_sha))
             return {
                 "id": identity, "url": f"https://example.invalid/{identity}", "state": "merged",
@@ -817,13 +838,29 @@ class WorkflowTests(RepositoryTestCase):
                 "base": configuration["integrationBranch"], "baseSha": base, "mergeSha": merge_sha,
             }
 
-        checks = ["check task one", "check task two"]
+        def fake_stale_requeue(repository, configuration, item, kind, integration_sha):
+            if item["baseSha"] == integration_sha:
+                return False
+            item.update(
+                status="pending" if kind == "task" else "open",
+                baseSha=integration_sha,
+                disposition=None,
+                lastError=common.STALE_REVIEW_ERROR,
+            )
+            return True
+
+        checks = ["check task one", "check task two", "check bug one", "check bug two"]
         verifier = {
             "approved": True, "summary": "approved", "findings": [], "blocker": None,
             "checks": [{"command": command, "result": "passed", "evidence": "passed"} for command in checks],
         }
         with (
             patch.object(build_loop, "assert_prerequisites"),
+            patch.object(build_loop, "assert_plan_drift"),
+            patch.object(build_loop, "new_worktree", return_value=root),
+            patch.object(build_loop, "assert_assignment_commit", side_effect=lambda worktree, base, item, starting: {"Head": heads[item["taskId"]]}),
+            patch.object(build_loop, "requeue_stale_review", side_effect=fake_stale_requeue),
+            patch.object(build_loop, "remove_merged_assignment"),
             patch.object(build_loop, "run_assignment", side_effect=fake_assignment),
             patch.object(build_loop, "run_reviews", side_effect=fake_reviews),
             patch.object(build_loop, "publish_assignment", side_effect=fake_publish),
@@ -832,13 +869,72 @@ class WorkflowTests(RepositoryTestCase):
             self.assertEqual(build_loop.run(root), "audit")
 
         tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
+        self.assertEqual(len(workers["task"]), 2)
         self.assertEqual([task["attemptCount"] for task in tasks["tasks"]], [1, 2])
         self.assertEqual(len(list(paths.results.glob("TASK-0001-attempt-*-review-*.json"))), 2)
         self.assertEqual(len(list(paths.results.glob("TASK-0002-attempt-*-review-*.json"))), 4)
-        initial = [record for record in assignments if record[2] == 1]
-        retries = [record for record in assignments if record[2] == 2]
-        self.assertEqual(len({record[3] for record in initial}), 1)
-        self.assertEqual([record[3] for record in retries], [publications[0][3]])
+
+        findings = [{
+            "bugId": identity, "title": title, "severity": "high", "category": "correctness",
+            "requirementIds": ["REQ-ONE"], "description": "output is wrong", "evidence": "reproduced",
+            "actualBehavior": "wrong", "requiredBehavior": "correct", "impact": "workflow blocks",
+            "requiredCorrection": "correct output", "acceptanceTest": check, "dependencies": [],
+            "allowedPaths": [filename], "exclusiveResources": [],
+        } for identity, title, filename, check in (
+            ("BUG-0018", "Fix first bug", "bug-one.txt", "check bug one"),
+            ("BUG-0028", "Fix second bug", "bug-two.txt", "check bug two"),
+        )]
+        audit_calls = 0
+
+        def fake_audit_role(repository, worktree, role, context, schema, sandbox):
+            nonlocal audit_calls
+            if role != "auditor":
+                return verifier
+            audit_calls += 1
+            return {
+                "status": "completed", "summary": "findings" if audit_calls == 1 else "clean",
+                "bugs": findings if audit_calls == 1 else [], "checks": [], "missingEvidence": [], "blocker": None,
+            }
+
+        def fake_new_pr(repository, configuration, head, base, expected_head, expected_base, title, body):
+            return {
+                "id": "project", "url": "https://example.invalid/project", "state": "open",
+                "repository": "owner/repo", "head": head, "headSha": expected_head,
+                "base": base, "baseSha": expected_base, "mergeSha": None,
+            }
+
+        def fake_complete(repository, configuration, pull_request, expected_head, expected_base):
+            self.assertEqual((expected_head, expected_base), (pull_request["headSha"], pull_request["baseSha"]))
+            return {**pull_request, "state": "merged", "mergeSha": expected_head}
+
+        with (
+            patch.object(audit_loop, "assert_prerequisites"),
+            patch.object(audit_loop, "assert_plan_drift"),
+            patch.object(audit_loop, "new_worktree", return_value=root),
+            patch.object(audit_loop, "assert_assignment_commit", side_effect=lambda worktree, base, item, starting: {"Head": heads[item["bugId"]]}),
+            patch.object(audit_loop, "requeue_stale_review", side_effect=fake_stale_requeue),
+            patch.object(audit_loop, "remove_merged_assignment"),
+            patch.object(audit_loop, "complete_project_cleanup"),
+            patch.object(audit_loop, "run_assignment", side_effect=fake_assignment),
+            patch.object(audit_loop, "run_reviews", side_effect=fake_reviews),
+            patch.object(audit_loop, "publish_assignment", side_effect=fake_publish),
+            patch.object(audit_loop, "invoke_role", side_effect=fake_audit_role),
+            patch.object(audit_loop, "new_pull_request", side_effect=fake_new_pr),
+            patch.object(audit_loop, "complete_pull_request", side_effect=fake_complete),
+        ):
+            self.assertEqual(audit_loop.run(root), "complete")
+
+        bugs = common.read_json(paths.bugs, paths.schemas / "bugs.schema.json")
+        self.assertEqual(len(workers["bug"]), 2)
+        self.assertEqual([bug["attemptCount"] for bug in bugs["bugs"]], [1, 2])
+        self.assertEqual(len(list(paths.results.glob("BUG-0001-attempt-*-review-*.json"))), 2)
+        self.assertEqual(len(list(paths.results.glob("BUG-0002-attempt-*-review-*.json"))), 4)
+        for kind in ("task", "bug"):
+            kind_publications = [record for record in publications if record[0] == kind]
+            initial = [record for record in assignments if record[0] == kind and record[2] == 1]
+            retries = [record for record in assignments if record[0] == kind and record[2] == 2]
+            self.assertEqual(len({record[3] for record in initial}), 1)
+            self.assertEqual([record[3] for record in retries], [record[3] for record in kind_publications[:1]])
 
     def test_build_restart_requeues_open_pr_before_merge_validation(self) -> None:
         root, _, config = self.prepare()

@@ -26,7 +26,13 @@ def _cached_which(command: str, mode: int, path: str | None, path_value: str | N
 
 
 def _which(command: str, mode: int = os.F_OK | os.X_OK, path: str | None = None) -> str | None:
-    return _cached_which(command, mode, path, os.environ.get("PATH"), os.environ.get("PATHEXT"), os.getcwd())
+    resolved = _cached_which(command, mode, path, os.environ.get("PATH"), os.environ.get("PATHEXT"), os.getcwd())
+    if resolved is None:
+        _cached_which.cache_clear()
+    elif not os.access(resolved, mode):
+        _cached_which.cache_clear()
+        resolved = _real_which(command, mode, path)
+    return resolved
 
 
 class RepositoryTestCase(unittest.TestCase):
