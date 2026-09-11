@@ -853,7 +853,7 @@ class WorkflowTests(RepositoryTestCase):
     def test_parallel_task_and_bug_waves_requeue_stale_reviews(self) -> None:
         root, _, config = self.prepare()
         config.update(
-            maximumConcurrentBuilders=1, maximumConcurrentFixers=2,
+            maximumConcurrentBuilders=2, maximumConcurrentFixers=2,
             maximumTaskAttempts=1, maximumBugAttempts=1,
         )
         paths = common.Paths(root)
@@ -867,7 +867,11 @@ class WorkflowTests(RepositoryTestCase):
             **planned["tasks"][0], "taskId": "TASK-0028", "title": "Implement second feature",
             "allowedPaths": ["task-two.txt"], "checks": ["check task two"],
         })
-        planned["summary"].update(taskCount=2, parallelizableTaskCount=2)
+        planned["tasks"].append({
+            **planned["tasks"][0], "taskId": "TASK-0038", "title": "Implement third feature",
+            "allowedPaths": ["task-three.txt"], "checks": ["check task three"],
+        })
+        planned["summary"].update(taskCount=3, parallelizableTaskCount=3)
         self.plan(root, planned)
 
         assignments: list[tuple[str, str, int, str, str]] = []
@@ -877,6 +881,7 @@ class WorkflowTests(RepositoryTestCase):
         active = {"task": 0, "bug": 0}
         maximum_active = {"task": 0, "bug": 0}
         activity: list[tuple[str, str, str]] = []
+        task_wave = threading.Barrier(2)
         bug_wave = threading.Barrier(2)
 
         @contextmanager
@@ -889,7 +894,9 @@ class WorkflowTests(RepositoryTestCase):
                 maximum_active[kind] = max(maximum_active[kind], active[kind])
                 activity.append(("start", kind, identity))
             try:
-                if kind == "bug" and identity in {"BUG-0001", "BUG-0002"}:
+                if kind == "task" and identity in {"TASK-0001", "TASK-0002"}:
+                    task_wave.wait(timeout=5)
+                elif kind == "bug" and identity in {"BUG-0001", "BUG-0002"}:
                     bug_wave.wait(timeout=5)
                 time.sleep(0.05)
                 yield
@@ -915,6 +922,12 @@ class WorkflowTests(RepositoryTestCase):
             common.write_immutable_json(common.attempt_path(state_paths, "result", identity, item["attemptCount"]), record)
             return record
 
+        def fake_task_requeue(repository, configuration, item, kind, integration_sha):
+            if item["baseSha"] == integration_sha:
+                return False
+            item.update(status="pending", baseSha=integration_sha, lastError=common.STALE_REVIEW_ERROR)
+            return True
+
         def fake_reviews(repository, state_paths, item, kind):
             return self.persist_reviews(state_paths, item, kind)
 
@@ -933,13 +946,14 @@ class WorkflowTests(RepositoryTestCase):
                 "base": configuration["integrationBranch"], "baseSha": base, "mergeSha": merge_sha,
             }
 
-        checks = ["check task one", "check task two", "check bug one", "check bug two", "check bug three"]
+        checks = ["check task one", "check task two", "check task three", "check bug one", "check bug two", "check bug three"]
         verifier = {
             "approved": True, "summary": "approved", "findings": [], "blocker": None,
             "checks": [{"command": command, "result": "passed", "evidence": "passed"} for command in checks],
         }
         with (
             patch.object(build_loop, "assert_prerequisites"),
+            patch.object(build_loop, "requeue_stale_review", side_effect=fake_task_requeue),
             patch.object(build_loop, "assert_plan_drift"),
             patch.object(build_loop, "new_worktree", return_value=root),
             patch.object(build_loop, "assert_assignment_commit", side_effect=lambda worktree, base, item, starting: {"Head": heads[item["taskId"]]}),
@@ -952,11 +966,16 @@ class WorkflowTests(RepositoryTestCase):
             self.assertEqual(build_loop.run(root), "audit")
 
         tasks = common.read_json(paths.tasks, paths.schemas / "tasks.schema.json")
-        self.assertEqual(maximum_active["task"], 1)
-        self.assertLess(activity.index(("end", "task", "TASK-0001")), activity.index(("start", "task", "TASK-0002")))
-        self.assertEqual([task["attemptCount"] for task in tasks["tasks"]], [1, 1])
+        self.assertEqual(maximum_active["task"], 2)
+        first_task_end = min(
+            activity.index(("end", "task", "TASK-0001")),
+            activity.index(("end", "task", "TASK-0002")),
+        )
+        self.assertLess(first_task_end, activity.index(("start", "task", "TASK-0003")))
+        self.assertEqual([task["attemptCount"] for task in tasks["tasks"]], [1, 2, 1])
         self.assertEqual(len(list(paths.results.glob("TASK-0001-attempt-*-review-*.json"))), 2)
-        self.assertEqual(len(list(paths.results.glob("TASK-0002-attempt-*-review-*.json"))), 2)
+        self.assertEqual(len(list(paths.results.glob("TASK-0002-attempt-*-review-*.json"))), 4)
+        self.assertEqual(len(list(paths.results.glob("TASK-0003-attempt-*-review-*.json"))), 2)
 
         findings = [{
             "bugId": identity, "title": title, "severity": "high", "category": "correctness",
