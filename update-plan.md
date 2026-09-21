@@ -90,6 +90,16 @@ Specific local findings:
 - Supersede `BUG-0040-015`'s prohibition on schema changes but retain its compatibility concern in migration tests.
 - Retain `BUG-0037-001`, `BUG-0038-007`, and `BUG-0038-008` as migration and shallow-checkout requirements.
 
+### Planning and baseline guarantees ported from Relay
+
+For repositories with more than ten tracked files, derive deterministic fixed scout scopes from tracked top-level paths and dispatch at most `maximumConcurrentAgents` read-only scouts. Give each scout only its assigned tracked-file snapshot and prohibit scope widening, edits, subagents, and task planning. Repositories with ten or fewer tracked files skip scouting.
+
+After clarification rounds produce a complete draft, run independent contract and technical-risk reviews against the same plan digest. Contract review covers requirement mapping, task boundaries, dependencies, allowed paths, acceptance criteria, and focused/project-wide validation separation. Technical-risk review covers feasibility, regressions, security, data loss, platforms, exact paths, and executable command syntax. Clean reviews skip repair. Findings permit one planning-PM repair and one delta-only verification; unresolved findings stop without publishing `plan.md` or the task ledger.
+
+Use one hard planning-call budget covering scouts, configured clarification rounds, two reviews, one repair, one verification, and the existing malformed-result allowance. Persist reservations before launch; restart restores no capacity.
+
+Planning output must declare at least one project-wide validation command. Before any builder or candidate publication, run those commands through a sandboxed verifier in a detached worktree at the exact planned base. Persist the base commit and tree, command-set hash, command evidence, deadline, and outcome. Reuse baseline success only when the base, tree, and command hash still match. Baseline failure consumes no task attempt, launches no provider mutation, and records an actionable durable blocker.
+
 ## 3. Coordinator and scheduling
 
 Reuse the existing Python modules and standard library:
@@ -221,6 +231,18 @@ Provider observations return `passed`, `failed`, `pending`, `identity-drift`, `a
 
 Immediately before merge, revalidate provider, repository, PR, source/base refs, exact head/base SHAs, policies, checks, and approvals. GitHub uses `gh pr merge --match-head-commit`. After merge, fetch and require remote containment, expected first parent, and a tree equal to `publishedTreeId`.
 
+### Candidate validation and provider evidence ported from Relay
+
+Persist task-focused checks separately from project-wide validation commands. Run focused checks first, then every project-wide command, against the exact candidate tree before initial review.
+
+For work originating from an earlier defect, persist `sourceRef`, `testPaths`, and `regressionValidationCommands`. Require every regression command in the task's focused validation set and require carried-forward defect work to change at least one declared test path.
+
+Bind every validation result to workflow ID, assignment ID, candidate SHA, tree ID, command hash, exit status, and log identity. A timeout may replay once on the unchanged clean candidate before repair is considered. Two identical stable validation failures stop consuming ordinary implementation attempts and route through the existing shared repair budget. Infrastructure failures never fabricate code findings or start semantic repair.
+
+Persist canonical PR title/body identity, metadata hash, source reference, reviewed SHA, published SHA and tree, provider checks, approvals, and the final merged record. Refresh canonical metadata after an approved candidate changes. Provider-publication recovery reuses the exact clean approved candidate and resumes only the unfinished push, PR, metadata, check, approval, or merge operation.
+
+Before cleanup, require matching candidate, metadata hash, source provenance, merged provider record, expected tree, and remote containment.
+
 ## 8. Finite audit and closure
 
 Only the audit stage performs a whole-project review. For root-scoped Brace it covers all tracked source, tests, packaging, CLI, Git/worktree safety, providers, tracked prompts/schemas/configuration, documentation, CI/workflows, cross-platform interactions, requirements, and approved plan at one frozen integration tree.
@@ -293,6 +315,20 @@ Persistence order:
 
 Recovery reconciles the ledger, immutable result, worktree HEAD, local/remote branch, exact PR identity, provider merge state, and integration/target containment. It reuses exact evidence or consumes the already reserved attempt; it never duplicates calls, commits, pushes, PRs, or merges.
 
+### Provenance, archive, handoff, and recovery guarantees ported from Relay
+
+Add a stable workflow ID and use `<workflow-id>/<TASK-or-BUG-id>` as the human-facing qualified identity. Preserve local task and bug IDs for existing schemas and dependency references. Carry source reference, test paths, regression commands, candidate identity, PR metadata identity, and provider proof through state, status, summaries, and historical evidence. Extend the already-planned schema versions rather than reserving additional versions.
+
+Before replacing completed workflow state or discarding recoverable legacy state, write an immutable archive under `.codex/results/workflows/<workflow-id>/`. Archive validated state, task and bug ledgers, summaries, immutable assignment/results, relevant logs, manifest hashes, and `HANDOFF.md`. Create `brace/archive/<workflow-id>/<assignment-id>` refs only for clean unmerged candidates that must survive state replacement. Treat the archive as immutable historical evidence, never another active mutable source of truth.
+
+Validate archive ownership, resolved paths, hashes, candidate refs, repository identity, and workflow identity before deleting live state. A handoff records the original base, candidate SHA, archive ref when present, assignment contract, source provenance, validation failure, and next planning input.
+
+Recovery reconciles ledger state, immutable result, worktree HEAD and cleanliness, local and remote branch, exact PR, provider merge state, and integration/target containment. Reuse exact completed evidence; otherwise consume the already-reserved attempt. Never duplicate calls, commits, pushes, PRs, merges, archives, or cleanup, and never silently grant an implementation, review, repair, provider, or audit attempt.
+
+Permit one persisted replay of an unchanged clean terminal candidate when the failure was external or validation-infrastructure-related. Separate recovery presentation from user-authorized state changes while retaining Brace's existing stage-command rerun model. Add no public `recover`, `resume`, or `--yes` command.
+
+Cleanup requires a complete inactive workflow, no owned worktrees, no open owned PRs, a validated archive when replacement requires one, and exact provider proof for every integrated assignment. Cleanup failure preserves all remaining evidence and reports the exact safe next action.
+
 ## 10. GitHub issue amendments
 
 Replace issue bodies instead of adding contradictory comments/addenda. Each issue links to the exact committed version of this file and owns only its slice.
@@ -310,6 +346,17 @@ Replace issue bodies instead of adding contradictory comments/addenda. Each issu
 | #51 | Keep its test-runtime objective but measure after semantics stabilize. Replace PR #52 and remove tests for superseded behavior without weakening safety coverage. |
 | #24 | Keep deferred. Remove reserved schema versions and build later from the then-current coordinator model. |
 
+Add these Relay-behavior responsibilities to the existing issue contracts:
+
+- #25 owns bounded planning review, exact-base baseline validation, and focused/project-wide validation separation.
+- #28 exposes workflow-qualified identities, baseline state, provenance, archive state, recovery action, provider proof, and safe next command.
+- #38 owns workflow identity, persisted provenance, archive manifests, handoffs, recovery reservations, and crash-safe write ordering.
+- #41 owns canonical PR metadata, publication recovery, final provider proof, and cleanup proof.
+- #37 owns deterministic planning, baseline, provenance, archive, recovery, cleanup, Windows, Ubuntu, and shallow-checkout coverage.
+- #51 measures performance only after these behaviors are stable.
+
+Do not invent a new issue number unless the existing issue contracts cannot contain these additions cleanly.
+
 Issues remain open through exact-head integration-to-main verification. Do not claim an empirical speedup before comparative runs.
 
 ## 11. Implementation order
@@ -322,6 +369,14 @@ Issues remain open through exact-head integration-to-main verification. Do not c
 6. **Finite audit:** replace `_restart`/`while True`, add campaign limits/extensions and exact-tree validity, and remove final dual reviews.
 7. **Status:** expose phases, queues, utilization, budgets, identities, deadlines, waiting states, and next action.
 8. **Performance/docs/release:** port valid #52 fixture work, delete the executable cache, fix teardown, rewrite tests/docs, benchmark, pass both CI platforms, and merge/release.
+
+Extend that order without renumbering or replacing its existing steps:
+
+- During state foundation, add workflow identity, provenance fields, baseline records, archive manifests, handoff records, and recovery reservations.
+- Before finite scoped candidate review, add scouts, bounded plan review/repair, exact-base validation, and validation-contract separation.
+- During provider-flow work, add canonical metadata refresh, publication recovery, provider proof, and cleanup proof.
+- Before performance/docs/release, add archive/handoff behavior and translate the Relay regression cases.
+- Each addition lands through the existing isolated-worktree and provider-PR process.
 
 Every phase lands through isolated worktrees and provider PRs into the integration branch. Do not begin the next phase while the preceding exact head is red.
 
@@ -380,6 +435,35 @@ Every phase lands through isolated worktrees and provider PRs into the integrati
 - Shallow CI does not depend on unavailable history.
 - Ubuntu and Windows CI pass on the exact final head.
 
+### Relay behavior adoption
+
+- Small repositories skip scouts.
+- Nontrivial repositories receive deterministic, isolated, bounded scout scopes.
+- Scouts cannot inspect unassigned tracked areas or widen scope.
+- Both plan reviewers bind to the same plan digest.
+- Clean planning skips repair.
+- One planning repair receives the complete finding batch and only that delta is verified.
+- Unresolved planning findings publish no plan or task ledger.
+- Planning restarts restore no call capacity.
+- Baseline success is reused only for the same base, tree, and command hash.
+- Baseline failure consumes no builder attempt and starts no provider operation.
+- Focused validation precedes project-wide validation.
+- Every project-wide command runs against the exact candidate tree.
+- Carried-forward defects retain source provenance, change a declared test path, and run their regression commands.
+- Timeout replay occurs at most once on the unchanged candidate.
+- Repeated identical validation failure enters the shared repair path without exhausting unrelated implementation attempts.
+- Infrastructure failure does not trigger semantic repair.
+- Repaired candidates refresh canonical PR metadata and source provenance.
+- Publication recovery does not rerun implementation or duplicate a PR.
+- Reused task and bug IDs remain unambiguous through workflow-qualified identities.
+- Workflow replacement refuses missing, incomplete, hash-mismatched, identity-mismatched, or path-invalid archives.
+- A successful archive preserves state, ledgers, summaries, immutable evidence, logs, handoff, and required candidate refs.
+- A crash at every archive and recovery persistence boundary duplicates nothing.
+- One hundred restarts restore no consumed capacity.
+- Cleanup refuses stale provider proof, source-provenance mismatch, open PRs, remaining worktrees, or unexpected trees.
+- Cleanup failure preserves evidence and returns the correct next action.
+- Windows and Ubuntu tests cover path validation, process interruption, immutable archive verification, and cleanup.
+
 Required final checks:
 
 ```text
@@ -408,6 +492,8 @@ Explicitly excluded:
 - General validation caching, nested pools, reviewer debate/voting, or recursive review campaigns.
 - Early unreviewed PRs, whole-project audits outside audit, automatic amendments/extensions, and force pushes.
 - Multi-project orchestration from #24.
+
+These additions adapt Relay behavior to Brace's existing coordinator and schemas rather than copying a second implementation. Brace's packaging, JSON state, integration branch, PM amendments, finite closure audits, and separate later TUI plan remain authoritative. Add no new plan, command, dependency, shared framework, or speculative migration tool.
 
 The design uses Relay's demonstrated forward-only budgets, Step Functions-style finite retry exits, GitHub Actions-style bounded concurrency/timeouts, Terraform-like immutable identities, explicit AI turn limits, and Aider-like responsibility separation. These are design precedents, not proof of speed. Brace's release claim remains limited to what its tests and comparative measurements establish.
 
@@ -699,6 +785,12 @@ Before an enterprise-readiness claim, tests must prove that there are no token/p
 Add `brace doctor [repository] [--output human|json]`. Without mutation or prompts, it checks supported Python and Brace versions; Git and Codex availability; applicable GitHub or Azure CLI availability and authentication; repository, remote, and provider identity; target and integration branch visibility; configuration and schema compatibility; worktree-root accessibility; workflow-lock state; required packaged support files; and recoverability of interrupted state.
 
 `doctor` must not create directories, initialize or migrate state, fetch destructively, repair files, update schemas, modify authentication, or prompt. Reuse existing discovery and validation helpers instead of adding another provider abstraction.
+
+### Relay behavior adoption in status and doctor
+
+Add no command. Include workflow-qualified identity, source provenance, baseline status, archive and handoff state, recovery action, PR metadata identity, provider proof, and safe next command in verbose and status JSON output. Show only concise actionable summaries in default output.
+
+Make `doctor` validate baseline compatibility, archive integrity, and interrupted-state recoverability without mutation. Preserve existing noninteractive behavior and exit codes.
 
 ### Static tab completion
 
