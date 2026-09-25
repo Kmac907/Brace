@@ -17,6 +17,16 @@ from support import RepositoryTestCase
 
 
 class CliTests(RepositoryTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        if self._testMethodName not in {
+            "test_status_retries_cross_file_writer_interleaving",
+            "test_status_rejects_unrecorded_provider_merge",
+        }:
+            patcher = patch.object(common, "STATUS_SNAPSHOT_ATTEMPTS", 1)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_commands_and_init_flags_parse(self) -> None:
         args = cli.parser().parse_args([
             "init",
