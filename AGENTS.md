@@ -1,14 +1,10 @@
-# Brace development instructions
+# Brace rewrite
 
-- Preserve the three-stage design: planning, build, and audit/bug-fix.
-- Keep project state repository-local and portable. Brace itself is a uv-packaged Python CLI; do not introduce a service or compiled application.
-- Use Python 3.11+ and resolve support files relative to `__file__`.
-- Prefer the Python standard library; add dependencies only for trust-boundary functionality the standard library does not provide.
-- Never embed credentials, user-specific paths, repository identities, or remote identities.
-- Keep mutable project state in ignored `.codex/*.json` files.
-- Only coordinator scripts may change shared state ledgers.
-- Keep semantic decisions in the project-manager agent. The Python coordinator validates and applies PM output but must not invent contract or scope changes.
-- PM amendments must be user-approved, isolated, durable, provider-integrated, and safely resumable. Never rewrite integrated tasks; append follow-up tasks and supersede only untouched pending work.
-- All task and bug changes must use isolated worktrees and provider pull requests.
-- Validate exact paths before removing worktrees or temporary directories.
-- Add deterministic tests for state transitions, retries, recovery, drift, and cleanup.
+The user has requested a complete, clean-slate rewrite in Go with a local supervisor.
+
+- Read `REWRITE-PLAN.md` as the self-contained specification for the new product.
+- Do not reuse or port legacy code, tests, prompts, schemas, configuration, state, plans, or development guidelines.
+- Do not recover or continue legacy tasks, issues, branches, worktrees, or agent conversations.
+- Remaining legacy implementation files are pending removal at milestone M0; they are not design references. Nested legacy instruction files do not govern this rewrite.
+- Current authorization covers analysis, retiring legacy planning documents, and writing the rewrite plan. Implementation begins when the user requests it.
+- Explicit subsequent user instructions take precedence over the plan.
