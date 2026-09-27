@@ -1,6 +1,6 @@
 # Brace: clean-slate rewrite plan
 
-Status: design proposal. Implementation has not started.
+Status: specification only, as confirmed by the user. Implementation has not started.
 
 ## 1. Authority and scope
 
@@ -9,31 +9,31 @@ This document is sufficient to start in an empty source tree. No previous Brace 
 The user requirements are:
 
 1. Move toward the supervision experience of Untrivial-ai/agent-orchestrator.
-2. Deliver a complete CLI before developing the UI.
+2. Deliver the CLI foundation first, then a native terminal UI (TUI) as the primary interactive application.
 3. Make individual agents visible and steerable.
 4. Remove unnecessary waiting, repeated reviews, and fragile recovery.
 5. Make planning and focused tasks easy to start.
 6. Maximize useful throughput while prioritizing accuracy.
 7. Rewrite everything; do not migrate or reuse the old product.
 
-All architectural choices below are new proposals. There is no inherited requirement for Python, three global stages, JSON ledgers, an integration branch, or avoiding a supervisor. Agent-orchestrator is a product reference, not code to copy. Its task sessions and project orchestrator are relevant precedents; feature-for-feature parity is not the initial scope. [Reference overview](https://github.com/Untrivial-ai/agent-orchestrator)
+All architectural choices below are new proposals. Python and uv are selected by the latest user instruction; this does not reinstate the legacy implementation or its guidelines. There is no inherited requirement for three global stages, JSON ledgers, an integration branch, or avoiding a supervisor. Agent-orchestrator is a product reference, not code to copy. Its task sessions and project orchestrator are relevant precedents; feature-for-feature parity is not the initial scope. [Reference overview](https://github.com/Untrivial-ai/agent-orchestrator)
 
 ### Proposed defaults
 
 | Decision | Proposal |
 |---|---|
-| Runtime | Go; one executable containing CLI, supervisor, and internal session-host modes |
+| Runtime | Python 3.12+; one uv-installed package exposing CLI, supervisor, and internal session-host modes |
 | Deployment | One local user; Windows, macOS, Linux; no Brace cloud account |
 | State | Local SQLite database and bounded local artifacts |
 | First harness | Codex native app-server protocol |
-| Second harness | Claude Code through a documented structured integration, subject to capability testing |
+| Additional harness | Deferred; Claude Code is a candidate subject to demand and capability testing; not a CLI/TUI release gate |
 | First Git provider | GitHub; add others when required |
 | Integration | Task-owned branch/worktree and PR to the configured target |
 | Merge authority | Explicit human merge by default; project policy can authorize automatic merge |
-| UI | Local browser application after the CLI release gate |
+| Interactive application | Python Textual TUI after the CLI release gate; primary interactive entrypoint |
 | Compatibility | No legacy imports, migration, aliases, or recovery |
 
-The user confirmed Go CLI and local supervisor during planning. This is a firm architecture decision. M0 pins supported versions and validates dependencies; this plan does not claim a tested compatibility matrix.
+The user selected Python with uv packaging to simplify implementation. This supersedes the earlier Go implementation choice. Keep the local supervisor, persistent sessions, SQLite, and TUI. Go or Rust may replace a specific component only when a required capability or measured performance limit justifies it. M0 pins supported versions and validates dependencies; this plan does not claim a tested compatibility matrix.
 
 ## 2. Product and release boundaries
 
@@ -61,15 +61,15 @@ Planning, implementation, review, and repair can coexist across different tasks.
 - Observe provider checks/reviews and integrate under explicit policy.
 - Recover from client, supervisor, host, agent, and provider failures honestly.
 - Support JSON, replayable events, noninteractive commands, completion, and diagnostics.
-- Support Codex fully and validate a second harness before claiming harness portability.
+- Support Codex fully with explicit capability limits and conformance tests. Additional harnesses are not a V1 requirement; do not claim harness portability before a second integration passes those tests.
 
-### V2: UI
+### V2: terminal application
 
-Project board, worker detail, orchestrator conversation, attention queue, and PR/evidence inspection. All actions use the same API and rules as the CLI. No UI-only orchestration.
+A native terminal application with project board, worker detail, orchestrator conversation, attention queue, and PR/evidence inspection. After this release, `brace` opens the TUI in an interactive terminal; `brace tui` opens it explicitly. CLI subcommands remain available for automation. All actions use the same API and rules as the CLI; the TUI owns no orchestration.
 
 ### Deferred
 
-Cloud workers, teams/tenancy, billing, mobile apps, remote exposure, plugins, arbitrary workflow designers, embedded browsers, terminal emulation, automatic harness switching, and cross-harness transcript translation. No scaffolding is needed for these features in V1.
+Additional harness integrations, cloud workers, teams/tenancy, billing, mobile apps, remote exposure, plugins, arbitrary workflow designers, embedded browsers, terminal emulation, automatic harness switching, and cross-harness transcript translation. No scaffolding is needed for these features in V1. A second harness does not block either the CLI release or the TUI.
 
 ## 3. Success and accuracy contract
 
@@ -120,7 +120,7 @@ An audit names scope, revision, checks, and budget. Accepted findings become ord
 ## 5. Architecture
 
 ```text
-CLI now / browser UI later
+Python CLI foundation / Textual TUI as the interactive app
             |
 authenticated local command API + event stream
             |
@@ -135,29 +135,46 @@ installed coding harnesses / validation processes
 task worktrees and exact-candidate verification workspaces
 ```
 
-The supervisor allows work to continue after a client exits and gives mutations one owner. Session hosts retain native protocol connections and pending interactions across supervisor restarts. A host is an internal mode of the same binary, not another installed service. SQLite provides transactions. The API prevents CLI/UI divergence.
+The supervisor allows work to continue after a client exits and gives mutations one owner. Session hosts retain native protocol connections and pending interactions across supervisor restarts. A host is an internal mode of the same installed Python package, launched with that installation's interpreter; it is not another installed service. SQLite provides transactions. The API keeps CLI and TUI behavior consistent.
 
 AO similarly separates its local backend, clients, sessions, and derived display status. This design uses that separation as a precedent without porting AO code. [AO architecture](https://github.com/Untrivial-ai/agent-orchestrator/blob/main/docs/architecture.md)
 
-Start with one Go module and packages for real boundaries: commands, persistence, scheduling, session runtime, harness integration, Git/provider integration, verification. Do not create an interface per entity. Introduce interfaces where boundary tests or a second implementation need them.
+Start with one Python distribution in a fresh `src/brace/` layout. Use small modules for actual boundaries: commands, persistence, scheduling, session runtime, harness integration, Git/provider integration, verification. Do not create an interface per entity or a package per class. Introduce protocols where boundary tests or a second implementation need them.
 
-Use Go's standard library for HTTP, JSON, subprocesses, concurrency, filesystem work, and tests. Use a maintained SQLite driver; `modernc.org/sqlite` is a candidate CGo-free driver, pending platform/performance validation. Evaluate a CLI library only if it materially reduces command/completion code. [Driver documentation](https://pkg.go.dev/modernc.org/sqlite)
+Use Python's standard library for CLI parsing (`argparse`), JSON, subprocess/process primitives, asynchronous coordination (`asyncio`), SQLite (`sqlite3`), filesystem operations, and tests (`unittest`). Use `aiohttp` for the authenticated local HTTP client/server and event streams, `jsonschema` for structured trust-boundary validation, and Textual for the TUI at M9. Do not implement a custom HTTP parser or terminal framework. Add platform bindings only when necessary to implement verified process ownership. Pin a tested dependency set; selecting a familiar library does not authorize copying any old implementation. [Python SQLite](https://docs.python.org/3/library/sqlite3.html), [aiohttp](https://docs.aiohttp.org/en/stable/)
+
+### Python execution model and selective native ports
+
+Use `asyncio` tasks for model/protocol streams, provider observation, and scheduling. Run installed coding harnesses as separate processes. These are largely external/I/O-bound operations; increased agent concurrency does not require parallel Python bytecode execution. Profile CPU-heavy work before changing runtimes. [Python asynchronous subprocesses](https://docs.python.org/3/library/asyncio-subprocess.html)
+
+Keep blocking SQLite operations on a dedicated, bounded database executor with a connection owned by that thread; route state transactions through the supervisor. Await results without blocking the event loop and do not share a connection between arbitrary threads. Keep transactions short and coordinate cancellation so an accepted write is reconciled even when its waiting client disconnects. Use bounded workers for other blocking local operations. Do not introduce multiprocessing for ordinary network/model orchestration.
+
+Launch supervisor and session-host modes using the installation's `sys.executable` and module entrypoints, not whichever `python` happens to be on PATH. Include package version, protocol version, interpreter/environment identity, and process generation in ownership handshakes. Detach from the launching terminal and redirect standard streams intentionally; Windows background launches must not open unwanted console windows. Resolve packaged support resources with `importlib.resources`, independent of the caller's working directory.
+
+Python does not remove native process-lifecycle requirements. M0/M2 must prove safe child creation, Job Object association, handle ownership, cancellation, and orphan reconciliation on Windows. Use a maintained platform binding when it supplies the necessary guarantees; a process group or `Popen.kill()` alone is not proof that Windows descendants stopped. Keep equivalent real-process tests on POSIX.
+
+Only propose a Go or Rust port when:
+
+1. A reproducible acceptance case establishes a required capability that supported Python/library integration cannot safely provide; or
+2. Profiling shows a specific Python component prevents the agreed latency/throughput/resource targets after straightforward fixes.
+
+Record the failing requirement, measured evidence, Python alternatives considered, and proposed smallest replacement. Port that component behind the existing versioned process/API boundary and run the same conformance tests. Examples may include an OS-specific process host or a measured CPU-heavy operation; neither is assumed necessary now. Preserve CLI behavior, task identity, data, and recovery semantics. A full-language rewrite requires its own evidence-backed decision. Add no native build pipeline, FFI, or compatibility framework in anticipation of a future port.
 
 ### Local transport and ownership
 
 Use authenticated loopback HTTP on an OS-selected port. A private discovery file contains port, supervisor identity, API version, and startup generation. Keep a random local authentication secret in user-restricted storage; never put it in process arguments or URLs.
 
-Validate Host and Origin, prohibit permissive CORS, and authenticate application routes. The later UI uses a one-use bootstrap exchange and scoped browser session. Localhost alone is not authentication. These controls protect against unrelated browser origins, not a compromised local user account.
+Authenticate application routes and validate Host. Reject browser-origin requests; expose no browser sessions, static frontend assets, or CORS-enabled application endpoints. Both native clients read the private discovery credentials. Localhost alone is not authentication. These controls protect against unrelated browser origins, not a compromised local user account.
 
 An OS exclusive lock prevents two supervisors from owning the same data directory. Never use a PID alone as proof of ownership. Verify endpoint identity and generation before adoption or replacement.
 
 | Component | Responsibility | Prohibited shortcut |
 |---|---|---|
-| CLI/UI | Input, rendering, subscriptions | Direct database writes |
+| CLI/TUI | Input, rendering, subscriptions | Direct database writes |
 | Supervisor | Policy, commands, scheduling, reconciliation | Treating agent claims as verified facts |
 | Session host | Native transport, owned processes, replay journal | Changing scope or merging PRs |
 | Orchestrator | Semantic planning and proposals | Bypassing user policy or budgets |
-| Worker | Implementation and repair | Approving itself or editing supervisor records |
+| Worker | Implementation and repair in its owned workspace | Approving itself, creating commits, changing branches/history, pushing, managing PRs, or editing supervisor records |
 | Reviewer | Independent evidence-backed findings | Editing the reviewed candidate |
 | Git/provider integration | Facts and authorized operations | Treating unknown/stale observations as success |
 
@@ -236,7 +253,7 @@ The adapter must discover executable/version, report authentication readiness sa
 
 Capabilities are explicit: resume, steer, approval delivery, history reconciliation, usage, sandbox controls, interruption. Unsupported operations return typed errors; they cannot silently create a fresh conversation or broaden permissions.
 
-The second-harness spike tests Claude Code's documented integration and/or ACP. ACP defines sessions and permission interactions; that does not prove any particular implementation offers durable recovery. Advertise only tested capabilities. [ACP overview](https://agentclientprotocol.com/protocol/overview)
+When demand justifies another harness, first test its documented structured integration against the existing permission, session, recovery, and control conformance cases. Claude Code and/or ACP are candidates, not initial dependencies. ACP defines sessions and permission interactions; that does not prove any particular implementation offers durable recovery. Advertise only tested capabilities and document unsupported operations; a generic shell runner is not equivalent support. No second-harness spike is required for M0 or either release. [ACP overview](https://agentclientprotocol.com/protocol/overview)
 
 ### Session host
 
@@ -258,6 +275,7 @@ A proposed task contains:
 - Acceptance criteria and required check/manual-evidence definitions.
 - Dependencies and their rationale.
 - Expected edit scope and exclusive resources.
+- Shared-interface contract references and revisions when tasks interact through an interface.
 - Risk category and review policy.
 - Size/resource estimates clearly marked as estimates.
 - Agent/model selection, permission profile, and budgets within user policy.
@@ -265,6 +283,10 @@ A proposed task contains:
 Mechanically validate dependency existence/cycles, scope syntax, executable/argument shape, and budgets. The orchestrator decides semantics; deterministic software validates and enforces the resulting contract.
 
 Prefer small vertical changes that can be accepted independently. Shared interfaces and migrations may need prerequisites. Do not split by arbitrary file count or maximize parallelism at the expense of integration risk.
+
+Before dispatching tasks that consume or implement a shared interface, the orchestrator supplies the same approved interface contract in each affected worker's context. Specify the relevant signatures or schemas, error behavior, invariants, ownership, and contract revision. Record these as part of the task contracts; no separate contract service is needed. Software validates matching references/revisions, while the orchestrator owns their meaning. If the interface cannot yet be settled, create a prerequisite task and wait for its integration rather than asking parallel workers to invent incompatible assumptions. Unrelated tasks need no interface artifact.
+
+An interface amendment identifies all affected tasks and evidence and follows the contract approval flow below. Running workers cannot silently adopt different interface revisions; dependent work resumes only with consistent approved context.
 
 Approval creates an immutable contract revision. A scope change records its diff, rationale, impacted tasks/evidence, and required decision. Approval creates the next revision rather than rewriting history. Existing implementation remains available but must be checked against the updated criteria.
 
@@ -317,6 +339,14 @@ Coalesce provider polling per PR, back off unchanged observations, respect rate 
 
 ## 11. Verification and independent review
 
+### Candidate ownership
+
+Workers leave implementation and repair changes uncommitted in their isolated task worktrees. The supervisor's Git integration owns candidate commits, branch/history changes, pushes, and PR mutations. Record the expected HEAD and branch before each worker turn; unexpected history or branch changes stop candidate publication and preserve the work for inspection. Enforce these operation boundaries through the harness permission profile and supervisor checks, not solely through prompt instructions.
+
+At a settled turn boundary, stop writes to the workspace, inspect the intended tracked and untracked changes against the approved scope, and create an immutable candidate through the supervisor. Persist its parent/head/tree identities and contract revision before releasing it to checks or reviewers. Do not blindly stage every file or include unexplained artifacts. A worker-reported blocker remains unresolved even when the process exits successfully; neither a summary nor a successful exit establishes completion.
+
+Run validation and review in isolated checkouts of that frozen candidate. Generated files or edits in verification workspaces never silently enter the candidate. An intended additional change returns through the worker and becomes a new supervisor-created candidate with the required gates. Repair preserves ancestry and useful work rather than resetting the implementation.
+
 ### Executable checks
 
 A check specifies executable, argument array, working directory, timeout, permitted environment, and expected outcome. Shell execution requires an explicit shell definition. Never concatenate model text into shell code.
@@ -364,6 +394,18 @@ PRs target the configured branch directly. There is no mandatory campaign integr
 ### Publication
 
 After local gates pass, push the owned branch and create/reconcile its PR. Persist an operation key and stable ownership metadata before acting. After a lost response, query exact provider/repository/branch identity before retrying. Ambiguous ownership stops with attention rather than creating another PR.
+
+### Base updates and conflict resolution
+
+Use native Git for ordinary base updates. A provider error or unknown mergeability is not evidence of a code conflict. Start an agent resolution action only after Git establishes an actual conflict against captured candidate and target commits.
+
+1. Record durable action intent, candidate/target identities, contract revision, owned workspace, deadline, and budget reservation. Hold the task's single-writer reservation; keep model work and CI waiting outside the short target integration lock.
+2. Prepare an isolated merge workspace from the recorded candidate and target. Supply the resolver with the task and shared-interface contracts, both sides' relevant intent and changes, conflicting paths, and Git diagnostics. Resume the owning worker conversation where supported.
+3. Permit edits and staging needed to resolve those conflicts, within the approved scope. The supervisor owns starting, completing, or aborting the merge. The resolver cannot commit, reset, rebase, switch branches, push, or change the merge inputs. A scope or interface decision goes to the orchestrator/user rather than being guessed by the resolver.
+4. Before committing, verify the expected HEAD and merge target, no unresolved index entries, and the intended changed paths. Preserve unexpected or unresolved work for inspection. The supervisor freezes the resolution as a new candidate; run mandatory integration checks and the review required by section 11. Previous whole-candidate approval does not authorize the changed tree.
+5. Refresh provider and target facts before publication/merge and apply the exact-input merge gate below. Further target movement invalidates affected evidence and may require another bounded update; do not force-push over unexplained changes.
+
+Resolution turns consume the task's persisted repair budget; Git/provider retries consume their external-operation budgets. Do not allocate a fresh allowance for each conflict workspace or supervisor restart. Exhaustion, unresolved conflict, or ambiguous operation outcome preserves the candidate/workspace and raises attention; it cannot trigger an unbounded new agent loop. Recovery reconciles recorded identities and actual Git state before resuming.
 
 ### Observations and feedback
 
@@ -432,6 +474,7 @@ Removing one project cannot delete another project's data. Do not delete the onl
 All product commands call supervisor operations. Read-only commands neither start model work nor repair data. Settle exact positional syntax in M0 and test it as a public contract.
 
 ```text
+brace tui [--project ID]    # Added at M9; bare brace also opens TUI in a terminal
 brace version
 brace completion <shell>
 brace doctor [--project ID] [--json]
@@ -493,7 +536,7 @@ Start the supervisor explicitly or via the first mutation with a clear startup m
 
 ## 16. API, events, and status
 
-Expose a versioned local API for projects, plans, tasks, sessions, decisions, evidence, and PRs. Define request/response structures once and generate the later UI's API schema. No multiple SDKs in V1.
+Expose a versioned local API for projects, plans, tasks, sessions, decisions, evidence, and PRs. Define request/response structures once in Python and share one typed client between the CLI and TUI. Document the wire contract; do not introduce a separate frontend schema generator or multiple SDKs.
 
 Responses distinguish accepted from completed and include request/operation IDs, revision, state, and typed error. Queuing input must not claim the agent has acted.
 
@@ -501,7 +544,7 @@ Events commit with state changes. SSE clients reconnect with a cursor and replay
 
 Write events directly in supervisor transactions. No CDC triggers or general event bus initially. Bound subscriber queues and disconnect slow readers with a replay cursor; they cannot block scheduling.
 
-Derive display state in one coherent read projection from facts. Categories include queued, working, needs input, blocked, checking, in review, ready to merge, integrated, cancelled, and failed. Always include precise reason and observation time. CLI and UI share that projection.
+Derive display state in one coherent read projection from facts. Categories include queued, working, needs input, blocked, checking, in review, ready to merge, integrated, cancelled, and failed. Always include precise reason and observation time. CLI and TUI share that projection.
 
 ## 17. Observability and release targets
 
@@ -542,6 +585,10 @@ All tests are newly authored from this plan. No legacy fixtures, expectations, t
 
 Use a fake clock, controlled completion queue, fake harness, and fake provider. Avoid sleeps/model calls for state and scheduling tests. Cover terminal states, dependencies/cycles, conflicts, fairness, approvals, quota/resource ownership, budgets, and stale generations.
 
+Prove overlapping execution with controlled start/release barriers: at least two independent workers must start before either is allowed to finish when capacity permits. Include bounded timeouts so accidental serialization fails the test instead of hanging. Also prove the configured concurrency ceiling and progress of unrelated work while another task is blocked; elapsed-time speedups alone are not concurrency evidence.
+
+Assert exact permitted model invocation counts in deterministic success, review repair, conflict resolution, provider failure, and recovery scenarios. Record calls by task, candidate, and action purpose. Duplicate observations cannot repeat a completed review or repair; provider/cleanup failures cannot launch code repair; exhausted or ambiguous actions cannot relaunch without the specified reconciliation or authorization. Restart preserves consumed and reserved budgets. These are scenario-specific assertions, not a blanket prohibition on authorized bounded repair.
+
 Inject failure at each external boundary: before intent commit, after intent commit, after launch, after external acceptance, before result persistence, and after persistence before response. Repeat client request IDs and replay out-of-order host/provider events.
 
 ### Real boundaries
@@ -569,9 +616,12 @@ Inject failure at each external boundary: before intent commit, after intent com
 13. Agent output, repository instructions, and PR text cannot issue privileged commands.
 14. Cleanup rejects other-project paths, symlink/junction escapes, and unexplained unpushed work.
 15. Slow subscribers cannot stall scheduling or silently lose critical decisions.
-16. Concurrent CLI/browser decisions reject stale revisions instead of double-applying changes.
+16. Concurrent CLI/TUI decisions reject stale revisions instead of double-applying changes.
+17. Parallel producer/consumer tasks receive matching shared-interface revisions; an unsettled interface creates an integrated prerequisite, and an amendment invalidates affected context/evidence.
+18. Unexpected worker commits/branch changes block publication; verification-generated files cannot enter the frozen candidate or acquire its approval.
+19. A real Git conflict is resolved against recorded head/base identities, receives fresh required gates, and retains unresolved work without exceeding its budget; target movement and restart cannot bypass those rules.
 
-Run fast core tests on every change, affected boundary tests during development, and the full cross-platform gate before release. Use Go's race detector on supported CI targets. Live model/provider checks are opt-in with expense/credential boundaries; mocks do not establish live compatibility.
+Run fast core tests on every change, affected boundary tests during development, and the full cross-platform gate before release. Use `unittest` and `IsolatedAsyncioTestCase` with fake clocks and controlled interleavings. Enable asyncio debug checks in CI, check leaked tasks/processes/resources, and exercise real concurrency boundaries; passing tests do not establish an absence of races. Live model/provider checks are opt-in with expense/credential boundaries; mocks do not establish live compatibility.
 
 ## 19. Milestones and dependency order
 
@@ -583,12 +633,12 @@ Deliver:
 
 - Remove legacy source, tests, templates, prompts, schemas, packaging/lockfiles, CI/release/site workflows, and product documentation from the rewrite tree.
 - Retain legal/license obligations and Git history, without deriving implementation guidance from them.
-- Create the Go module, minimal CLI, test entrypoint, and cross-platform build matrix from scratch.
-- Pin supported Go, SQLite-driver, Git, and harness versions after actual compatibility checks.
+- Create fresh `pyproject.toml`, `uv.lock`, Python package, console entrypoint, tests, and cross-platform build/install matrix from scratch. Use `uv_build` as the initial build backend, subject to a pinned compatible version.
+- Pin supported Python/uv, dependency, Git, and harness versions after actual compatibility checks. Verify the Python runtime includes a compatible SQLite library on every supported platform.
 - Settle command syntax, public errors/events, and essential dependency choices.
-- Prove Codex structured interaction and OS process ownership feasibility; spike the second harness.
+- Prove Codex structured interaction and OS process ownership feasibility. Additional harness feasibility work is deferred until that integration is requested.
 
-Exit: clean build/help/version on Windows, macOS, Linux; no references to legacy runtime paths; no model/provider mutation from installation/help; a recorded capability matrix and resolved blocking architecture questions.
+Exit: fresh wheel/sdist builds and isolated `uv tool install` plus help/version smoke on Windows, macOS, Linux; no references to legacy runtime paths; no model/provider mutation from installation/help; a recorded capability matrix and resolved blocking architecture questions.
 
 ### M1 — Durable local commands
 
@@ -606,51 +656,51 @@ Exit: real coding turn and continuation, supported steering, one-time permission
 
 Depends on M2. Deliver contracts/approval, task worktrees, candidates, deterministic checks, independent review, retained repair, PR publication/observation, and explicit merge. Implement review/evidence/PR inspection.
 
-Exit: a real task reaches verified merge; an injected defect is repaired in the same session; lost replies and target advancement cannot bypass gates.
+Exit: a real task reaches verified merge; supervisor-owned candidate snapshots exclude verification artifacts; an injected defect is repaired in the same session; bounded conflict resolution, lost replies, and target advancement cannot bypass gates.
 
 ### M4 — Continuous concurrency
 
 Depends on M3. Deliver bounded scheduling, dependencies, ownership/conflicts, fairness, reviewer/check scheduling, provider backoff, and target integration reservations. Show queue reasons/utilization.
 
-Exit: simulated utilization/refill targets; a blocked task does not hold unrelated work; limits and reservations hold under races; model/network execution never holds shared mutation locks.
+Exit: simulated utilization/refill targets; controlled barriers prove overlapping workers within the configured ceiling; a blocked task does not hold unrelated work; limits and reservations hold under races; model/network execution never holds shared mutation locks.
 
 ### M5 — Project orchestration and audit
 
 Depends on M3; integrate with M4 before qualification. Deliver persistent orchestrator conversation, focused-task clarification, task-graph proposals, subset approval, contract revision, delegation, scope decisions, and bounded audits.
 
-Exit: ambiguous outcome becomes approved tasks; independent work proceeds; scope changes preserve history; findings become ordinary bounded repair tasks.
+Exit: ambiguous outcome becomes approved tasks; independent work proceeds with matching shared-interface contracts or explicit prerequisites; scope changes preserve history; findings become ordinary bounded repair tasks.
 
 ### M6 — Recovery and accuracy qualification
 
 Depends on M4 and M5. Basic recovery is already required in earlier milestones; this completes the matrix. Deliver fault injection, evidence reuse, seeded defects, scoped/full-review comparison, backup/restore, cleanup and security tests.
 
-Exit: all critical/high required defect and failure scenarios pass; uncertainty stays visible; no weakened review policy without evidence; cancellation/cleanup verified cross-platform.
+Exit: all critical/high required defect and failure scenarios pass; invocation-count assertions prove retries, reviews, and conflict repair stay within durable budgets across restart; uncertainty stays visible; no weakened review policy without evidence; cancellation/cleanup verified cross-platform.
 
-### M7 — Second harness and complete CLI
+### M7 — Complete CLI
 
-Depends on M6; harness feasibility was spiked in M0. Deliver the second real integration, explicit capability limits, stable JSON/NDJSON, completion, noninteractive decisions, diagnostics, pagination, exit codes, and complete usage examples.
+Depends on M6. Deliver explicit Codex capability limits, stable JSON/NDJSON, completion, noninteractive decisions, diagnostics, pagination, exit codes, and complete usage examples.
 
-Exit: shared conformance tests run against both integrations; capability limitations are truthful; every required workflow can be performed through CLI without editing storage or using a UI.
+Exit: conformance tests pass for the supported Codex integration; capability limitations are truthful; every required workflow can be performed through CLI without editing storage or requiring the TUI.
 
-If the second harness cannot satisfy required permission/recovery semantics, record the exact unmet criteria and resolve scope explicitly. Do not quietly substitute a generic shell runner and claim parity.
+Additional harness support is a separate follow-up when required, using the existing conformance cases. Neither that work nor a portability claim is a prerequisite for M8 or M9.
 
 ### M8 — Throughput qualification and CLI release
 
-Depends on M7. Deliver scheduler benchmarks, repeated live evaluation, fresh-install testing, release artifacts/checksums, new-format upgrade policy, complete CLI documentation, and limitations.
+Depends on M7. Deliver scheduler benchmarks, repeated live evaluation, fresh-install testing, wheel/sdist artifacts and checksums, uv installation/upgrade/uninstall smoke tests, registry/release publishing, a safe stopped-process upgrade procedure, new-format upgrade policy, complete CLI documentation, and limitations.
 
-Exit: targets pass or have evidence-backed explicit revisions; accuracy gates stay intact; release artifacts pass cross-platform smoke tests. Ship the CLI before beginning UI implementation.
+Exit: targets pass or have evidence-backed explicit revisions; accuracy gates stay intact; release artifacts pass cross-platform smoke tests. Ship the CLI foundation before beginning TUI implementation.
 
-### M9 — UI
+### M9 — Native terminal application
 
-Begins only after M8 acceptance. Deliver the local browser interface, served by the same binary and authenticated API. A small TypeScript/React application is the proposed implementation; select/pin UI tooling at M9, not during M0.
+Begins only after M8 acceptance. Deliver the native terminal interface in the same Python distribution using Textual for widgets, layout, input, and asynchronous view updates. Pin compatible versions at M9 and include the TUI in the normal installation. Reuse the shared authenticated local API client; do not build a browser frontend or add a Node.js toolchain.
 
-Exit: CLI/UI parity, keyboard-accessible workflows, stream reconnect/replay, large-history handling, and stale-decision safety. No UI-owned orchestration state.
+Exit: CLI/TUI parity, complete keyboard workflows, terminal resize/restoration, stream reconnect/replay, large-history handling, and stale-decision safety on Windows, macOS, and Linux. `brace` launches the TUI interactively; noninteractive commands remain stable. No TUI-owned orchestration state.
 
 ### Implementation work breakdown
 
 | Work package | Deliverable | First milestone | Proof |
 |---|---|---|---|
-| Platform/build | Binary, install, version, CI matrix | M0 | Fresh-platform smoke |
+| Platform/build | Python package, uv install, version, CI matrix | M0 | Fresh-platform smoke |
 | State/commands | Transactions, identities, decisions, revisions | M1 | Crash/replay tests |
 | Local API | Authentication, request IDs, reads/events | M1 | Unauthorized/stale/repeated request tests |
 | Host/runtime | Child ownership, journal, reconnect | M2 | OS process tests |
@@ -661,37 +711,137 @@ Exit: CLI/UI parity, keyboard-accessible workflows, stream reconnect/replay, lar
 | Scheduler | Continuous dispatch, conflicts, fairness | M4 | Fake-clock resource tests |
 | Orchestrator | Proposals, approval, delegation, audit | M5 | Outcome-to-task acceptance |
 | Qualification | Full recovery/security/accuracy matrix | M6 | Recorded gate results |
-| Portability/CLI | Second harness, automation, completion | M7 | Shared conformance and CLI goldens |
+| CLI | Automation, completion, Codex capability reporting | M7 | Codex conformance and CLI goldens |
 | Performance/release | Benchmarks, packaging, docs | M8 | Reproducible release evidence |
-| UI | Board, conversation, attention, evidence | M9 | Shared API/UI acceptance |
+| TUI | Terminal board, conversation, attention, evidence | M9 | Shared API/TUI and terminal acceptance |
 
 Work packages may be developed independently after their contracts exist, but milestone acceptance follows the dependency order. More simultaneous implementation agents is not a substitute for a coherent vertical slice.
 
-## 20. UI specification after CLI release
+## 20. Terminal application specification
 
-### Project board
+The TUI is the primary interactive product. The CLI supplies automation and the underlying operational foundation. Both ship in the same Python distribution installed with uv; the supervisor and session hosts remain independent of terminal lifetime.
 
-Show queued, working, needs attention, in review, ready to merge, and completed tasks. Cards include task, harness, current action, branch/PR, and precise wait reason. Categories/counts come from the shared read projection.
+Use [Textual](https://textual.textualize.io/guide/workers/) for terminal widgets, layout, input, rendering, and background UI operations. Use its supported APIs rather than writing a terminal renderer. Textual belongs in the normal package dependencies once the TUI ships. Add component dependencies only for controls actually needed; no custom UI framework, browser frontend, or JavaScript runtime.
+
+### Launch and lifecycle
+
+```text
+brace                         # Open the TUI when stdin/stdout are terminals
+brace tui                     # Explicit terminal application
+brace tui --project ID        # Open a selected project
+brace status --json           # Automation remains a normal CLI command
+```
+
+Before M9, bare `brace` prints CLI help. At M9, bare `brace` opens the TUI only when both stdin and stdout are terminals; otherwise it prints plain help without starting work. Explicit `brace tui` without a usable terminal exits with a concise diagnostic and points to CLI commands.
+
+Opening the TUI may start the local supervisor, with visible connecting/starting state; it never starts agents merely by opening a project. Reopening attaches to current sessions and persisted events. Closing the TUI detaches; coding work continues under the supervisor. Cancelling a worker or stopping the supervisor is always an explicit separate action.
+
+Restore terminal modes, cursor visibility, and alternate-screen state on normal exit, handled errors, and interrupts. A terminal disconnect must not cancel worker execution. Surface an actionable reconnect message if the supervisor disappears; reconnect from the last durable event cursor and resync when necessary.
+
+### Layout
+
+Wide terminals show project/task navigation on the left, selected content in the center, and contextual details when space permits. Narrow terminals show one pane at a time with clear navigation and a persistent project/session label. Never require a wide Kanban layout to operate the product.
+
+The header shows project, connection health, active-agent capacity, and attention count. The footer shows context-sensitive keyboard actions. Detailed budgets, exact commits, and validation artifacts belong in detail views, not every row.
+
+Provide stable selection by object ID while events update rows. Do not jump focus or reorder the user's selected item unexpectedly. Explicit sort/filter changes may reorder results; background updates must preserve the selection and scroll anchor where possible.
+
+### Project overview
+
+Show tasks grouped or filtered by queued, working, needs attention, in review, ready to merge, and completed. Rows/cards identify task, agent, active action, branch/PR, and precise waiting reason. Counts and display categories use the shared read projection.
+
+Allow project selection, focused-task creation, plan inspection, priority changes, and worker navigation. In an empty installation, guide the user through registering a repository and checking readiness. Preserve unrelated dirty files and do not initialize or rewrite repositories merely to populate the screen.
 
 ### Worker detail
 
-Conversation, live actions, changes, acceptance criteria, findings, check artifacts, budget/resource use, and PR state. Provide send, supported steer, pause, cancel, resume. Distinguish queued versus accepted input and terminal outcomes.
+Tabs or focusable sections provide conversation, activity, diff, acceptance criteria, findings, checks, budgets, and PR state. Live conversation streams distinguish queued messages, harness-accepted input, active work, and final outcomes. The compose area supports multiline input and paste without automatically sending pasted text.
+
+Provide send, capability-supported steer, pause, cancel, and resume. Show the affected worker and operation before cancellation. Scope-changing input enters the same contract proposal/approval flow as the CLI. Agent permission requests appear as explicit decision controls; the TUI never simulates approval by injecting text into an agent terminal.
+
+Follow live output only while the user is at the end. Scrolling upward freezes that view and shows a new-output count. Paginate transcript history and cap rendered content; the terminal screen does not hold the full lifetime transcript in memory.
 
 ### Project orchestrator
 
-Persistent project conversation with concrete plan proposals and contract diffs. Approval shows exactly what work/authority is granted. Rendering a suggestion never authorizes execution.
+A persistent conversation with plan proposals, dependency summaries, acceptance criteria, and contract diffs. Users can approve a subset of work or request revision. Approval clearly states the work and authority it grants; displaying a suggestion does not authorize execution.
 
 ### Attention queue
 
-Pending permissions, semantic questions, failed checks, exhausted budgets, unknown outcomes, and provider blockers. Each item identifies the affected session/candidate, why it is waiting, and available actions. Stale answers refresh rather than apply elsewhere.
+Collect permission requests, semantic questions, failed checks, exhausted budgets, unknown outcomes, and provider blockers. Every item identifies its project, worker, candidate/revision where relevant, reason, and permitted actions. A stale answer refreshes the decision instead of applying it elsewhere.
 
-### PR/evidence view
+Do not steal input focus when attention arrives. Update the attention count and offer a navigation shortcut. Critical connection or persistence failure receives a visible banner while preserving unsent input.
 
-Required gates, current head/base, check freshness, findings, merge policy, and integration result. Link to the provider. The supervisor reevaluates permission/gates when a merge action is submitted, even if the UI button was previously enabled.
+### PR and evidence inspection
 
-### Accessibility and behavior
+Show current head/base, required gates, observation freshness, findings, check results/artifacts, merge policy, and observed integration result. Provide a copyable provider URL; opening the user's browser is optional and is not an application dependency.
 
-Keyboard navigation, focus management, semantic controls, contrast, screen-reader labels, reduced motion, and status beyond color are required. Test disconnect/replay, slow clients, paginated histories, and concurrent CLI/UI control. No terminal emulator or browser automation in the first UI release.
+The supervisor revalidates merge authority and gates when the user submits a merge action. A formerly enabled control is not sufficient authorization after state changes. Rendering a diff or artifact never executes its contents.
+
+### Keyboard and accessibility
+
+- Arrow keys navigate lists; Tab/Shift+Tab move focus; Enter opens or activates the focused control; Escape returns or dismisses.
+- `?` opens contextual help outside text input; shortcuts do not consume ordinary compose-field characters.
+- `q` exits only from navigation mode. Ctrl+C requests client exit, never worker cancellation. Nonempty unsent input prompts discard/stay before ordinary exit; forced process termination cannot guarantee draft preservation.
+- Multiline input uses an explicit Send control, plus a documented shortcut with a terminal-compatible fallback. Enter in the editor inserts a newline.
+- Every operation is keyboard-accessible. Mouse support is optional; scrolling/clicking cannot be the only way to reach an action.
+- Status uses text and symbols as well as color. Honor no-color/reduced-animation settings and offer ASCII rendering where glyph widths are unreliable.
+- Test real terminal behavior for Unicode, wide/combining characters, bracketed paste, resize, 80-column layouts, and monochrome output. Degrade to a focused single-pane view on small terminals.
+- Do not claim universal screen-reader accessibility for a full-screen terminal UI. Keep the plain CLI and stream output complete, test available assistive-terminal workflows, and document limitations.
+
+### Event handling and performance
+
+Textual screens/widgets store view state, not authoritative orchestration state. Use asynchronous workers and UI messages for API requests and streamed events. Blocking work uses a bounded thread worker when necessary; worker threads cannot mutate widgets directly. Git commands, model calls, and database work never run in the renderer or block keyboard processing.
+
+Coalesce high-frequency repaint notifications without dropping durable decisions or action outcomes. Bound log buffers and event queues. Slow rendering cannot apply backpressure to scheduling. On overflow, reconnect/resync using the shared cursor contract rather than silently losing state.
+
+### TUI acceptance
+
+Test screens and interactions with injected API events, fake clocks, and Textual's headless `run_test`/Pilot facilities. Add real terminal integration tests for input, resize, signals, terminal restoration, and reconnect on Windows/macOS/Linux. Test concurrent CLI/TUI decisions, lost responses, stale revisions, slow consumers, and large histories. [Textual testing](https://textual.textualize.io/guide/testing/)
+
+Required user journey: register repository, start approved work, inspect two concurrent workers, send feedback, answer a decision, cancel only one worker, detach/reopen, inspect a failed check and repair, and complete an authorized PR merge. The entire journey is possible without opening a web application or editing internal files.
+
+### Packaging and distribution
+
+Ship one Python distribution exposing the `brace` console command through `[project.scripts]`. The CLI, supervisor, internal session-host modes, and eventual Textual TUI are installed together. Use fresh `pyproject.toml`, `uv.lock`, `src/brace/`, and `uv_build` configuration. Build a wheel and source distribution with `uv build`; do not ship a frozen executable or reuse legacy packaging files. [uv build backend](https://docs.astral.sh/uv/concepts/build-backend/)
+
+Use uv as the primary installer on Windows, macOS, and Linux. It creates an isolated tool environment and places the command on PATH; it can select/download a compatible Python when needed. Users install uv, Git, and their selected agent harnesses; they do not need Go, Rust, a compiler, or a manually managed virtual environment for supported wheel-based installations. [uv tools](https://docs.astral.sh/uv/guides/tools/), [uv Python management](https://docs.astral.sh/uv/concepts/python-versions/)
+
+Reserve/verify a distribution name before publishing. The console command remains `brace` even if the registry distribution needs another name. Publish versioned wheels/sdists to the selected Python package registry and attach the same artifacts, checksums, and release notes to GitHub Releases. A version-pinned Git URL or release wheel is a supported installation source while registry publication is unavailable. All command examples below are templates until a rewritten release is published:
+
+```text
+uv tool install <distribution-name>
+brace --help
+brace version
+
+# Local development in the fresh rewrite checkout
+uv sync --locked
+uv run brace --help
+uv run python -m unittest discover -s tests
+uv build
+
+# Install a built release artifact into an isolated tool environment
+uv tool install ./dist/<release-wheel>.whl
+```
+
+The lockfile makes the development/CI environment reproducible. Installed tools resolve the wheel's published dependency metadata; do not claim that a source `uv.lock` automatically fixes every dependency in a consumer installation. Pin/constraint dependencies deliberately and test a fresh installation from the actual artifacts, including all package resources and conditional platform dependencies.
+
+### Upgrades and process lifetime
+
+A uv-managed environment can be replaced during upgrade. Live Python processes may still lazily import modules from that environment, so supervisor-restart resilience is not permission to upgrade code underneath living hosts.
+
+The supported initial update procedure is:
+
+1. Persist active state and stop new dispatch.
+2. Drain current turns, or explicitly cancel when the user chooses; resolve pending decisions or leave the upgrade pending rather than granting approval.
+3. Shut down the supervisor and every owned host using the environment; verify they have stopped.
+4. Back up the new-format database/artifact references.
+5. Run `uv tool upgrade <distribution-name>` for registry installations, or reinstall the selected pinned Git/wheel release as appropriate.
+6. Start the new supervisor, check schema/protocol compatibility, and reconcile retained conversations/workspaces before resuming approved work.
+
+Document that directly invoking uv upgrade/uninstall cannot be intercepted by an already running app; callers must follow this procedure. A new client refuses unsafe interactions with incompatible living processes. Do not promise zero-downtime upgrades or use an old package to open a database it cannot read. Restore a compatible backup for rollback when required.
+
+Use `uv tool install` for persistent supervisors and hosts. `uvx` cache environments are not a supported launch location for long-lived background work; reserve them for short-lived version/help/diagnostic use. The application must prevent persistent dispatch from unsupported transient installations, with detection/behavior proved in M0 packaging tests.
+
+M8 tests install, upgrade, version pinning, uninstall, data preservation, artifact completeness, and PATH behavior on all supported operating systems. M9 adds Textual to the same package and installation path. Package-manager installation must require no manual virtualenv work or native compilation on supported release platforms. WinGet/Homebrew wrappers and custom self-update are deferred because uv already supplies the requested installation workflow.
 
 ## 21. Configuration and permissions
 
@@ -725,11 +875,11 @@ Readiness output distinguishes installed, authenticated, compatible, permission-
 | Database/event pressure | Bound logs, batch noncritical events, measure before adding storage infrastructure |
 | Context grows without bound | Native compaction plus explicit decisions and task context; show resets |
 | Unsafe repository execution | Explicit permission/isolation profile for both agents and tests |
-| UI delays core delivery | M8 release is a prerequisite for M9 |
+| TUI delays core delivery | M8 CLI foundation release is a prerequisite for M9 |
 
-Decisions confirmed by the user: full rewrite, no reuse/migration, CLI before UI, accuracy, maximum useful throughput, and Go CLI with a local supervisor.
+Decisions confirmed by the user: full rewrite, no reuse/migration, CLI foundation before the interactive interface, a native TUI as the application, accuracy, maximum useful throughput, and a Python CLI packaged with uv. Keep the local supervisor; consider Go or Rust only for demonstrated capability/performance requirements.
 
-M0 must settle exact dependency/protocol versions, second-harness integration, CLI library choice, and supported execution-isolation capabilities. These technical checks do not reopen permission to reuse legacy code.
+M0 must settle exact Python/uv/dependency/Codex protocol versions, published distribution name, and supported process/isolation capabilities. Additional harness integration is deferred and cannot block CLI or TUI delivery. These technical checks do not reopen permission to reuse legacy code.
 
 ## 23. Repository analysis and retirement record
 
@@ -739,10 +889,10 @@ Observed categories and their disposition:
 
 | Existing category | Disposition |
 |---|---|
-| Runtime source and command handlers | Remove at M0; implement Go product from scratch |
+| Runtime source and command handlers | Remove at M0; implement the new Python product from scratch |
 | Tests and support fixtures | Remove at M0; derive new tests from this document |
 | Agent prompts, instruction files, schemas | Remove at M0; author new contracts/context from scratch |
-| Package configuration and lockfile | Remove at M0; create a new Go module/dependency lock |
+| Package configuration and lockfile | Remove at M0; author fresh Python project metadata and uv lockfile |
 | Release/site automation and website | Remove at M0; new release process/docs follow new product |
 | Runtime state, task/bug ledgers, old conversations | Never import or resume |
 | Roadmaps and issue implementation drafts | Remove during this planning pass |
@@ -768,7 +918,7 @@ Later filesystem deletion must verify exact paths/ownership and protect unrelate
 | User requirement | Specification | Release proof |
 |---|---|---|
 | Closer to agent-orchestrator | Sessions, project orchestrator, PR feedback, shared clients | M2/M3/M5/M9 workflows |
-| CLI first | Complete command/API contract; hard UI prerequisite | M8 release before M9 begins |
+| CLI first, TUI application | Complete command/API foundation, then native terminal interface | M8 release before M9; terminal acceptance at M9 |
 | See and steer agents | Live events, delivery states, messages/control | M2/M7 conformance and CLI scenarios |
 | Slow runs/repeated reviews | Continuous scheduling, retained repair, evidence reuse | M4 utilization and M6 review experiment |
 | Recovery | Host journal, durable intents, uncertain outcome handling | M6 fault matrix |
@@ -776,16 +926,22 @@ Later filesystem deletion must verify exact paths/ownership and protect unrelate
 | Accuracy | Layered gates, exact evidence, seeded defect corpus | M6/M8 correctness report |
 | Maximum throughput | Useful-work metric, resources/fairness, integration concurrency | M8 benchmark report |
 | Full rewrite/no reuse | Empty-tree M0, no imports, fresh tests/contracts | M0 source/dependency audit |
-| Go/local supervisor | One binary, local API, host modes | M0/M1 platform tests |
+| Python/uv and local supervisor | One Python distribution, uv tool installation, local API, host modes | M0/M1 platform and installation tests |
 
 Final checklist:
 
-- [ ] Fresh installation/database; no legacy reads, imports, or resumed campaigns.
+- [ ] Fresh uv tool installation/database; no legacy reads, imports, or resumed campaigns.
+- [ ] CLI/TUI/supervisor/hosts launch through the installed Python environment; upgrade tests prove safe shutdown and resumption.
+- [ ] Go/Rust components are introduced only for a demonstrated requirement, with the same conformance and recovery gates.
 - [ ] No legacy code, tests, prompts, schemas, build rules, or guidelines reused.
 - [ ] Focused task reaches verified integration entirely through CLI.
 - [ ] Persistent orchestrator proposes and delegates approved task graphs.
 - [ ] Individual sessions are observable and steerable with truthful delivery status.
 - [ ] Independent tasks progress continuously under declared limits.
+- [ ] Parallel workers use matching approved shared-interface contracts; unsettled interfaces become prerequisites.
+- [ ] The supervisor owns candidate commits; checks/reviews inspect immutable snapshots and cannot silently add generated artifacts.
+- [ ] Conflict resolution preserves exact input identities, required gates, and durable repair limits.
+- [ ] Controlled concurrency and model invocation-count tests catch serialization, duplicate work, and budget resets.
 - [ ] Required correctness and acceptance-review gates hold.
 - [ ] Repairs preserve work and invalidate changed evidence correctly.
 - [ ] Human/provider waiting does not monopolize model slots or cause repeated review.
@@ -793,7 +949,8 @@ Final checklist:
 - [ ] Provider merge gates bind evidence to relevant candidate/integration identities.
 - [ ] Cancellation and cleanup cannot affect unrelated processes/resources.
 - [ ] Accuracy and performance reports are reproducible and state limitations.
-- [ ] CLI release is accepted before UI implementation.
-- [ ] UI calls the same operations and enforces the same rules as CLI.
+- [ ] CLI foundation release is accepted before TUI implementation.
+- [ ] Codex satisfies the supported capability contract; a second harness is not required for CLI or TUI release.
+- [ ] Native TUI calls the same operations and enforces the same rules as CLI.
 
 When implementation is requested, begin at M0 with this document and fresh files. Do not port or incrementally refactor the old product.
